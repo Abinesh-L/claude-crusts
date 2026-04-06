@@ -188,15 +188,16 @@ export function renderAnalysis(
   console.log(chalk.bold('\u2560' + '\u2550'.repeat(62) + '\u2563'));
 
   // Category breakdown (primary view: current context if compacted)
+  // Layout: 2 pad + 18 label + 1 sp + 14 tokens + 1 sp + 8 pct + 2 sp + bar = 62
+  const barWidth = 62 - 2 - 18 - 1 - 14 - 1 - 8 - 2; // = 16
   console.log(chalk.bold('\u2551') + ' '.repeat(62) + chalk.bold('\u2551'));
   for (const bucket of primaryBuckets) {
     const color = CATEGORY_COLOR[bucket.category];
-    const label = color(CATEGORY_LABEL[bucket.category].padEnd(18));
+    const labelText = CATEGORY_LABEL[bucket.category].padEnd(18);
     const tokens = fmtTokens(bucket.tokens).padStart(14);
     const pct = `(${bucket.percentage.toFixed(1)}%)`.padStart(8);
-    const bar = renderBar(bucket.percentage, 17, color);
-    const acc = bucket.accuracy === 'estimated' ? chalk.dim(' ~') : '  ';
-    console.log(chalk.bold('\u2551') + `  ${label} ${tokens} ${pct}  ${bar}${acc}` + chalk.bold('\u2551'));
+    const bar = renderBar(bucket.percentage, barWidth, color);
+    console.log(chalk.bold('\u2551') + `  ${color(labelText)} ${tokens} ${pct}  ${bar}` + chalk.bold('\u2551'));
   }
 
   // Totals
