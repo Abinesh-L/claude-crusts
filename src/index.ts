@@ -29,7 +29,7 @@ const program = new Command();
 program
   .name('claude-crusts')
   .description('Break down your Claude Code context window into the 6 CRUSTS categories')
-  .version('0.3.0')
+  .version('0.3.1')
   .option('--path <path>', 'Custom path to JSONL session files')
   .option('--json', 'Output as JSON instead of formatted tables')
   .option('--project <name>', 'Filter by project name')

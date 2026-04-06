@@ -19,14 +19,14 @@
 ║  TOTAL: 143,507 / 200,000 tokens (71.8%)                       ║
 ║  FREE:  56,493 tokens                                          ║
 ║                                                                ║
-║  ⚠  WASTE DETECTED:                                           ║
-║     • "index.ts" read 9 times — est. ~9,897 tokens             ║
-║     • "types.ts" read 6 times — est. ~5,972 tokens             ║
+║  WASTE DETECTED:                                               ║
+║     "index.ts" read 9 times -- est. ~9,897 tokens              ║
+║     "types.ts" read 6 times -- est. ~5,972 tokens              ║
 ║     ... and 6 more                                             ║
 ║                                                                ║
-║  💡 RECOMMENDATIONS:                                          ║    
+║  RECOMMENDATIONS:                                              ║
 ║     /compact to remove duplicate reads                         ║
-║     Review loaded tools — 36 of 40 were never used             ║
+║     Review loaded tools -- 36 of 40 were never used            ║
 ║     Messages until auto-compaction: ~48                        ║
 ║                                                                ║
 ║  Context health: HOT                                           ║
@@ -183,9 +183,9 @@ CRUSTS Fix — Session a1b2c3d4
 │ Important: these files are already in your context from        │
 │ earlier reads. Do NOT re-read them. Reference your earlier     │
 │ reads instead:                                                 │
-│ - renderer.ts (already read, at messages #5, #160, #180)       │
+│ - renderer.ts (already read, at messages #5, #160, #180)   │
 │ - classifier.ts (already read, at messages #4, #38, #41, #46)  │
-│ - recommender.ts (already read, at messages #149, #210)        │
+│ - recommender.ts (already read, at messages #149, #210)    |
 │                                                                │
 │ If you need to check something in these files, say "based on   │
 │ [filename] that you already read" instead of reading the file  │
@@ -245,14 +245,14 @@ claude-crusts lost --json              # machine-readable output
 ║  Session: 841f980f | 5 compaction event(s)                       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  Compaction #1 (at message #420)                                 ║
-║  167,040 → 31,069 tokens (−135,971 dropped)                     ║
+║  Compaction #1 (at message #420)                               ║
+║  167,040 -> 31,069 tokens (-135,971 dropped)                     ║
 ║  ──────────────────────────────────────────────────────────────  ║
-║  File Reads (2) — ~2,311 tokens                                  ║
+║  File Reads (2) -- ~2,311 tokens                                 ║
 ║    File read: PROJECT_BRIEF.md                         ~2,180 #15║
 ║    File read: CLAUDE_MD.md                               ~131 #14║
 ║  ──────────────────────────────────────────────────────────────  ║
-║  Total: 44,596 tokens lost out of 851,734 pre-compaction (5.2%) ║
+║  Total: 44,596 tokens lost out of 851,734 pre-compaction (5.2%)  ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
