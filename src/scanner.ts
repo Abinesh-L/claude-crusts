@@ -17,6 +17,7 @@ import type {
   FileContent,
   MCPServerInfo,
   MemoryFileSummary,
+  SkillInfo,
 } from './types.ts';
 import { BUILT_IN_TOOLS, TOTAL_BUILTIN_TOOL_TOKENS } from './built-in-tools.ts';
 import type { BuiltInTool } from './built-in-tools.ts';
@@ -321,61 +322,79 @@ export function readMCPConfig(projectPath?: string): MCPServerInfo[] {
 }
 
 /**
- * Read memory files from ~/.claude/memdir/ directory.
+ * Read MEMORY.md and its linked files from a single memdir directory.
  *
- * Only counts the MEMORY.md index file and files referenced in it,
- * since Claude Code loads memory on-demand rather than dumping all
- * memdir/ contents into context. This produces a conservative estimate
- * that better matches /context ground truth (~1.8K tokens).
+ * Helper for `readMemoryFiles`. Returns files tagged with the supplied source.
  *
+ * @param memdir - Absolute path to the memdir directory
+ * @param source - Whether this is the global or project-scoped memdir
+ * @returns Array of MemoryFileSummary records
+ */
+function readMemdirAt(memdir: string, source: 'global' | 'project'): MemoryFileSummary[] {
+  const files: MemoryFileSummary[] = [];
+  if (!existsSync(memdir)) return files;
+
+  const memoryMdPath = join(memdir, 'MEMORY.md');
+  if (!existsSync(memoryMdPath)) return files;
+
+  try {
+    const stat = statSync(memoryMdPath);
+    const content = readFileSync(memoryMdPath, 'utf-8');
+    files.push({
+      path: memoryMdPath,
+      sizeBytes: stat.size,
+      estimatedTokens: estimateTokensFromText(content),
+      source,
+    });
+
+    const linkPattern = /\[.*?\]\(([^)]+)\)/g;
+    let match: RegExpExecArray | null;
+    while ((match = linkPattern.exec(content)) !== null) {
+      const refPath = join(memdir, match[1]!);
+      if (existsSync(refPath)) {
+        try {
+          const refStat = statSync(refPath);
+          if (!refStat.isFile()) continue;
+          const refContent = readFileSync(refPath, 'utf-8');
+          files.push({
+            path: refPath,
+            sizeBytes: refStat.size,
+            estimatedTokens: estimateTokensFromText(refContent),
+            source,
+          });
+        } catch {
+          // skip unreadable files
+        }
+      }
+    }
+  } catch {
+    // skip if unreadable
+  }
+
+  return files;
+}
+
+/**
+ * Read memory files from the global and (optionally) project-scoped memdirs.
+ *
+ * Counts MEMORY.md and files referenced from it. Claude Code loads memory
+ * on-demand, so this produces a conservative estimate that matches /context
+ * ground truth (~1.8K tokens for typical sessions).
+ *
+ * @param projectPath - Optional project directory; when provided, also scans
+ *   `<projectPath>/.claude/memdir/` for project-scoped memory.
  * @returns Object with individual file summaries and total estimated tokens
  */
-export function readMemoryFiles(): {
+export function readMemoryFiles(projectPath?: string): {
   files: MemoryFileSummary[];
   totalEstimatedTokens: number;
 } {
-  const memdir = join(homedir(), '.claude', 'memdir');
-  const files: MemoryFileSummary[] = [];
+  const globalMemdir = join(homedir(), '.claude', 'memdir');
+  const files: MemoryFileSummary[] = [...readMemdirAt(globalMemdir, 'global')];
 
-  if (!existsSync(memdir)) {
-    return { files, totalEstimatedTokens: 0 };
-  }
-
-  // Only count MEMORY.md (the index file that is always loaded)
-  const memoryMdPath = join(memdir, 'MEMORY.md');
-  if (existsSync(memoryMdPath)) {
-    try {
-      const stat = statSync(memoryMdPath);
-      const content = readFileSync(memoryMdPath, 'utf-8');
-      files.push({
-        path: memoryMdPath,
-        sizeBytes: stat.size,
-        estimatedTokens: estimateTokensFromText(content),
-      });
-
-      // Parse MEMORY.md for referenced files and count those too
-      const linkPattern = /\[.*?\]\(([^)]+)\)/g;
-      let match: RegExpExecArray | null;
-      while ((match = linkPattern.exec(content)) !== null) {
-        const refPath = join(memdir, match[1]!);
-        if (existsSync(refPath)) {
-          try {
-            const refStat = statSync(refPath);
-            if (!refStat.isFile()) continue;
-            const refContent = readFileSync(refPath, 'utf-8');
-            files.push({
-              path: refPath,
-              sizeBytes: refStat.size,
-              estimatedTokens: estimateTokensFromText(refContent),
-            });
-          } catch {
-            // skip unreadable files
-          }
-        }
-      }
-    } catch {
-      // skip if unreadable
-    }
+  if (projectPath) {
+    const projectMemdir = join(projectPath, '.claude', 'memdir');
+    files.push(...readMemdirAt(projectMemdir, 'project'));
   }
 
   const totalEstimatedTokens = files.reduce(
@@ -384,6 +403,82 @@ export function readMemoryFiles(): {
   );
 
   return { files, totalEstimatedTokens };
+}
+
+/** Per-skill token estimate when no token cost is recorded in settings.json */
+const DEFAULT_SKILL_TOKENS = 60;
+
+/**
+ * Pull skill names out of a parsed `skills` value in settings.json.
+ *
+ * Tolerates several shapes seen in the wild: array of strings, array of
+ * objects with `name`, or an object keyed by skill name.
+ *
+ * @param raw - The parsed `skills` value from settings.json
+ * @returns Array of skill names (may be empty)
+ */
+function extractSkillNames(raw: unknown): string[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw
+      .map((entry) => {
+        if (typeof entry === 'string') return entry;
+        if (entry && typeof entry === 'object' && typeof (entry as { name?: unknown }).name === 'string') {
+          return (entry as { name: string }).name;
+        }
+        return null;
+      })
+      .filter((n): n is string => !!n);
+  }
+  if (typeof raw === 'object') {
+    return Object.keys(raw as Record<string, unknown>);
+  }
+  return [];
+}
+
+/**
+ * Discover Claude Code skills configured in global and project settings.
+ *
+ * Mirrors the structure of `readMCPConfig`. Reads `~/.claude/settings.json`
+ * and `<projectPath>/.claude/settings.json` for a `skills` key. Each skill is
+ * given a flat token estimate (`DEFAULT_SKILL_TOKENS`); the classifier sums
+ * the discovered tokens to replace the legacy hardcoded constant.
+ *
+ * @param projectPath - Optional project directory
+ * @returns Array of SkillInfo objects, deduped by name
+ */
+export function readSkillsConfig(projectPath?: string): SkillInfo[] {
+  const skills: SkillInfo[] = [];
+
+  const globalSettingsPath = join(homedir(), '.claude', 'settings.json');
+  if (existsSync(globalSettingsPath)) {
+    try {
+      const settings = JSON.parse(readFileSync(globalSettingsPath, 'utf-8'));
+      for (const name of extractSkillNames(settings.skills)) {
+        skills.push({ name, source: 'global', estimatedTokens: DEFAULT_SKILL_TOKENS });
+      }
+    } catch {
+      // Skip corrupted settings
+    }
+  }
+
+  if (projectPath) {
+    const projectSettingsPath = join(projectPath, '.claude', 'settings.json');
+    if (existsSync(projectSettingsPath)) {
+      try {
+        const settings = JSON.parse(readFileSync(projectSettingsPath, 'utf-8'));
+        for (const name of extractSkillNames(settings.skills)) {
+          if (!skills.some((s) => s.name === name)) {
+            skills.push({ name, source: 'project', estimatedTokens: DEFAULT_SKILL_TOKENS });
+          }
+        }
+      } catch {
+        // Skip corrupted settings
+      }
+    }
+  }
+
+  return skills;
 }
 
 /**

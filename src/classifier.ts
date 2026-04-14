@@ -1055,7 +1055,11 @@ function deriveInternalSystemPrompt(
   const knownClaudeMd = configData.systemPrompt.totalEstimatedTokens;
   const knownToolSchemas = configData.builtInTools.totalEstimatedTokens;
   const knownMemory = configData.memoryFiles.totalEstimatedTokens;
-  const knownSkills = 476; // From /context ground truth observation
+  // Sum discovered skills' estimated cost. Falls back to 476 (the historical
+  // /context ground-truth observation) when no skills are discovered, so
+  // sessions on machines without skills configured keep their prior derivation.
+  const discoveredSkillTokens = configData.skills.totalEstimatedTokens;
+  const knownSkills = discoveredSkillTokens > 0 ? discoveredSkillTokens : 476;
 
   // Estimate first user message tokens
   let knownFirstUserMessage = 0;

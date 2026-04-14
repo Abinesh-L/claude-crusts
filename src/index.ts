@@ -13,15 +13,18 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { discoverSessions, parseSession } from './scanner.ts';
 import { analyzeSession, gatherConfigData } from './analyzer.ts';
-import { setVerbose } from './classifier.ts';
+import { setVerbose, classifySession } from './classifier.ts';
 import { runCalibration, renderCalibrationComparison } from './calibrator.ts';
 import { compareSessions } from './comparator.ts';
 import { generateSessionReport, generateComparisonReport } from './html-report.ts';
 import { generateSessionReportMd, generateComparisonReportMd } from './md-report.ts';
 import { analyzeLostContent } from './lost-detector.ts';
 import { startWatch } from './watcher.ts';
-import { renderAnalysis, renderTimeline, renderList, renderWaste, renderFix, renderComparison, renderLost } from './renderer.ts';
+import { startTui } from './tui.ts';
+import { enableHooks, disableHooks, hooksStatus } from './hooks.ts';
+import { renderAnalysis, renderTimeline, renderList, renderWaste, renderFix, renderComparison, renderLost, renderTrend } from './renderer.ts';
 import { generateFixPrompts } from './recommender.ts';
+import { loadTrendHistory, summarizeTrend } from './trend.ts';
 import type { SessionInfo } from './types.ts';
 
 const program = new Command();
@@ -29,7 +32,7 @@ const program = new Command();
 program
   .name('claude-crusts')
   .description('Break down your Claude Code context window into the 6 CRUSTS categories')
-  .version('0.3.1')
+  .version('0.5.0')
   .option('--path <path>', 'Custom path to JSONL session files')
   .option('--json', 'Output as JSON instead of formatted tables')
   .option('--project <name>', 'Filter by project name')
@@ -110,6 +113,9 @@ program
       console.log(`    Memory files: ${configData.memoryFiles.files.length} (~${configData.memoryFiles.totalEstimatedTokens.toLocaleString()} tokens)`);
     }
     console.log(`    Built-in tools: ${configData.builtInTools.tools.length} (~${configData.builtInTools.totalEstimatedTokens.toLocaleString()} tokens)`);
+    if (configData.skills.items.length > 0) {
+      console.log(`    Skills: ${configData.skills.items.length} (${configData.skills.items.map((s) => s.name).join(', ')})`);
+    }
     console.log();
   });
 
@@ -370,6 +376,79 @@ program
   .action(async () => {
     await runCalibration();
   });
+
+program
+  .command('trend')
+  .description('Show trends across your recent sessions')
+  .option('--limit <n>', 'Number of sessions to include (default 50)')
+  .action((_options: { limit?: string }, cmd: Command) => {
+    const globals = cmd.optsWithGlobals();
+    const limit = _options.limit ? parseInt(_options.limit, 10) : 50;
+    const records = loadTrendHistory(limit, globals.project as string | undefined);
+
+    if (globals.json) {
+      const summary = summarizeTrend(records);
+      console.log(JSON.stringify({ records, summary }, null, 2));
+      return;
+    }
+
+    const summary = summarizeTrend(records);
+    renderTrend(records, summary);
+  });
+
+program
+  .command('tui [session-id]')
+  .description('Interactive REPL shell — browse sessions, run commands, compare')
+  .action(async (sessionId: string | undefined, _options: unknown, cmd: Command) => {
+    const globals = cmd.optsWithGlobals();
+    await startTui(globals.path, sessionId);
+  });
+
+program
+  .command('status [session-id]')
+  .description('One-line context health summary (used by hooks)')
+  .action(async (sessionId: string | undefined, _options: unknown, cmd: Command) => {
+    const globals = cmd.optsWithGlobals();
+    const session = resolveSession(sessionId, globals.path, globals.project);
+    if (!session) return;
+
+    const messages = await parseSession(session.path);
+    if (messages.length === 0) return;
+
+    const configData = gatherConfigData();
+    const breakdown = classifySession(messages, configData);
+
+    const view = breakdown.currentContext ?? {
+      usage_percentage: breakdown.usage_percentage,
+    };
+    const pct = view.usage_percentage;
+    const msgCount = breakdown.messages.length;
+    const compCount = breakdown.compactionEvents.length;
+
+    const healthLabel = pct < 50 ? 'healthy' : pct < 70 ? 'warming' : pct < 85 ? 'hot' : 'critical';
+    const color = pct < 50 ? chalk.green : pct < 70 ? chalk.yellow : pct < 85 ? chalk.red : chalk.bgRed.white;
+
+    console.log(color(`CRUSTS: ${pct.toFixed(1)}% (${healthLabel}) | ${msgCount} msgs | ${compCount} compaction${compCount === 1 ? '' : 's'}`));
+  });
+
+const hooksCmd = program
+  .command('hooks')
+  .description('Manage Claude Code hook integration');
+
+hooksCmd
+  .command('enable')
+  .description('Enable CRUSTS after-response hook in Claude Code')
+  .action(() => enableHooks());
+
+hooksCmd
+  .command('disable')
+  .description('Disable CRUSTS after-response hook')
+  .action(() => disableHooks());
+
+hooksCmd
+  .command('status')
+  .description('Show whether CRUSTS hooks are installed')
+  .action(() => hooksStatus());
 
 program.parse();
 

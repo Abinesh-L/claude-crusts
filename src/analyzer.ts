@@ -13,12 +13,14 @@ import {
   readSystemPromptFiles,
   readMCPConfig,
   readMemoryFiles,
+  readSkillsConfig,
   getBuiltInToolList,
 } from './scanner.ts';
 import { classifySession } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
 import { generateRecommendations } from './recommender.ts';
 import { loadCalibration, compareWithEstimates } from './calibrator.ts';
+import { recordTrend } from './trend.ts';
 import type {
   AnalysisResult,
   ConfigData,
@@ -35,11 +37,16 @@ import type {
  * @returns Aggregated config data
  */
 export function gatherConfigData(projectPath?: string): ConfigData {
+  const skillItems = readSkillsConfig(projectPath);
   return {
     systemPrompt: readSystemPromptFiles(projectPath),
     mcpServers: readMCPConfig(projectPath),
-    memoryFiles: readMemoryFiles(),
+    memoryFiles: readMemoryFiles(projectPath),
     builtInTools: getBuiltInToolList(),
+    skills: {
+      items: skillItems,
+      totalEstimatedTokens: skillItems.reduce((sum, s) => sum + s.estimatedTokens, 0),
+    },
   };
 }
 
@@ -121,7 +128,7 @@ export async function analyzeSession(
     calibration = compareWithEstimates(breakdown, calibrationData);
   }
 
-  return {
+  const result: AnalysisResult = {
     sessionId,
     project,
     messageCount: breakdown.messages.length,
@@ -132,4 +139,10 @@ export async function analyzeSession(
     configData,
     messages,
   };
+
+  // Persist a one-line summary for the `trend` command. Best-effort —
+  // recordTrend swallows its own I/O errors.
+  recordTrend(result);
+
+  return result;
 }

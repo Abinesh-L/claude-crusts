@@ -141,6 +141,14 @@ export interface MemoryFileSummary {
   path: string;
   sizeBytes: number;
   estimatedTokens: number;
+  source: 'global' | 'project';
+}
+
+/** A skill discovered from Claude Code settings */
+export interface SkillInfo {
+  name: string;
+  source: 'global' | 'project';
+  estimatedTokens: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +168,10 @@ export interface ConfigData {
   };
   builtInTools: {
     tools: { name: string; estimated_tokens: number }[];
+    totalEstimatedTokens: number;
+  };
+  skills: {
+    items: SkillInfo[];
     totalEstimatedTokens: number;
   };
 }
@@ -411,6 +423,41 @@ export interface ComparisonResult {
   insights: string[];
 }
 
+// ---------------------------------------------------------------------------
+// Trend types
+// ---------------------------------------------------------------------------
+
+/** A single historical analyze run, persisted to ~/.claude-crusts/history.jsonl */
+export interface TrendRecord {
+  sessionId: string;
+  projectName: string;
+  timestamp: string;
+  totalTokens: number;
+  percentUsed: number;
+  messageCount: number;
+  compactionCount: number;
+  health: ContextHealth;
+  topCategory: CrustsCategory;
+  topCategoryTokens: number;
+}
+
+/** Aggregate summary computed across a list of TrendRecords */
+export interface TrendSummary {
+  count: number;
+  avgPercentUsed: number;
+  avgTotalTokens: number;
+  avgCompactionCount: number;
+  avgMessageCount: number;
+  /** Most frequent top category across the records */
+  dominantCategory: CrustsCategory;
+  /** Direction of percent-used trend across the window: 'improving' = decreasing */
+  direction: 'improving' | 'worsening' | 'flat';
+  /** Delta in percentUsed: average of last third minus average of first third */
+  percentUsedDelta: number;
+  /** Sparkline-ready series of percentUsed for the records */
+  series: number[];
+}
+
 /** Full analysis result from the orchestrator */
 export interface AnalysisResult {
   sessionId: string;
@@ -422,4 +469,9 @@ export interface AnalysisResult {
   calibration: CalibrationComparison[] | null;
   configData: ConfigData;
   messages: SessionMessage[];
+}
+
+/** A trend record together with the percent-used delta vs the previous record */
+export interface TrendRecordWithDelta extends TrendRecord {
+  percentUsedDelta: number | null;
 }

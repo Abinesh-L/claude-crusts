@@ -21,12 +21,17 @@ claude-crusts lost [session-id]                 — What was lost during compact
 claude-crusts watch [session-id]                — Live-monitor a session with compact dashboard
 claude-crusts report [session-id]               — Generate standalone report (HTML or Markdown)
 claude-crusts calibrate                         — Cross-reference against /context output
+claude-crusts trend                              — Cross-session trends (sparkline, averages, direction)
+claude-crusts tui [session-id]                   — Interactive REPL shell with tab completion + clipboard copy
+claude-crusts status [session-id]                — One-line context health (fast path, used by hooks)
+claude-crusts hooks enable|disable|status        — Manage Claude Code hook integration
 ```
 
 Global flags: `--json`, `--project <name>`, `--path <path>`, `--verbose`
 Subcommand flags: `--until <n>` on analyze/waste/timeline
 Report flags: `--format <html|md>` (default: html), `--compare <id>` for comparison report, `--output <path>` for custom file path
 Watch flags: `--interval <ms>` polling interval (default: 2000)
+Trend flags: `--limit <n>` number of sessions (default: 50)
 
 ## Rules
 
@@ -52,9 +57,12 @@ Watch flags: `--interval <ms>` polling interval (default: 2000)
 scanner.ts → classifier.ts → waste-detector.ts → recommender.ts → renderer.ts
                   ↑                                                     ↑
               analyzer.ts (orchestrates)                         calibrator.ts
-                                                                comparator.ts
-                                                                lost-detector.ts
+                  ↓                                             comparator.ts
+              trend.ts (history)                                lost-detector.ts
                                                                 watcher.ts
+                                                                tui.ts
+                                                                clipboard.ts
+                                                                hooks.ts
                                                                 html-report.ts
                                                                 md-report.ts
 ```
@@ -63,21 +71,25 @@ Supporting: `types.ts`, `built-in-tools.ts`
 
 ### File Responsibilities
 
-- **types.ts**: All shared types and interfaces (including ComparisonResult, CategoryDelta)
-- **index.ts**: CLI entrypoint with 10 Commander.js commands
-- **analyzer.ts**: Pipeline orchestrator, project path decoding
-- **scanner.ts**: Session discovery, JSONL streaming, config readers
+- **types.ts**: All shared types and interfaces (including ComparisonResult, CategoryDelta, TrendRecord, TrendSummary, SkillInfo)
+- **index.ts**: CLI entrypoint with 14 Commander.js commands (including hooks subcommands)
+- **analyzer.ts**: Pipeline orchestrator, project path decoding, trend recording
+- **scanner.ts**: Session discovery, JSONL streaming, config readers (MCP, memory, skills)
 - **classifier.ts**: Core engine — classification, token estimation, compaction detection, derived overhead, auto-trim
 - **waste-detector.ts**: 6 waste detection rules (edit-aware)
 - **recommender.ts**: 7 recommendation patterns + fix prompt generator
-- **renderer.ts**: 7 render functions (dashboard, timeline, list, waste, fix, comparison, lost). Bar chart guarantees ≥1 filled block for categories ≥1%
-- **calibrator.ts**: /context parser, calibration storage, comparison
+- **renderer.ts**: 8 render functions (dashboard, timeline, list, waste, fix, comparison, lost, trend). Bar chart guarantees ≥1 filled block for categories ≥1%
+- **calibrator.ts**: /context parser, calibration storage, comparison. Exports `CRUSTS_DIR` (~/.claude-crusts)
+- **trend.ts**: Cross-session trend tracking — append-only JSONL history, deduped by session id, sparkline + direction detection
 - **comparator.ts**: Cross-session comparison engine with 5 auto-insight rules
 - **html-report.ts**: Standalone HTML report generator (session + comparison modes)
 - **md-report.ts**: Standalone Markdown report generator (session + comparison modes)
 - **lost-detector.ts**: Compaction loss analysis — reconstructs what was dropped. Detects tool_use ID filenames and replaces with "Agent sub-task result". Extracts meaningful descriptions from agent/tool results
 - **watcher.ts**: Live session monitor with compact dashboard, inline compaction line (flash effect on new compaction, settles to yellow), category labels `C R U Sys T St`
 - **built-in-tools.ts**: 40 built-in tool schemas, total 9,055 tokens
+- **tui.ts**: Interactive REPL shell — session picker, command dispatch (analyze/waste/fix/copy/timeline/lost/status/compare/trend), readline-based prompt with session ID indicator, tab completion for commands + session IDs, clipboard copy for fix blocks
+- **clipboard.ts**: Cross-platform clipboard utility — `clip` (Windows), `pbcopy` (macOS), `xclip`/`xsel` (Linux)
+- **hooks.ts**: Claude Code hook integration — reads/writes `~/.claude/settings.json` hooks, manages `~/.claude-crusts/config.json` toggle state
 - **.claude/commands/crusts.md**: Custom slash command — runs `npx claude-crusts analyze --json` and gives actionable advice
 
 ## Key Technical Decisions
@@ -94,7 +106,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 - Includes: `block.signature`, tool block metadata (IDs, names), recursive sub-blocks
 
 **Derived overhead** — per-session, not hardcoded:
-- Internal system prompt: first assistant `input_tokens` − known components (CLAUDE.md + tools 9,055 + memory + skills 476 + first user message). Range 1K-15K.
+- Internal system prompt: first assistant `input_tokens` − known components (CLAUDE.md + tools 9,055 + memory + discovered skills [fallback 476] + first user message). Range 1K-15K.
 - Message framing: median of ≤20 consecutive assistant pair deltas from post-compaction window. Range 0-50 tokens/msg. Distributed proportionally across categories.
 
 **Edit-aware waste detection**:
@@ -124,7 +136,11 @@ Supporting: `types.ts`, `built-in-tools.ts`
 | `HEALTH_THRESHOLDS` | recommender.ts | 50/70/85 | healthy/warming/hot/critical |
 | `MCP_TOKENS_PER_TOOL` | scanner.ts | 0 | MCP tools loaded on-demand |
 | `TOTAL_BUILTIN_TOOL_TOKENS` | built-in-tools.ts | 9,055 | Sum of 40 tool schemas |
-| `CRUSTS_DIR` | calibrator.ts | `~/.claude-crusts` | Calibration data directory |
+| `CRUSTS_DIR` | calibrator.ts | `~/.claude-crusts` | Calibration + trend data directory |
+| `HISTORY_PATH` | trend.ts | `~/.claude-crusts/history.jsonl` | Append-only trend history |
+| `DEFAULT_SKILL_TOKENS` | scanner.ts | 60 | Per-skill token estimate fallback |
+| `HOOK_COMMAND` | hooks.ts | `claude-crusts status` | Command installed in Claude Code hooks |
+| `CRUSTS_CONFIG_PATH` | hooks.ts | `~/.claude-crusts/config.json` | Hook toggle state file |
 
 ## Waste Detection Rules
 

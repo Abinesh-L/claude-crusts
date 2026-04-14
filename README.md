@@ -40,6 +40,9 @@ Fully offline. Zero API calls. Zero token cost.
 - **Detects waste** — duplicate file reads, unused tool schemas, stale content
 - **Gives you the fix** — run `claude-crusts fix` to get three pasteable blocks: one for your current session, one for your CLAUDE.md, and one /compact command. All generated from your data, no LLM needed.
 - **Works on past sessions** — Claude Code forgets everything when you exit. The JSONL logs don't. Analyze any session from days or weeks ago.
+- **Tracks trends** — see how your context usage changes across sessions with sparklines and direction detection
+- **Interactive TUI** — REPL shell with Tab completion and clipboard copy to browse sessions, run commands, switch and compare without leaving the app
+- **Hook integration** — opt-in one-line health summary after every Claude Code response
 
 ## Installation
 
@@ -84,6 +87,18 @@ claude-crusts compare <session-a> <session-b>
 
 # 9. Generate a shareable report (HTML or Markdown)
 claude-crusts report
+
+# 10. Track trends across sessions
+claude-crusts trend
+
+# 11. Interactive shell — all commands in one session
+claude-crusts tui
+
+# 12. Quick health check (one line)
+claude-crusts status
+
+# 13. Auto-show health after every Claude Code response (opt-in)
+claude-crusts hooks enable
 ```
 
 ## Use Inside Claude Code
@@ -104,7 +119,7 @@ This works automatically when you clone or install claude-crusts, because the sl
 |--|--|--|
 | **Best for** | Quick check + immediate action | Deep analysis, monitoring, forensics |
 | **Token cost** | Uses some context tokens for Claude to process the JSON | Zero — doesn't touch your session |
-| **Features** | Analyze + actionable advice | All 10 commands: watch, lost, timeline, compare, report, etc. |
+| **Features** | Analyze + actionable advice | All 14 commands: tui, watch, lost, timeline, compare, trend, hooks, etc. |
 | **When to use** | Mid-session: "should I compact?" | Separate terminal: detailed views, live monitoring, past session forensics |
 
 Use `/crusts` when you want a quick answer without leaving your session. Use the CLI when you want the full picture without spending tokens on it.
@@ -323,6 +338,86 @@ claude-crusts calibrate
 # Then paste your /context output and press Enter twice
 ```
 
+### `claude-crusts trend`
+
+Track how your context usage changes across sessions. Shows a sparkline, per-session averages, direction (improving/worsening/flat), and recent session history. Records are saved automatically each time you run `analyze`.
+
+```bash
+claude-crusts trend                  # all sessions
+claude-crusts trend --project myapp  # filter by project
+claude-crusts trend --limit 10       # last 10 sessions
+claude-crusts trend --json           # machine-readable
+```
+
+History is stored at `~/.claude-crusts/history.jsonl` (append-only, deduped by session ID).
+
+### `claude-crusts tui [session-id]`
+
+Interactive REPL shell. Browse sessions, run analysis commands, switch sessions, and compare — all without leaving the app. Features Tab completion for both commands and session IDs, plus clipboard copy for fix blocks.
+
+```bash
+claude-crusts tui                    # launch, auto-selects latest session
+claude-crusts tui a1b2c3d4           # launch with a specific session pre-selected
+```
+
+Once inside, type commands like you would in a shell:
+
+```
+  CRUSTS Interactive Shell
+  Type a command, or "help" for a list of commands.
+
+  ID        Age   Size     Project
+  a1b2c3d4  2m    1.2 MB   my-project
+  e5f6a7b8  1h    856 KB   another-project
+  ...
+
+  Auto-selected most recent session: a1b2c3d4 (my-project)
+  Use "select <id>" to switch, or type a command.
+
+crusts:a1b2c3d4> analyze             # full 6-category breakdown
+crusts:a1b2c3d4> waste               # waste detection report
+crusts:a1b2c3d4> fix                 # pasteable fix prompts
+  Tip: use "copy 1", "copy 2", or "copy 3" to copy a block to clipboard.
+
+crusts:a1b2c3d4> copy 2              # copy CLAUDE.md snippet to clipboard
+  Copied CLAUDE.md snippet to clipboard.
+
+crusts:a1b2c3d4> timeline            # message-by-message growth
+crusts:a1b2c3d4> lost                # what was lost in compaction
+crusts:a1b2c3d4> status              # one-line health check
+crusts:a1b2c3d4> compare e5f6a7b8    # compare with another session
+crusts:a1b2c3d4> trend               # cross-session trends
+crusts:a1b2c3d4> list                # show all sessions
+crusts:a1b2c3d4> select e5f6       # Tab completes session IDs
+crusts:a1b2c3d4> help                # show available commands
+crusts:a1b2c3d4> quit                # exit
+```
+
+**Tab completion** works for both commands and session IDs. Type `sel` + Tab to complete `select`, then type the first few characters of a session ID and press Tab to auto-fill it. Works with `select` and `compare` commands.
+
+**Clipboard copy** lets you quickly grab fix blocks after running `fix`. Each block is numbered — use `copy 1` (session prompt), `copy 2` (CLAUDE.md snippet), or `copy 3` (/compact command). Works on Windows (`clip`), macOS (`pbcopy`), and Linux (`xclip`/`xsel`).
+
+### `claude-crusts status [session-id]`
+
+One-line context health summary. Fast path — classify only, no waste detection or recommendations. Used by hooks but also useful standalone.
+
+```bash
+claude-crusts status
+# CRUSTS: 62.4% (warming) | 45 msgs | 1 compaction
+```
+
+### `claude-crusts hooks enable|disable|status`
+
+Opt-in Claude Code hook integration. When enabled, `claude-crusts status` runs automatically after each Claude Code response, showing a one-line context health indicator.
+
+```bash
+claude-crusts hooks enable           # install hook in ~/.claude/settings.json
+claude-crusts hooks disable          # remove hook (other hooks untouched)
+claude-crusts hooks status           # check if enabled
+```
+
+Not everyone wants context info after every response — this is strictly opt-in.
+
 ### Global Options
 
 ```
@@ -366,7 +461,7 @@ CRUSTS reads Claude Code's session files directly from disk. **No API calls. No 
 
 **Past sessions work.** Claude Code forgets everything when a session ends. The JSONL files remain on disk permanently. CRUSTS can analyze sessions from days or weeks ago — useful for understanding why a past session hit compaction unexpectedly or consumed more tokens than expected.
 
-**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from the first assistant message's API token count minus all known components (CLAUDE.md, tool schemas, memory, skills, first user message). Different sessions with different setups produce different derived values.
+**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from the first assistant message's API token count minus all known components (CLAUDE.md, tool schemas, memory, discovered skills, first user message). Skills are discovered from `settings.json` — not hardcoded. Different sessions with different setups produce different derived values.
 
 **Token estimation** uses `output_tokens` from the API response (exact for assistant messages) and character-based heuristics for everything else (empirically calibrated). Use `claude-crusts calibrate` with `/context` output to measure estimation accuracy for your sessions.
 
@@ -405,6 +500,9 @@ Claude Code's built-in `/context` command gives you a snapshot of your current c
 | Cross-session | None | Side-by-side comparison with auto-generated insights |
 | Compaction detail | None — context is just gone | Reconstructs what was lost: files, conversations, tools, instructions |
 | Live monitoring | None | Real-time dashboard with compaction alerts (`claude-crusts watch`) |
+| Trend tracking | None | Cross-session sparkline, averages, improving/worsening direction |
+| Interactive TUI | None | REPL shell with Tab completion, clipboard copy, all commands interactively |
+| Hook integration | None | Opt-in one-line health summary after every response |
 | Shareable reports | None | Standalone HTML/Markdown file — screenshot for LinkedIn, share with team |
 | Cost | Free (built-in) | Free (offline, zero API calls) |
 
@@ -518,8 +616,8 @@ CRUSTS produces estimates — like `/context` itself, which Claude Code labels "
 - Compaction prediction — based on average token growth rate
 
 **Known limitations:**
-- Memory file detection may undercount (conservative approach)
-- Skills tracked as a fixed estimate (~476 tokens)
+- Memory file detection may undercount (conservative approach — reads MEMORY.md + linked files only)
+- Skills token estimate is per-skill flat rate (~60 tokens each); falls back to 476 total when no skills are discovered
 - CLAUDE.md split recommendations use estimated line ranges
 - Token estimation is calibrated for code-heavy sessions — pure English conversation sessions may vary
 
@@ -545,14 +643,17 @@ bun run typecheck
 The codebase is organized as a pipeline:
 
 ```
-scanner.ts → classifier.ts → waste-detector.ts → recommender.ts → renderer.ts
-                ↑                                                      ↑
-            analyzer.ts (orchestrates)                          calibrator.ts
-                                                                comparator.ts
-                                                                html-report.ts
-                                                                md-report.ts
-                                                                lost-detector.ts
-                                                                watcher.ts
+scanner.ts -> classifier.ts -> waste-detector.ts -> recommender.ts -> renderer.ts
+                  |                                                       |
+              analyzer.ts (orchestrates)                           calibrator.ts
+                  |                                                comparator.ts
+              trend.ts (history)                                   lost-detector.ts
+                                                                   watcher.ts
+                                                                   tui.ts
+                                                                   clipboard.ts
+                                                                   hooks.ts
+                                                                   html-report.ts
+                                                                   md-report.ts
 ```
 
 See [ROADMAP.md](ROADMAP.md) for planned features and contribution opportunities.

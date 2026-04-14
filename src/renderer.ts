@@ -22,6 +22,8 @@ import type {
   Recommendation,
   RecommendationReport,
   ContextHealth,
+  TrendRecord,
+  TrendSummary,
 } from './types.ts';
 import type { LostAnalysis, CompactionLoss, LostItem } from './lost-detector.ts';
 
@@ -879,4 +881,105 @@ function renderCompactionEvent(event: CompactionLoss, w: number): void {
 
   // Per-event total
   lostLine(`  Lost: ~${event.totalLostTokens.toLocaleString()} tokens identified`, w, chalk.dim);
+}
+
+// ---------------------------------------------------------------------------
+// Trend view
+// ---------------------------------------------------------------------------
+
+/** Sparkline characters ordered by magnitude (low → high) */
+const SPARK_CHARS = ['\u2581', '\u2582', '\u2583', '\u2584', '\u2585', '\u2586', '\u2587', '\u2588'];
+
+/**
+ * Build a sparkline string from a numeric series.
+ *
+ * @param values - Array of numbers
+ * @returns A compact one-line sparkline using Unicode block elements
+ */
+function sparkline(values: number[]): string {
+  if (values.length === 0) return '';
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  return values
+    .map((v) => {
+      const idx = Math.round(((v - min) / range) * (SPARK_CHARS.length - 1));
+      return SPARK_CHARS[idx]!;
+    })
+    .join('');
+}
+
+/**
+ * Render the trend dashboard showing historical session statistics.
+ *
+ * @param records - Chronologically-sorted trend records
+ * @param summary - Pre-computed aggregate summary
+ */
+export function renderTrend(records: TrendRecord[], summary: TrendSummary): void {
+  if (records.length === 0) {
+    console.log(chalk.dim('  No trend history yet. Run `claude-crusts analyze` on a few sessions first.'));
+    console.log();
+    return;
+  }
+
+  const w = 62;
+  const border = chalk.bold;
+
+  console.log();
+  console.log(border('\u2554' + '\u2550'.repeat(w) + '\u2557'));
+  console.log(border('\u2551') + chalk.bold.white(`  CRUSTS Trend  (${summary.count} session${summary.count === 1 ? '' : 's'})`.padEnd(w)) + border('\u2551'));
+  console.log(border('\u2560' + '\u2550'.repeat(w) + '\u2563'));
+
+  // Sparkline
+  const spark = sparkline(summary.series);
+  const dirColor = summary.direction === 'improving'
+    ? chalk.green
+    : summary.direction === 'worsening'
+      ? chalk.red
+      : chalk.dim;
+  const dirLabel = summary.direction === 'improving'
+    ? 'improving'
+    : summary.direction === 'worsening'
+      ? 'worsening'
+      : 'flat';
+  const deltaStr = summary.percentUsedDelta >= 0
+    ? `+${summary.percentUsedDelta.toFixed(1)}pp`
+    : `${summary.percentUsedDelta.toFixed(1)}pp`;
+
+  console.log(border('\u2551') + `  Context usage: ${spark}  ${dirColor(dirLabel)} (${deltaStr})`.padEnd(w) + border('\u2551'));
+  console.log(border('\u2560' + '\u2550'.repeat(w) + '\u2563'));
+
+  // Averages
+  const lines: [string, string][] = [
+    ['Avg context used', `${summary.avgPercentUsed.toFixed(1)}%`],
+    ['Avg tokens', summary.avgTotalTokens.toLocaleString(undefined, { maximumFractionDigits: 0 })],
+    ['Avg messages', summary.avgMessageCount.toFixed(0)],
+    ['Avg compactions', summary.avgCompactionCount.toFixed(1)],
+    ['Dominant category', CATEGORY_LABEL[summary.dominantCategory]],
+  ];
+  for (const [label, value] of lines) {
+    const text = `  ${label.padEnd(22)} ${value}`;
+    console.log(border('\u2551') + text.padEnd(w) + border('\u2551'));
+  }
+
+  console.log(border('\u2560' + '\u2550'.repeat(w) + '\u2563'));
+
+  // Recent sessions table (last 10)
+  console.log(border('\u2551') + chalk.bold('  Recent sessions').padEnd(w) + border('\u2551'));
+  console.log(border('\u2551') + chalk.dim('  Session          Used   Msgs  Compact  Health').padEnd(w) + border('\u2551'));
+
+  const recent = records.slice(-10);
+  for (const r of recent) {
+    const sid = r.sessionId.slice(0, 8);
+    const pct = `${r.percentUsed.toFixed(1)}%`.padStart(6);
+    const msgs = String(r.messageCount).padStart(5);
+    const comp = String(r.compactionCount).padStart(5);
+    const hColor = healthColor(r.health);
+    const hLabel = r.health.padEnd(8);
+    const line = `  ${sid.padEnd(17)} ${pct} ${msgs}  ${comp}  `;
+    console.log(border('\u2551') + line + hColor(hLabel) + ' '.repeat(Math.max(0, w - line.length - hLabel.length)) + border('\u2551'));
+  }
+
+  console.log(border('\u255A' + '\u2550'.repeat(w) + '\u255D'));
+  console.log();
 }

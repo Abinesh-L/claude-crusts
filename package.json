@@ -1,6 +1,6 @@
 {
   "name": "claude-crusts",
-  "version": "0.3.1",
+  "version": "0.5.0",
   "description": "Break down your Claude Code context window into the 6 CRUSTS categories. See what's eating your tokens.",
   "type": "module",
   "bin": {

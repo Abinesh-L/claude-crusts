@@ -29,7 +29,7 @@ import type {
 } from './types.ts';
 
 /** Directory where CRUSTS stores its own data */
-const CRUSTS_DIR = join(homedir(), '.claude-crusts');
+export const CRUSTS_DIR = join(homedir(), '.claude-crusts');
 
 /** Path to saved calibration data */
 const CALIBRATION_PATH = join(CRUSTS_DIR, 'calibration.json');
