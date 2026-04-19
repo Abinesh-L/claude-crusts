@@ -53,4 +53,5 @@ PROJECT_STATUS.md
 # local-only docs (not pushed to git)
 FEATURES-v0.4-v0.5.md
 FIXES-*.md
+HANDOFF.md
 ROADMAP.md
