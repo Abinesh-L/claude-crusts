@@ -8,7 +8,6 @@
 
 import type {
   CrustsBreakdown,
-  ClassifiedMessage,
   WasteItem,
   Recommendation,
   RecommendationReport,
@@ -17,6 +16,7 @@ import type {
   SessionMessage,
   FixPrompts,
 } from './types.ts';
+import { buildCompactFocus } from './optimizer.ts';
 
 /**
  * Auto-compaction triggers at ~80% of context window.
@@ -117,48 +117,31 @@ function recommendDuplicateFiles(waste: WasteItem[]): Recommendation[] {
 function recommendCompactCommand(
   waste: WasteItem[],
   breakdown: CrustsBreakdown,
-  messages: SessionMessage[],
 ): Recommendation[] {
   const ctx = breakdown.currentContext ?? breakdown;
   if (ctx.total_tokens < breakdown.context_limit * 0.5) return [];
 
-  // Find the oldest message range containing waste
-  const wasteWithRanges = waste
-    .filter((w) => w.message_range && w.estimated_tokens > 100)
-    .sort((a, b) => a.message_range![0] - b.message_range![0]);
-
-  if (wasteWithRanges.length === 0) {
-    // No specific waste ranges, but context is high — suggest general compact
+  // Share the waste-driven focus-string generator with `fix` block 3 and
+  // `optimize`'s compact-focus entry, so all three commands emit the same
+  // text on the same session.
+  const focus = buildCompactFocus(waste);
+  if (focus) {
+    const wasteCount = waste.filter((w) => w.message_range && w.estimated_tokens > 100).length;
     return [{
       priority: 1,
-      action: '/compact',
-      impact: Math.floor(ctx.total_tokens * 0.25),
-      reason: `Context at ${ctx.usage_percentage.toFixed(0)}%. Compaction will summarize older messages and free ~25% of tokens.`,
+      action: focus.text,
+      impact: focus.savings,
+      reason: `${wasteCount} waste item(s) in older messages. Compacting frees ~${focus.savings.toLocaleString()} tokens while retaining recent work.`,
     }];
   }
 
-  // Accumulate waste from the oldest block forward
-  let cutoff = wasteWithRanges[0]!.message_range![1];
-  let savings = 0;
-  for (const w of wasteWithRanges) {
-    if (w.message_range![0] <= cutoff + 10) {
-      cutoff = Math.max(cutoff, w.message_range![1]);
-      savings += w.estimated_tokens;
-    }
-  }
-
-  const startMsg = breakdown.currentContext?.startIndex ?? 0;
-  const keepFrom = cutoff + startMsg;
-  const focusHint = extractCompactFocusHint(messages, breakdown.messages, keepFrom);
-  const action = focusHint
-    ? `/compact focus on ${focusHint}`
-    : '/compact';
-
+  // No targetable high/medium waste — context is still high enough to warrant
+  // a general compact suggestion.
   return [{
     priority: 1,
-    action,
-    impact: savings,
-    reason: `${wasteWithRanges.length} waste items in older messages. Compacting frees ~${savings.toLocaleString()} tokens while retaining recent work.`,
+    action: '/compact',
+    impact: Math.floor(ctx.total_tokens * 0.25),
+    reason: `Context at ${ctx.usage_percentage.toFixed(0)}%. Compaction will summarize older messages and free ~25% of tokens.`,
   }];
 }
 
@@ -514,7 +497,7 @@ export function generateRecommendations(
   messages: SessionMessage[],
 ): RecommendationReport {
   const recommendations: Recommendation[] = [
-    ...recommendCompactCommand(waste, breakdown, messages),
+    ...recommendCompactCommand(waste, breakdown),
     ...recommendCompactionPrediction(breakdown),
     ...recommendDuplicateFiles(waste),
     ...recommendTopConsumers(breakdown, waste, configData, messages),
@@ -528,7 +511,11 @@ export function generateRecommendations(
   return {
     recommendations,
     estimated_messages_until_compaction: estimateMessagesUntilCompaction(breakdown),
-    context_health: getContextHealth(breakdown.usage_percentage),
+    // Post-compaction sessions have `currentContext.usage_percentage` reflecting
+    // the live window. `breakdown.usage_percentage` is the LIFETIME ratio
+    // (cumulative tokens across all compactions) which routinely exceeds 100%
+    // and would misread as "critical" even when the live window is cold.
+    context_health: getContextHealth(breakdown.currentContext?.usage_percentage ?? breakdown.usage_percentage),
   };
 }
 
@@ -579,19 +566,17 @@ function extractDuplicateFiles(waste: WasteItem[]): DupeFileInfo[] {
  * @param breakdown - CRUSTS breakdown
  * @param waste - Detected waste items
  * @param configData - Config data from scanner
- * @param messages - Raw session messages for context extraction
  * @returns Fix prompts ready for pasting
  */
 export function generateFixPrompts(
   breakdown: CrustsBreakdown,
   waste: WasteItem[],
   configData: ConfigData,
-  messages: SessionMessage[],
 ): FixPrompts {
   return {
     sessionPrompt: buildSessionPrompt(breakdown, waste),
     claudeMdSnippet: buildClaudeMdSnippet(breakdown, waste, configData),
-    compactCommand: buildCompactCommand(breakdown, waste, messages),
+    compactCommand: buildCompactCommand(breakdown, waste),
   };
 }
 
@@ -676,81 +661,16 @@ function buildClaudeMdSnippet(
   return sections.join('\n');
 }
 
-/** Tool names whose input contains a file_path or path field */
-const FILE_TOOLS = new Set(['Read', 'FileReadTool', 'Write', 'FileWriteTool', 'Edit', 'FileEditTool', 'NotebookEdit']);
-
 /**
- * Extract a content-based focus hint for /compact from recent messages.
+ * Build a specific /compact command for the `fix` command's block 3.
  *
- * Looks at messages after `keepFromIndex` to find filenames being worked on
- * and user task context, then builds a natural language focus string.
+ * Delegates the focus-string generation to `optimizer.ts:buildCompactFocus`
+ * so the `fix` and `optimize` commands emit byte-identical /compact-focus
+ * strings on the same session.
  *
- * @param messages - Raw session messages
- * @param classified - Classified messages
- * @param keepFromIndex - Index of first message to keep (scan these for context)
- * @returns Focus hint string or null if not enough context
- */
-function extractCompactFocusHint(
-  messages: SessionMessage[],
-  classified: ClassifiedMessage[],
-  keepFromIndex: number,
-): string | null {
-  const recentFiles = new Set<string>();
-  const userPhrases: string[] = [];
-
-  // Scan messages we want to KEEP for context about current work
-  for (let i = keepFromIndex; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!msg) continue;
-    const content = msg.message?.content;
-    if (!Array.isArray(content)) continue;
-
-    for (const block of content) {
-      // Extract filenames from file tool calls
-      if (block.type === 'tool_use' && block.name && FILE_TOOLS.has(block.name)) {
-        const filePath = (block.input?.file_path as string | undefined)
-          ?? (block.input?.path as string | undefined);
-        if (filePath) {
-          const parts = filePath.replace(/\\/g, '/').split('/');
-          const name = parts[parts.length - 1];
-          if (name) recentFiles.add(name);
-        }
-      }
-
-      // Extract user task descriptions (short user text messages)
-      if (block.type === 'text' && block.text && msg.type === 'user') {
-        const text = block.text.trim();
-        if (text.length > 5 && text.length < 200) {
-          userPhrases.push(text);
-        }
-      }
-    }
-  }
-
-  const parts: string[] = [];
-
-  // Add file context (up to 5 most recently seen files)
-  if (recentFiles.size > 0) {
-    const files = [...recentFiles].slice(-5);
-    parts.push(`the ${files.join(', ')} changes`);
-  }
-
-  // Add task context from the last meaningful user message
-  if (userPhrases.length > 0) {
-    const lastPhrase = userPhrases[userPhrases.length - 1]!;
-    // Extract a short task summary — first sentence or first 80 chars
-    const sentence = lastPhrase.split(/[.!?\n]/)[0]?.trim() ?? '';
-    if (sentence.length > 10 && sentence.length <= 80) {
-      parts.push(sentence.toLowerCase());
-    }
-  }
-
-  if (parts.length === 0) return null;
-  return parts.join(' and ');
-}
-
-/**
- * Build a specific /compact command with content-based focus hint.
+ * Gate: below 50% usage, don't surface a compact suggestion at all. Above
+ * 50% with targeted waste, emit the waste-driven focus command. Above 70%
+ * with no targetable waste, fall back to a plain `/compact`.
  *
  * @param breakdown - CRUSTS breakdown
  * @param waste - Detected waste items
@@ -759,37 +679,11 @@ function extractCompactFocusHint(
 function buildCompactCommand(
   breakdown: CrustsBreakdown,
   waste: WasteItem[],
-  messages: SessionMessage[],
 ): string | null {
   const ctx = breakdown.currentContext ?? breakdown;
-
-  // Only suggest compact if context is above 50%
   if (ctx.usage_percentage < 50) return null;
-
-  // Find the oldest waste range
-  const wasteWithRanges = waste
-    .filter((w) => w.message_range && w.estimated_tokens > 100)
-    .sort((a, b) => a.message_range![0] - b.message_range![0]);
-
-  if (wasteWithRanges.length > 0) {
-    let cutoff = wasteWithRanges[0]!.message_range![1];
-    for (const w of wasteWithRanges) {
-      if (w.message_range![0] <= cutoff + 10) {
-        cutoff = Math.max(cutoff, w.message_range![1]);
-      }
-    }
-    const startMsg = breakdown.currentContext?.startIndex ?? 0;
-    const keepFrom = cutoff + startMsg;
-    const focusHint = extractCompactFocusHint(messages, breakdown.messages, keepFrom);
-    return focusHint
-      ? `/compact focus on ${focusHint}`
-      : '/compact';
-  }
-
-  // General compact if context is high
-  if (ctx.usage_percentage >= 70) {
-    return '/compact';
-  }
-
+  const focus = buildCompactFocus(waste);
+  if (focus) return focus.text;
+  if (ctx.usage_percentage >= 70) return '/compact';
   return null;
 }

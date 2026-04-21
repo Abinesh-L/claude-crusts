@@ -6,18 +6,30 @@
  * all without leaving the app.
  *
  * Commands inside the TUI:
- *   list / ls           — show all sessions
- *   select <id>         — load a session by ID prefix
- *   analyze             — full CRUSTS breakdown of current session
- *   waste               — waste detection report
- *   fix                 — pasteable fix prompts
- *   timeline            — message-by-message context growth
- *   lost                — what was lost in compaction
- *   trend               — cross-session trends
- *   compare <id>        — compare current session with another
- *   status              — one-line health check
- *   help / ?            — show available commands
- *   quit / exit / q     — exit the TUI
+ *   list / ls                    — show all sessions
+ *   select <id>                  — load a session by ID prefix
+ *   analyze                      — full CRUSTS breakdown of current session
+ *   waste                        — waste detection report
+ *   fix                          — pasteable fix prompts (copy <1|2|3>)
+ *   optimize                     — ranked actionable fixes with token-savings ROI
+ *   models                       — per-session model usage snapshot
+ *   timeline                     — message-by-message context growth
+ *   diff <from> <to>             — intra-session delta between two message indexes
+ *   lost                         — what was lost in compaction
+ *   trend                        — cross-session trends
+ *   compare <id>                 — compare current session with another
+ *   status                       — one-line health check
+ *   doctor                       — sanity-check the claude-crusts install
+ *   hooks <enable|disable|status> — manage status hook
+ *   auto-inject <enable|...>     — manage self-healing UserPromptSubmit hook
+ *   bench compare <a> <b>        — diff two bench-compact result JSON files
+ *   bench reextract <result>     — re-run file-ref extractor on a bench result
+ *   help / ?                     — show available commands
+ *   quit / exit / q              — exit the TUI
+ *
+ * Out of scope for the TUI (use the CLI instead): `optimize --apply` (spawns
+ * its own readline dialog that would collide with ours), `bench compact`
+ * (long-running JSONL watch), `watch`, `calibrate`, `report`.
  */
 
 import { createInterface } from 'readline';
@@ -38,16 +50,34 @@ import {
   renderComparison,
   renderLost,
   renderTrend,
+  renderModelHistory,
 } from './renderer.ts';
 import type { SessionInfo, AnalysisResult, FixPrompts } from './types.ts';
 import { copyToClipboard } from './clipboard.ts';
+import { buildOptimizeReport, renderOptimizeReport } from './optimizer.ts';
+import { runDoctor, renderDoctor } from './doctor.ts';
+import { computeSessionDiff, renderSessionDiff } from './session-diff.ts';
+import {
+  enableHooks,
+  disableHooks,
+  hooksStatus,
+  enableAutoInject,
+  disableAutoInject,
+  autoInjectStatus,
+} from './hooks.ts';
+import {
+  loadBenchResult,
+  compareBenchResults,
+  renderBenchComparison,
+  reextractSummaryRefs,
+} from './bench.ts';
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
-/** Current TUI state */
-interface TuiState {
+/** Current TUI state (exported for tests). */
+export interface TuiState {
   sessions: SessionInfo[];
   current: SessionInfo | null;
   result: AnalysisResult | null;
@@ -75,23 +105,37 @@ function printBanner(): void {
 function printHelp(): void {
   console.log();
   console.log(chalk.bold('  Session'));
-  console.log(chalk.dim('    list, ls') + '           Show all discovered sessions');
-  console.log(chalk.dim('    select <id>') + '        Load a session by ID prefix');
+  console.log(chalk.dim('    list, ls') + '              Show all discovered sessions');
+  console.log(chalk.dim('    select <id>') + '           Load a session by ID prefix');
   console.log();
   console.log(chalk.bold('  Analysis') + chalk.dim(' (requires a selected session)'));
-  console.log(chalk.dim('    analyze') + '            Full 6-category CRUSTS breakdown');
-  console.log(chalk.dim('    waste') + '              Waste detection report');
-  console.log(chalk.dim('    fix') + '                Pasteable fix prompts');
-  console.log(chalk.dim('    copy <1|2|3>') + '       Copy a fix block to clipboard');
-  console.log(chalk.dim('    timeline') + '           Message-by-message context growth');
-  console.log(chalk.dim('    lost') + '               What was lost in compaction');
-  console.log(chalk.dim('    status') + '             One-line health summary');
-  console.log(chalk.dim('    compare <id>') + '       Compare with another session');
+  console.log(chalk.dim('    analyze') + '               Full 6-category CRUSTS breakdown');
+  console.log(chalk.dim('    waste') + '                 Waste detection report');
+  console.log(chalk.dim('    fix') + '                   Pasteable fix prompts');
+  console.log(chalk.dim('    copy <1|2|3>') + '          Copy a fix block to clipboard');
+  console.log(chalk.dim('    optimize') + '              Ranked actionable fixes with ROI (dry-run)');
+  console.log(chalk.dim('    models') + '                Per-session model usage snapshot');
+  console.log(chalk.dim('    timeline') + '              Message-by-message context growth');
+  console.log(chalk.dim('    diff <from> <to>') + '      Intra-session delta between two indexes');
+  console.log(chalk.dim('    lost') + '                  What was lost in compaction');
+  console.log(chalk.dim('    status') + '                One-line health summary');
+  console.log(chalk.dim('    compare <id>') + '          Compare with another session');
+  console.log();
+  console.log(chalk.bold('  Management'));
+  console.log(chalk.dim('    doctor') + '                Sanity-check the install');
+  console.log(chalk.dim('    hooks <enable|disable|status>') + '     Status hook');
+  console.log(chalk.dim('    auto-inject <enable|disable|status>') + '  Self-healing hook');
+  console.log();
+  console.log(chalk.bold('  Bench'));
+  console.log(chalk.dim('    bench compare <a> <b>') + ' Diff two bench-compact JSON files');
+  console.log(chalk.dim('    bench reextract <r>') + '   Re-run file-ref extractor on a result');
   console.log();
   console.log(chalk.bold('  Global'));
-  console.log(chalk.dim('    trend') + '              Cross-session trends');
-  console.log(chalk.dim('    help, ?') + '            Show this help');
-  console.log(chalk.dim('    quit, exit, q') + '      Exit');
+  console.log(chalk.dim('    trend') + '                 Cross-session trends');
+  console.log(chalk.dim('    help, ?') + '               Show this help');
+  console.log(chalk.dim('    quit, exit, q') + '         Exit');
+  console.log();
+  console.log(chalk.dim('  Out of scope for TUI (use CLI): optimize --apply, bench compact, watch, calibrate, report'));
   console.log();
 }
 
@@ -161,11 +205,13 @@ function getPrompt(state: TuiState): string {
 /**
  * Execute a single TUI command.
  *
+ * Exported so tests can drive dispatch without starting a readline loop.
+ *
  * @param input - Raw user input
  * @param state - TUI state (mutated in place)
  * @returns False if the TUI should exit, true to continue
  */
-async function executeCommand(input: string, state: TuiState): Promise<boolean> {
+export async function executeCommand(input: string, state: TuiState): Promise<boolean> {
   const trimmed = input.trim();
   if (!trimmed) return true;
 
@@ -232,7 +278,7 @@ async function executeCommand(input: string, state: TuiState): Promise<boolean> 
     case 'fix': {
       if (!(await ensureAnalysis(state))) return true;
       const r = state.result!;
-      const fix = generateFixPrompts(r.breakdown, r.waste, r.configData, r.messages);
+      const fix = generateFixPrompts(r.breakdown, r.waste, r.configData);
       state.lastFix = fix;
       renderFix(fix, r.sessionId);
       if (fix.sessionPrompt || fix.claudeMdSnippet || fix.compactCommand) {
@@ -364,6 +410,139 @@ async function executeCommand(input: string, state: TuiState): Promise<boolean> 
       return true;
     }
 
+    case 'optimize': {
+      // Route the apply short-circuit BEFORE requiring a session — the CLI
+      // pointer is the same advice regardless of state.
+      if (arg && /^apply$/i.test(arg)) {
+        console.log(chalk.yellow('  `optimize apply` is CLI-only — run it from a separate shell:'));
+        console.log(chalk.dim('    claude-crusts optimize --apply'));
+        console.log(chalk.dim('  (The TUI\'s active readline would collide with the per-fix confirmation dialog.)'));
+        console.log();
+        return true;
+      }
+      if (!(await ensureAnalysis(state))) return true;
+      const r = state.result!;
+      const report = buildOptimizeReport(
+        r.sessionId,
+        r.breakdown,
+        r.waste,
+        r.configData,
+        r.messages,
+        process.cwd(),
+      );
+      renderOptimizeReport(report);
+      return true;
+    }
+
+    case 'doctor': {
+      const report = runDoctor();
+      renderDoctor(report);
+      return true;
+    }
+
+    case 'models': {
+      if (!(await ensureAnalysis(state))) return true;
+      const history = state.result!.breakdown.modelHistory;
+      if (!history) {
+        console.log(chalk.yellow('  This session has no recorded model history (pre-v0.7.0 data).'));
+        return true;
+      }
+      renderModelHistory(history, state.result!.sessionId);
+      return true;
+    }
+
+    case 'diff': {
+      if (!(await ensureAnalysis(state))) return true;
+      const from = arg ? parseInt(arg, 10) : NaN;
+      const to = parts[2] ? parseInt(parts[2], 10) : NaN;
+      if (!Number.isFinite(from) || !Number.isFinite(to)) {
+        console.log(chalk.yellow('  Usage: diff <from-index> <to-index>'));
+        return true;
+      }
+      try {
+        const messages = await parseSession(state.current!.path);
+        const configData = gatherConfigData();
+        const diff = computeSessionDiff(messages, configData, state.current!.id, from, to);
+        renderSessionDiff(diff);
+      } catch (err) {
+        console.log(chalk.red(`  ${err instanceof Error ? err.message : String(err)}`));
+      }
+      return true;
+    }
+
+    case 'hooks': {
+      const sub = (arg ?? '').toLowerCase();
+      switch (sub) {
+        case 'enable': enableHooks(); break;
+        case 'disable': disableHooks(); break;
+        case 'status':
+        case '':
+          hooksStatus();
+          break;
+        default:
+          console.log(chalk.yellow(`  Unknown hooks subcommand: ${sub}. Use enable|disable|status.`));
+      }
+      return true;
+    }
+
+    case 'auto-inject': {
+      const sub = (arg ?? '').toLowerCase();
+      switch (sub) {
+        case 'enable': enableAutoInject(); break;
+        case 'disable': disableAutoInject(); break;
+        case 'status':
+        case '':
+          autoInjectStatus();
+          break;
+        default:
+          console.log(chalk.yellow(`  Unknown auto-inject subcommand: ${sub}. Use enable|disable|status.`));
+      }
+      return true;
+    }
+
+    case 'bench': {
+      const sub = (arg ?? '').toLowerCase();
+      if (sub === 'compact') {
+        console.log(chalk.yellow('  `bench compact` is CLI-only — it tails a JSONL file for minutes.'));
+        console.log(chalk.dim('    claude-crusts bench compact [session-id] --output <path>'));
+        console.log();
+        return true;
+      }
+      if (sub === 'compare') {
+        const aPath = parts[2];
+        const bPath = parts[3];
+        if (!aPath || !bPath) {
+          console.log(chalk.yellow('  Usage: bench compare <a.json> <b.json>'));
+          return true;
+        }
+        try {
+          const a = loadBenchResult(aPath);
+          const b = loadBenchResult(bPath);
+          renderBenchComparison(compareBenchResults(a, b));
+        } catch (err) {
+          console.log(chalk.red(`  ${err instanceof Error ? err.message : String(err)}`));
+        }
+        return true;
+      }
+      if (sub === 'reextract') {
+        const resultPath = parts[2];
+        if (!resultPath) {
+          console.log(chalk.yellow('  Usage: bench reextract <result.json>'));
+          return true;
+        }
+        try {
+          const { priorRefCount, newRefCount } = await reextractSummaryRefs(resultPath);
+          console.log(chalk.green(`  Rewrote ${resultPath}: ${priorRefCount} → ${newRefCount} refs.`));
+        } catch (err) {
+          console.log(chalk.red(`  ${err instanceof Error ? err.message : String(err)}`));
+        }
+        return true;
+      }
+      console.log(chalk.yellow('  Usage: bench compare <a> <b>  |  bench reextract <result>'));
+      console.log(chalk.dim('         (bench compact is CLI-only — it blocks for minutes)'));
+      return true;
+    }
+
     default:
       console.log(chalk.yellow(`  Unknown command: ${cmd}. Type "help" for available commands.`));
       return true;
@@ -426,8 +605,10 @@ export async function startTui(basePath?: string, initialSessionId?: string): Pr
 
   /** All available TUI commands */
   const ALL_CMDS = [
-    'analyze', 'waste', 'fix', 'copy', 'timeline', 'lost', 'status',
-    'compare', 'trend', 'list', 'ls', 'select', 'help', 'quit', 'exit', 'q',
+    'analyze', 'waste', 'fix', 'copy', 'optimize', 'models', 'timeline', 'diff', 'lost',
+    'status', 'compare', 'trend', 'list', 'ls', 'select',
+    'doctor', 'hooks', 'auto-inject', 'bench',
+    'help', 'quit', 'exit', 'q',
   ];
 
   /**

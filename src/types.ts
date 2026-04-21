@@ -201,6 +201,30 @@ export interface ToolBreakdown {
   resultTokens: number;
 }
 
+/** Per-MCP-server invocation stats */
+export interface MCPServerStats {
+  /** Server name (e.g., "gmail", "calendar") */
+  name: string;
+  /** Where the server is configured */
+  source: 'global' | 'project';
+  /** Number of tool invocations from this server in the session */
+  invocationCount: number;
+  /** Sum of tool_use + tool_result tokens for this server's calls */
+  tokensSpent: number;
+  /** Whether the server was configured but had zero invocations */
+  unused: boolean;
+}
+
+/** Per-MCP-server breakdown across the session */
+export interface MCPBreakdown {
+  /** One entry per configured server, sorted by tokensSpent desc */
+  servers: MCPServerStats[];
+  /** Servers configured but with zero invocations this session */
+  unusedServers: string[];
+  /** Total tokens spent on MCP invocations across all servers */
+  totalMcpTokens: number;
+}
+
 // ---------------------------------------------------------------------------
 // Analysis output types
 // ---------------------------------------------------------------------------
@@ -265,17 +289,102 @@ export interface DerivedOverhead {
   } | null;
 }
 
+/**
+ * A contiguous run of assistant messages on a single model.
+ *
+ * When a session is driven entirely by one model, there is exactly one
+ * segment. Switching to a different model mid-session starts a new segment;
+ * switching back (e.g. sonnet → opus → sonnet) creates a third segment so
+ * the full chronological flow is preserved rather than deduplicated.
+ */
+export interface ModelSegment {
+  /** Model identifier as recorded in the JSONL (e.g. `claude-sonnet-4-6`) */
+  model: string;
+  /** 0-based index into `messages` of the first assistant turn in this segment */
+  firstMessageIndex: number;
+  /** 0-based index into `messages` of the last assistant turn in this segment */
+  lastMessageIndex: number;
+  /** Number of assistant turns attributed to this model segment */
+  assistantMessageCount: number;
+  /** Sum of `usage.input_tokens` across assistant turns in the segment */
+  totalInputTokens: number;
+  /** Sum of `usage.output_tokens` across assistant turns in the segment */
+  totalOutputTokens: number;
+  /** Sum of `usage.cache_creation_input_tokens` across assistant turns */
+  cacheCreationTokens: number;
+  /** Sum of `usage.cache_read_input_tokens` across assistant turns */
+  cacheReadTokens: number;
+  /** ISO timestamp of the first assistant turn in this segment (if available) */
+  firstSeenAt: string | null;
+  /** ISO timestamp of the last assistant turn in this segment (if available) */
+  lastSeenAt: string | null;
+}
+
+/**
+ * Per-session model usage snapshot.
+ *
+ * Enables the `models` command and the "switched from X" hint in analyze
+ * headers. `current` reflects the LAST non-synthetic assistant model —
+ * that's the model Claude Code was using at the most recent turn and the
+ * most useful summary when a user asks "what am I on now?".
+ */
+export interface ModelHistory {
+  /** All non-synthetic segments in chronological order */
+  segments: ModelSegment[];
+  /** Unique list of models seen (first-occurrence order, de-duplicated) */
+  uniqueModels: string[];
+  /** The most recent non-synthetic model, or 'unknown' if none found */
+  current: string;
+  /** Number of model changes — `segments.length - 1`, clamped to ≥ 0 */
+  switchCount: number;
+}
+
 /** Full CRUSTS breakdown for a session */
 export interface CrustsBreakdown {
   buckets: CrustsBucket[];
+  /**
+   * Authoritative window size in tokens — from the last non-synthetic
+   * assistant turn's API-reported effective input (`input_tokens +
+   * cache_creation_input_tokens + cache_read_input_tokens`). Falls back to
+   * the classifier's content-sum (`contentSumTokens`) when no assistant turn
+   * with usage data exists in the session.
+   *
+   * Use this for "how full is my context window?" questions. For "what fills
+   * the window?" use the per-bucket breakdown.
+   */
   total_tokens: number;
+  /**
+   * Sum of per-message classified tokens across all messages, by category.
+   * Always equals `buckets.reduce((s, b) => s + b.tokens, 0)`. Preserved as
+   * a distinct field so --verbose diagnostics can show the classifier's
+   * internal content accounting alongside the API's window size.
+   *
+   * For short sessions CRUSTS' content-sum UNDER-reports the window (cached
+   * prior conversation re-sent each turn appears once in the API's number
+   * but isn't classified per-message). For long multi-compact sessions it
+   * OVER-reports (per-turn outputs accumulate even though subsequent turns
+   * see them only via cache). The API number is the truth.
+   */
+  contentSumTokens?: number;
   context_limit: number;
   free_tokens: number;
   usage_percentage: number;
   messages: ClassifiedMessage[];
   toolBreakdown: ToolBreakdown;
-  /** Model name extracted from first non-synthetic assistant message */
+  /** Per-MCP-server invocation breakdown (if any MCP servers configured) */
+  mcpBreakdown?: MCPBreakdown;
+  /**
+   * Primary model for this session — the LAST non-synthetic assistant model.
+   * Reflects the current model at the most recent turn. For multi-model
+   * sessions, see `modelHistory` for full segment attribution.
+   */
   model: string;
+  /**
+   * Per-session model usage snapshot. Always populated (even for single-model
+   * sessions — which produce a `segments` array with one entry). Optional on
+   * the type for backward compatibility with pre-v0.7.0 consumers.
+   */
+  modelHistory?: ModelHistory;
   /** Session duration in seconds, or null if timestamps unavailable */
   durationSeconds: number | null;
   /** Detected compaction events */
@@ -283,7 +392,12 @@ export interface CrustsBreakdown {
   /** If compaction occurred, breakdown of only post-last-compaction context */
   currentContext?: {
     buckets: CrustsBucket[];
+    /** API-derived effective input for the last assistant turn in the slice;
+     * falls back to content-sum of the slice when no API usage available. */
     total_tokens: number;
+    /** Classifier's content-sum across the slice. Same rationale as
+     * `CrustsBreakdown.contentSumTokens` — diagnostic, not authoritative. */
+    contentSumTokens?: number;
     free_tokens: number;
     usage_percentage: number;
     startIndex: number;
@@ -439,6 +553,8 @@ export interface TrendRecord {
   health: ContextHealth;
   topCategory: CrustsCategory;
   topCategoryTokens: number;
+  /** Model-dependent context window used for this record. Optional for backward compatibility with pre-v0.6.0 history. */
+  contextLimit?: number;
 }
 
 /** Aggregate summary computed across a list of TrendRecords */

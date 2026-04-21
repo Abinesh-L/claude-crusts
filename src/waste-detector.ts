@@ -14,15 +14,21 @@ import type {
   WasteItem,
   ConfigData,
 } from './types.ts';
+import { loadWasteThresholds, describeThresholdOverrides } from './config.ts';
+
+// Thresholds are bound at the top of `detectWaste` from user config (with
+// defaults from `config.ts`). Kept as module-level `let`s so the internal
+// helpers need no signature changes — the only public entrypoint is
+// `detectWaste`, which always rebinds these before running its pipeline.
 
 /** How many messages back before a file read is considered "stale" */
-const STALE_READ_THRESHOLD = 15;
+let STALE_READ_THRESHOLD = 15;
 
 /** System prompt token threshold before we flag it as oversized */
-const OVERSIZED_SYSTEM_THRESHOLD = 1_500;
+let OVERSIZED_SYSTEM_THRESHOLD = 1_500;
 
 /** Cache read ratio threshold before we warn */
-const CACHE_OVERHEAD_THRESHOLD = 0.6;
+let CACHE_OVERHEAD_THRESHOLD = 0.6;
 
 /** Phrases that indicate a debug exchange was resolved */
 const RESOLUTION_PHRASES = [
@@ -43,7 +49,7 @@ const RESOLUTION_PHRASES = [
 ];
 
 /** Max messages to look back from a resolution marker */
-const RESOLUTION_LOOKBACK = 10;
+let RESOLUTION_LOOKBACK = 10;
 
 /** Characters per token estimation heuristic */
 const CHARS_PER_TOKEN = 4;
@@ -571,6 +577,14 @@ export function detectWaste(
   breakdown: CrustsBreakdown,
   configData: ConfigData,
 ): WasteItem[] {
+  // Apply user-configured thresholds from ~/.claude-crusts/config.json
+  // (falls through to defaults for unset keys).
+  const thresholds = loadWasteThresholds();
+  STALE_READ_THRESHOLD = thresholds.staleReadThreshold;
+  OVERSIZED_SYSTEM_THRESHOLD = thresholds.oversizedSystemThreshold;
+  CACHE_OVERHEAD_THRESHOLD = thresholds.cacheOverheadThreshold;
+  RESOLUTION_LOOKBACK = thresholds.resolutionLookback;
+
   // If compaction occurred, only analyze post-compaction messages
   const startIndex = breakdown.currentContext?.startIndex ?? 0;
   const effectiveMessages = startIndex > 0 ? messages.slice(startIndex) : messages;

@@ -82,6 +82,7 @@ export function recordTrend(result: AnalysisResult): void {
       health: classifyHealth(view.usage_percentage),
       topCategory,
       topCategoryTokens,
+      contextLimit: breakdown.context_limit,
     };
 
     if (!existsSync(CRUSTS_DIR)) {
@@ -210,4 +211,55 @@ export function summarizeTrend(records: TrendRecord[]): TrendSummary {
     percentUsedDelta,
     series: percents,
   };
+}
+
+/** Escape a single CSV cell — double internal quotes and wrap if needed. */
+function csvEscape(value: string | number | undefined): string {
+  if (value === undefined || value === null) return '';
+  const s = String(value);
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+/**
+ * Serialise a list of trend records as a CSV document.
+ *
+ * Columns follow the TrendRecord schema verbatim, including the
+ * optional `contextLimit` column (empty for pre-v0.6.0 records that
+ * predate that field). Timestamps are kept as ISO strings so they sort
+ * lexically in spreadsheets. The header is always emitted.
+ *
+ * @param records - Trend records (any order; caller decides)
+ * @returns CSV text including a trailing newline
+ */
+export function formatTrendAsCsv(records: TrendRecord[]): string {
+  const header = [
+    'sessionId',
+    'projectName',
+    'timestamp',
+    'totalTokens',
+    'percentUsed',
+    'messageCount',
+    'compactionCount',
+    'health',
+    'topCategory',
+    'topCategoryTokens',
+    'contextLimit',
+  ].join(',');
+
+  const lines = records.map((r) => [
+    csvEscape(r.sessionId),
+    csvEscape(r.projectName),
+    csvEscape(r.timestamp),
+    csvEscape(r.totalTokens),
+    csvEscape(r.percentUsed.toFixed(2)),
+    csvEscape(r.messageCount),
+    csvEscape(r.compactionCount),
+    csvEscape(r.health),
+    csvEscape(r.topCategory),
+    csvEscape(r.topCategoryTokens),
+    csvEscape(r.contextLimit),
+  ].join(','));
+
+  return [header, ...lines].join('\n') + '\n';
 }

@@ -99,7 +99,7 @@ export function generateSessionReportMd(result: AnalysisResult, fix: FixPrompts)
   lines.push(`**Context:** ${fmt(primaryTotal)} / ${fmt(bd.context_limit)} tokens (${primaryPct.toFixed(1)}% used)`);
   lines.push(`**Free space:** ${fmt(primaryFree)} tokens`);
   if (hasCompaction) {
-    lines.push(`**Session lifetime:** ${fmt(bd.total_tokens)} tokens across ${result.messageCount} messages`);
+    lines.push(`**Session lifetime:** ${fmt(bd.contentSumTokens ?? bd.total_tokens)} tokens across ${result.messageCount} messages`);
   }
   lines.push('');
 

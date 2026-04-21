@@ -22,6 +22,7 @@ import type {
   Recommendation,
   RecommendationReport,
   ContextHealth,
+  ModelHistory,
   TrendRecord,
   TrendSummary,
 } from './types.ts';
@@ -166,7 +167,16 @@ export function renderAnalysis(
   messageCount: number,
 ): void {
   const hc = healthColor(report.context_health);
-  const model = breakdown.model;
+  // Multi-model sessions: append "(switched from <first>)" so the header
+  // reflects the full flow rather than fixating on the last model only.
+  // `current` in modelHistory is identical to `breakdown.model`; we compare
+  // the first-seen model to detect switches without double-counting when
+  // the user returned to the starting model.
+  const modelHistory = breakdown.modelHistory;
+  const firstModel = modelHistory?.segments[0]?.model;
+  const model = modelHistory && modelHistory.switchCount > 0 && firstModel && firstModel !== breakdown.model
+    ? `${breakdown.model} (switched from ${firstModel})`
+    : breakdown.model;
   const duration = formatDuration(breakdown.durationSeconds);
 
   // Determine which view to show primarily
@@ -210,9 +220,14 @@ export function renderAnalysis(
   console.log(chalk.bold('\u2551') + `  FREE:  ${primaryFree.toLocaleString()} tokens`.padEnd(62) + chalk.bold('\u2551'));
   console.log(chalk.bold('\u2551') + ' '.repeat(62) + chalk.bold('\u2551'));
 
-  // Session lifetime summary (if compacted, show as secondary info)
+  // Session lifetime summary (if compacted, show as secondary info).
+  // Uses `contentSumTokens` — the classifier's per-message content sum
+  // across all messages — because `total_tokens` is now the API-derived
+  // current window size, not a lifetime accumulator. Falls back to
+  // `total_tokens` for pre-v0.7.0 fixtures where contentSumTokens is undefined.
   if (hasCompaction) {
-    const lifetimeLine = `  Session lifetime: ${breakdown.total_tokens.toLocaleString()} tokens across ${messageCount} messages`;
+    const lifetimeTokens = breakdown.contentSumTokens ?? breakdown.total_tokens;
+    const lifetimeLine = `  Session lifetime: ${lifetimeTokens.toLocaleString()} tokens across ${messageCount} messages`;
     console.log(chalk.bold('\u2551') + chalk.dim(lifetimeLine.padEnd(62)) + chalk.bold('\u2551'));
     console.log(chalk.bold('\u2551') + ' '.repeat(62) + chalk.bold('\u2551'));
   }
@@ -981,5 +996,66 @@ export function renderTrend(records: TrendRecord[], summary: TrendSummary): void
   }
 
   console.log(border('\u255A' + '\u2550'.repeat(w) + '\u255D'));
+  console.log();
+}
+
+/**
+ * Render the per-session model history report.
+ *
+ * One row per `ModelSegment` in chronological order, plus a summary line
+ * with switch count and current model. For single-model sessions we still
+ * print the table so users don't wonder whether the feature ran — it just
+ * shows one row.
+ *
+ * @param history - Output of classifier.computeModelHistory
+ * @param sessionId - 8-char prefix is displayed in the header
+ */
+export function renderModelHistory(history: ModelHistory, sessionId: string): void {
+  console.log();
+  console.log(chalk.bold(`  Model history — session ${sessionId.slice(0, 8)}`));
+  console.log(chalk.dim('  ' + '━'.repeat(60)));
+
+  if (history.segments.length === 0) {
+    console.log(chalk.yellow('  No non-synthetic assistant turns recorded in this session.'));
+    console.log();
+    return;
+  }
+
+  const header = chalk.bold('  Current : ') + chalk.cyan(history.current);
+  const switched = history.switchCount > 0
+    ? chalk.yellow(`  (switched ${history.switchCount} time${history.switchCount === 1 ? '' : 's'})`)
+    : chalk.dim('  (single model)');
+  console.log(header + switched);
+  console.log();
+
+  const table = new Table({
+    head: ['#', 'Model', 'Msgs', 'Input', 'Output', 'Cache R', 'Cache W', 'First → Last msg'],
+    style: { head: ['cyan'], border: ['grey'] },
+    colAligns: ['right', 'left', 'right', 'right', 'right', 'right', 'right', 'left'],
+  });
+
+  for (let i = 0; i < history.segments.length; i++) {
+    const seg = history.segments[i]!;
+    table.push([
+      `${i + 1}`,
+      seg.model,
+      seg.assistantMessageCount.toLocaleString(),
+      seg.totalInputTokens.toLocaleString(),
+      seg.totalOutputTokens.toLocaleString(),
+      seg.cacheReadTokens.toLocaleString(),
+      seg.cacheCreationTokens.toLocaleString(),
+      `#${seg.firstMessageIndex + 1} → #${seg.lastMessageIndex + 1}`,
+    ]);
+  }
+  console.log(table.toString());
+
+  // Running totals across all segments — reassure the user we accounted for
+  // every assistant turn without having to eyeball the table.
+  const totalMsgs = history.segments.reduce((s, seg) => s + seg.assistantMessageCount, 0);
+  const totalIn = history.segments.reduce((s, seg) => s + seg.totalInputTokens, 0);
+  const totalOut = history.segments.reduce((s, seg) => s + seg.totalOutputTokens, 0);
+  console.log(chalk.dim(`  Totals: ${totalMsgs.toLocaleString()} assistant turns, ` +
+              `${totalIn.toLocaleString()} input + ${totalOut.toLocaleString()} output tokens across ` +
+              `${history.segments.length} segment${history.segments.length === 1 ? '' : 's'}.`));
   console.log();
 }

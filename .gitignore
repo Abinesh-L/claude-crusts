@@ -55,3 +55,12 @@ FEATURES-v0.4-v0.5.md
 FIXES-*.md
 HANDOFF.md
 ROADMAP.md
+LINKEDIN*.md
+RELEASE-NOTES-*.md
+test-*.ps1
+BENCH-OBSERVATIONS.md
+BUGS-AND-FIXES.md
+scripts/
+bench-*.json
+blind.json
+focused.json

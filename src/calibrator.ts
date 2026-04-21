@@ -276,6 +276,17 @@ export async function runCalibration(): Promise<void> {
   table.push([chalk.bold('Total'), chalk.bold(data.total_capacity.toLocaleString())]);
 
   console.log(table.toString());
+
+  // MCP assumption check — warn immediately on calibration, not just on later analyze.
+  if (b.mcp_tools > 0) {
+    console.log();
+    console.log(chalk.yellow(`  !  MCP tools baseline looks wrong:`));
+    console.log(chalk.dim(`     MCP_TOKENS_PER_TOOL = 0 (assumed on-demand load)`));
+    console.log(chalk.dim(`     /context MCP tools  = ${b.mcp_tools.toLocaleString()}`));
+    console.log(chalk.dim(`     Claude Code on this install costs real tokens for MCP schemas.`));
+    console.log(chalk.dim(`     Update MCP_TOKENS_PER_TOOL in src/scanner.ts based on per-server measurement.`));
+  }
+
   console.log(chalk.dim('\n  Future analyses will show accuracy comparison against this data.\n'));
 }
 
@@ -342,5 +353,6 @@ export function renderCalibrationComparison(comparisons: CalibrationComparison[]
       console.log(chalk.dim(`     Update per-tool estimates in src/built-in-tools.ts`));
     }
   }
+
   console.log();
 }

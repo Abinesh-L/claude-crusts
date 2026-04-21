@@ -397,7 +397,7 @@ ${hasCompaction ? `<p class="meta" style="color:#ffb300">${bd.compactionEvents.l
 
   if (hasCompaction) {
     html += `<div class="gauge-row" style="margin-top:0.5rem;color:#888">
-  <span>Session lifetime: ${fmt(bd.total_tokens)} tokens across ${result.messageCount} messages</span>
+  <span>Session lifetime: ${fmt(bd.contentSumTokens ?? bd.total_tokens)} tokens across ${result.messageCount} messages</span>
 </div>`;
   }
 

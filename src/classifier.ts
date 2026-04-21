@@ -22,12 +22,14 @@ import type {
   ClassifiedMessage,
   ConfigData,
   ToolBreakdown,
+  MCPBreakdown,
   CompactionEvent,
   DerivedOverhead,
+  ModelHistory,
+  ModelSegment,
 } from './types.ts';
-
-/** Default context window limit for Claude models */
-const CONTEXT_LIMIT = 200_000;
+import { resolveContextLimitWithSignal } from './model-context.ts';
+import { describeThresholdOverrides } from './config.ts';
 
 /** Whether to print derivation debug info to stderr */
 let verbose = false;
@@ -625,6 +627,78 @@ export function detectCompactionEvents(messages: SessionMessage[]): CompactionEv
 }
 
 /**
+ * Walk every non-synthetic assistant turn and build the per-session model
+ * history.
+ *
+ * Contiguous turns on the same model collapse into a single `ModelSegment`.
+ * A model change opens a new segment; switching back later creates a third
+ * segment rather than merging with the first — the chronological flow is
+ * preserved. Synthetic model markers (`<synthetic>`) — which Claude Code
+ * writes around session exit/resume — are ignored entirely; they never
+ * start, extend, or close a segment.
+ *
+ * Per-segment token counts are summed from `usage.*` fields rather than
+ * estimated, so they're exact when Claude Code recorded usage.
+ *
+ * @param messages - All session messages (classifier's `effectiveMessages`)
+ * @returns History snapshot with at least one segment for any session that
+ *   has at least one non-synthetic assistant turn
+ */
+function computeModelHistory(messages: SessionMessage[]): ModelHistory {
+  const segments: ModelSegment[] = [];
+  let current: ModelSegment | null = null;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    if (msg.type !== 'assistant') continue;
+    const model = msg.message?.model;
+    if (!model || model === '<synthetic>') continue;
+
+    const usage = msg.message?.usage;
+    const timestamp = msg.timestamp ?? null;
+
+    if (current && current.model === model) {
+      // Extend the open segment.
+      current.lastMessageIndex = i;
+      current.assistantMessageCount++;
+      current.totalInputTokens += usage?.input_tokens ?? 0;
+      current.totalOutputTokens += usage?.output_tokens ?? 0;
+      current.cacheCreationTokens += usage?.cache_creation_input_tokens ?? 0;
+      current.cacheReadTokens += usage?.cache_read_input_tokens ?? 0;
+      current.lastSeenAt = timestamp;
+      continue;
+    }
+
+    // New segment — either the first ever, or a model switch.
+    current = {
+      model,
+      firstMessageIndex: i,
+      lastMessageIndex: i,
+      assistantMessageCount: 1,
+      totalInputTokens: usage?.input_tokens ?? 0,
+      totalOutputTokens: usage?.output_tokens ?? 0,
+      cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
+      cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
+    };
+    segments.push(current);
+  }
+
+  const uniqueModels: string[] = [];
+  for (const seg of segments) {
+    if (!uniqueModels.includes(seg.model)) uniqueModels.push(seg.model);
+  }
+
+  return {
+    segments,
+    uniqueModels,
+    current: segments.length > 0 ? segments[segments.length - 1]!.model : 'unknown',
+    switchCount: Math.max(0, segments.length - 1),
+  };
+}
+
+/**
  * Detect compaction events via compact_boundary system messages.
  *
  * Each auto-compaction produces this sequence in the JSONL:
@@ -726,6 +800,49 @@ function detectViaHeuristic(messages: SessionMessage[]): CompactionEvent[] {
 }
 
 /**
+ * Pull the authoritative "current window size" from the last non-synthetic
+ * assistant turn's API-reported usage.
+ *
+ * `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` is
+ * what Claude Code sends to the API on that turn — the bounded, correct
+ * number. The classifier's per-message content-sum diverges from this: it
+ * under-reports short sessions (cached prior conversation re-sent each turn
+ * is a single API hit but isn't classified per message) and over-reports
+ * long multi-compact sessions (every per-turn output accumulates even though
+ * subsequent turns see it only via cache).
+ *
+ * Walks backward from the end of the slice so we always pick the latest
+ * state. Skips synthetic assistants (which are compaction-summary markers,
+ * not real API turns with usage).
+ *
+ * @param messages - Session messages to scan (typically `effectiveMessages`)
+ * @param fromIndex - Don't look earlier than this index. 0 for whole-session,
+ *   `currentContext.startIndex` for the post-last-compaction slice.
+ * @returns Effective input in tokens, or null if no usable assistant turn
+ *   exists in the range.
+ */
+function computeEffectiveInputTokens(
+  messages: SessionMessage[],
+  fromIndex: number = 0,
+): number | null {
+  for (let i = messages.length - 1; i >= fromIndex; i--) {
+    const msg = messages[i];
+    if (!msg || msg.type !== 'assistant') continue;
+    if (msg.message?.model === '<synthetic>') continue;
+    const usage = msg.message?.usage as
+      | { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
+      | undefined;
+    if (!usage) continue;
+    const input = usage.input_tokens ?? 0;
+    const cacheCreation = usage.cache_creation_input_tokens ?? 0;
+    const cacheRead = usage.cache_read_input_tokens ?? 0;
+    const effective = input + cacheCreation + cacheRead;
+    if (effective > 0) return effective;
+  }
+  return null;
+}
+
+/**
  * Build a CRUSTS bucket array from category token and accuracy maps.
  *
  * @param categoryTokens - Token counts per category
@@ -767,12 +884,14 @@ function buildBuckets(
  * @param messages - Parsed session messages from scanner.parseSession()
  * @param configData - Config data from scanner (system prompt, MCP, memory, tools)
  * @param untilIndex - Optional message cutoff (exclusive). If set, disables auto-trim.
+ * @param modelOverride - Optional live model ID (e.g. `claude-opus-4-7[1m]`) that takes precedence over the stripped ID in the JSONL. Used by the statusline path where Claude Code preserves the variant in its stdin payload.
  * @returns Complete CRUSTS breakdown with per-message detail
  */
 export function classifySession(
   messages: SessionMessage[],
   configData: ConfigData,
   untilIndex?: number,
+  modelOverride?: string,
 ): CrustsBreakdown {
   // Determine effective endpoint: explicit --until, or auto-trim CRUSTS invocation
   const effectiveEnd = untilIndex ?? findAnalysisCutoff(messages);
@@ -811,6 +930,10 @@ export function classifySession(
   let toolCallTokens = 0;
   let toolResultTokens = 0;
 
+  // Per-MCP-server invocation tokens (keyed by server name parsed from `mcp__<server>__<tool>`)
+  const mcpServerTokens = new Map<string, number>();
+  const mcpServerInvocations = new Map<string, number>();
+
   // Classify each message
   const classifiedMessages: ClassifiedMessage[] = [];
   let cumulative = 0;
@@ -839,6 +962,16 @@ export function classifySession(
         toolCallTokens += tokens;
       } else {
         toolResultTokens += tokens;
+      }
+      // Per-MCP-server accounting: `mcp__<server>__<tool>` is Anthropic's naming convention
+      if (toolName?.startsWith('mcp__')) {
+        const server = toolName.split('__')[1];
+        if (server) {
+          mcpServerTokens.set(server, (mcpServerTokens.get(server) ?? 0) + tokens);
+          if (msg.type === 'assistant') {
+            mcpServerInvocations.set(server, (mcpServerInvocations.get(server) ?? 0) + 1);
+          }
+        }
       }
     }
 
@@ -877,8 +1010,15 @@ export function classifySession(
     categoryAccuracy.system = 'estimated';
   }
 
-  // Calculate session lifetime totals
-  const totalTokens = Object.values(categoryTokens).reduce((a, b) => a + b, 0);
+  // Classifier's per-category content sum — the internal accounting number,
+  // kept around for --verbose diagnostics. NOT the authoritative window size;
+  // see `computeEffectiveInputTokens` for the canonical per-turn total.
+  const contentSumTokens = Object.values(categoryTokens).reduce((a, b) => a + b, 0);
+  // Authoritative window size from the latest assistant turn's API usage.
+  // Falls back to the content sum when no usable usage data exists (fresh
+  // sessions, synthetic-only sessions, or fixtures without `usage` fields).
+  const effectiveInputTokens = computeEffectiveInputTokens(effectiveMessages);
+  const totalTokens = effectiveInputTokens ?? contentSumTokens;
   const buckets = buildBuckets(categoryTokens, categoryAccuracy);
 
   // Build loaded vs used tool lists
@@ -902,6 +1042,28 @@ export function classifySession(
     resultTokens: toolResultTokens,
   };
 
+  // Build per-MCP-server breakdown — only if any MCP server is configured
+  let mcpBreakdown: MCPBreakdown | undefined;
+  if (configData.mcpServers.length > 0) {
+    const servers = configData.mcpServers.map((s) => {
+      const invocationCount = mcpServerInvocations.get(s.name) ?? 0;
+      const tokensSpent = mcpServerTokens.get(s.name) ?? 0;
+      return {
+        name: s.name,
+        source: s.source,
+        invocationCount,
+        tokensSpent,
+        unused: invocationCount === 0,
+      };
+    });
+    servers.sort((a, b) => b.tokensSpent - a.tokensSpent);
+    mcpBreakdown = {
+      servers,
+      unusedServers: servers.filter((s) => s.unused).map((s) => s.name),
+      totalMcpTokens: servers.reduce((sum, s) => sum + s.tokensSpent, 0),
+    };
+  }
+
   // Derive framing overhead from post-compaction window for cleaner data
   // (pre-compaction pairs span compaction boundaries and produce negative deltas)
   const framingStartIndex = compactionEvents.length > 0
@@ -923,6 +1085,41 @@ export function classifySession(
         categoryTokens[cat] += framingForCat;
         categoryAccuracy[cat] = 'estimated';
       }
+    }
+  }
+
+  // Resolve the model ID and full session model history.
+  //
+  // `modelHistory` walks every non-synthetic assistant turn in order and
+  // groups contiguous runs of the same model into segments, recording the
+  // API token flows for each segment. When the user switches Claude models
+  // mid-session (e.g. sonnet → opus), each switch closes one segment and
+  // opens another — the chronological flow is preserved, not collapsed.
+  //
+  // `breakdown.model` reports the CURRENT model (the last non-synthetic
+  // assistant) rather than the first, which is more useful as an "at-a-glance
+  // what am I on?" label. The first model is still accessible via
+  // `modelHistory.segments[0].model`.
+  //
+  // A live override (Claude Code's statusline payload — which preserves the
+  // `[1m]` variant JSONL strips) takes precedence when supplied.
+  const modelHistory = computeModelHistory(effectiveMessages);
+  const model = modelOverride ?? modelHistory.current;
+  // Claude Code strips the `[1m]` variant from the recorded model ID, so we
+  // combine model-ID lookup with a usage-based heuristic: if any assistant
+  // message observed an effective input > 200K, the window must be 1M.
+  const contextResolution = resolveContextLimitWithSignal(model, effectiveMessages);
+  const contextLimit = contextResolution.limit;
+  if (verbose) {
+    const signalExplanation =
+      contextResolution.signal === 'model-id' ? `model-ID "${model}" matched a 1M-variant pattern` :
+      contextResolution.signal === 'usage' ? 'an observed message exceeded 200K effective input (conclusive 1M)' :
+      'neither model-ID nor usage signal fired — defaulting to 200K. If this is a 1M session below that usage, pass --path or run the statusline to detect via the live model override.';
+    console.error(`[verbose] Context limit: ${contextLimit.toLocaleString()} (signal: ${contextResolution.signal}) \u2014 ${signalExplanation}`);
+    const thresholdOverrides = describeThresholdOverrides();
+    if (thresholdOverrides.length > 0) {
+      console.error(`[verbose] Waste thresholds overridden via ~/.claude-crusts/config.json:`);
+      for (const note of thresholdOverrides) console.error(`[verbose]   ${note}`);
     }
   }
 
@@ -973,21 +1170,20 @@ export function classifySession(
       }
     }
 
-    const currentTotal = Object.values(currentCategoryTokens).reduce((a, b) => a + b, 0);
+    const currentContentSum = Object.values(currentCategoryTokens).reduce((a, b) => a + b, 0);
+    // Same API-first rule for the post-compaction slice — without this, heavy
+    // multi-compact sessions display content-sum > context_limit (Bug #9).
+    const currentEffective = computeEffectiveInputTokens(effectiveMessages, startIndex);
+    const currentTotal = currentEffective ?? currentContentSum;
     currentContext = {
       buckets: buildBuckets(currentCategoryTokens, currentCategoryAccuracy),
       total_tokens: currentTotal,
-      free_tokens: CONTEXT_LIMIT - currentTotal,
-      usage_percentage: (currentTotal / CONTEXT_LIMIT) * 100,
+      contentSumTokens: currentContentSum,
+      free_tokens: Math.max(0, contextLimit - currentTotal),
+      usage_percentage: (currentTotal / contextLimit) * 100,
       startIndex,
     };
   }
-
-  // Extract model name from first non-synthetic assistant message
-  const modelMsg = effectiveMessages.find(
-    (m) => m.type === 'assistant' && m.message?.model && m.message.model !== '<synthetic>',
-  );
-  const model = modelMsg?.message?.model ?? 'unknown';
 
   // Compute session duration from first and last message timestamps
   let durationSeconds: number | null = null;
@@ -1001,12 +1197,15 @@ export function classifySession(
   return {
     buckets,
     total_tokens: totalTokens,
-    context_limit: CONTEXT_LIMIT,
-    free_tokens: CONTEXT_LIMIT - totalTokens,
-    usage_percentage: (totalTokens / CONTEXT_LIMIT) * 100,
+    contentSumTokens,
+    context_limit: contextLimit,
+    free_tokens: Math.max(0, contextLimit - totalTokens),
+    usage_percentage: (totalTokens / contextLimit) * 100,
     messages: classifiedMessages,
     toolBreakdown,
+    mcpBreakdown,
     model,
+    modelHistory,
     durationSeconds,
     compactionEvents,
     currentContext,

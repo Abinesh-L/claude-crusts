@@ -1,6 +1,124 @@
-# CRUSTS — Context Window Analyzer for Claude Code
+<p align="center">
+  <img src="https://em-content.zobj.net/source/apple/391/bread_1f35e.png" width="120" alt="CRUSTS logo: a loaf of bread" />
+</p>
 
-**See what's eating your tokens.** CRUSTS breaks down your Claude Code context window into 6 categories, detects waste, and tells you exactly what to do about it.
+<h1 align="center">CRUSTS</h1>
+
+<p align="center">
+  <strong>Your Claude Code context has crusts. CRUSTS trims them.</strong>
+</p>
+
+<p align="center">
+  <em>Stale file reads, duplicate tool schemas, resolved exchanges nobody needs,<br/>
+  oversized CLAUDE.md files, unused MCP servers — the crusts of your session.<br/>
+  CRUSTS finds them, ranks them by token savings, and trims them for you.</em>
+</p>
+
+<p align="center">
+  <a href="#the-fastest-way-to-start">Quickstart</a> ·
+  <a href="#before--after">Before/After</a> ·
+  <a href="#cli-commands">Commands</a> ·
+  <a href="#why-crusts">Why</a> ·
+  <a href="#the-crusts-framework">Framework</a>
+</p>
+
+<p align="center">
+  <em>Fully offline. Zero API calls. Zero token cost.</em>
+</p>
+
+---
+
+## Before / After
+
+Same work session. Same files read, same tools loaded, same conversation. One `claude-crusts optimize --apply` + one `/compact focus "..."` command it generated.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🥖 Stale (before)
+
+```
+TOTAL:  143,507 / 200,000  (71.8%)
+  Tools         86,460  (60%)
+  Retrieved     35,996  (25%)
+  Conversation   7,616   (5%)
+  System         7,319   (5%)
+  User           4,217   (3%)
+  State          1,899   (1%)
+
+"index.ts" read 9 times
+"types.ts" read 6 times
+36 of 40 tool schemas unused
+Auto-compaction in ~12 msgs
+
+Context health: HOT
+```
+
+</td>
+<td width="50%" valign="top">
+
+### 🍞 Fresh (after)
+
+```
+TOTAL:   92,108 / 200,000  (46.1%)
+  Retrieved     33,801  (37%)
+  Tools         18,204  (19%)
+  Conversation   7,616   (8%)
+  System         7,319   (8%)
+  User           3,421   (4%)
+  State          1,747   (2%)
+
+No duplicate reads
+Stale reads trimmed
+Tool schemas pruned (.claudeignore)
+Auto-compaction in ~180 msgs
+
+Context health: HEALTHY
+```
+
+</td>
+</tr>
+</table>
+
+**Same session. 51K tokens reclaimed. Same work. Fewer crusts.**
+
+```
+┌──────────────────────────────────────────────┐
+│  CONTEXT FRESHNESS      ████████ CRISP       │
+│  DUPLICATE FILE READS   ░░░░░░░░ PURGED      │
+│  UNUSED TOOL SCHEMAS    ░░░░░░░░ REMOVED     │
+│  SELF-HEALING HOOK      ████████ LIVE        │
+│  OFFLINE / API-FREE     ████████ 100%        │
+│  VIBES                  ████████ TOASTY      │
+└──────────────────────────────────────────────┘
+```
+
+Three commands cover 90% of day-to-day use. You can stop reading right there if those do what you need — the rest of this README is the deep dive.
+
+```bash
+# 1. SELF-HEAL — install the hook. Your context silently self-heals from
+#    now on: when usage crosses the threshold, CRUSTS injects a targeted
+#    /compact focus advisory into Claude's next turn. Zero user action.
+claude-crusts hooks auto-inject enable
+
+# 2. ACTIVE FIX — write .claudeignore + CLAUDE.md rules for you.
+#    Atomic backups under ~/.claude-crusts/backups/, per-fix confirmation.
+claude-crusts optimize --apply
+
+# 3. TUI — the REPL shell where every other command lives.
+#    This is the recommended day-to-day entry point. No flags to memorise.
+claude-crusts tui
+```
+
+> **Start with the TUI.** It's the smoothest way to use CRUSTS — an
+> interactive shell with tab completion, clipboard copy for fix blocks,
+> and every analysis / management command in one place. Everything below
+> is for scripting, CI, and power-user flows.
+
+---
+
+**What CRUSTS does.** Slices your Claude Code context window into 6 categories — **C**onversation, **R**etrieved, **U**ser, **S**ystem, **T**ools, **S**tate/memory — finds the crusts (what's gone stale or never got used), and trims them for you.
 
 ```
 ╔════════════════════════════════════════════════════════════════╗
@@ -35,14 +153,46 @@
 
 Fully offline. Zero API calls. Zero token cost.
 
-**What it does:**
-- **Interactive TUI** — the fastest way to use CRUSTS. Run `claude-crusts tui` for a REPL shell that auto-selects your latest session, offers Tab completion for commands and session IDs, and lets you run every command without memorizing flags.
-- **Breaks down your context** into 6 categories — see exactly where your tokens are going
-- **Detects waste** — duplicate file reads, unused tool schemas, stale content
-- **Gives you the fix** — run `claude-crusts fix` to get three pasteable blocks: one for your current session, one for your CLAUDE.md, and one /compact command. All generated from your data, no LLM needed.
-- **Works on past sessions** — Claude Code forgets everything when you exit. The JSONL logs don't. Analyze any session from days or weeks ago.
-- **Tracks trends** — see how your context usage changes across sessions with sparklines and direction detection
-- **Hook integration** — opt-in one-line health summary after every Claude Code response
+**Core capabilities:**
+- **Self-healing context** — `hooks auto-inject enable` installs a hook that injects a session-specific `/compact focus` into Claude's next turn when you cross the configured threshold. No copy-paste, no user action.
+- **Active optimization** — `optimize --apply` writes `.claudeignore` and CLAUDE.md rules for you, with confirmation prompts and backups under `~/.claude-crusts/backups/`.
+- **6-category context breakdown** — Conversation, Retrieved, User, System, Tools, State/Memory. See exactly where your tokens are going.
+- **Waste detection** — duplicate file reads, unused tool schemas, stale content, resolved exchanges, cache overhead, unused tool results.
+- **Past-session analysis** — Claude Code forgets everything when you exit. The JSONL logs don't. Analyze any session from days or weeks ago.
+- **Cross-session trends** — sparklines, direction (improving / worsening / flat), recent-session table.
+- **Interactive TUI** — `claude-crusts tui` drops you into a REPL shell with tab completion for commands and session IDs.
+- **Reports** — standalone HTML/Markdown reports you can screenshot or share.
+- **Other:** cross-session comparison, calibration against `/context`, install sanity check (`doctor`), intra-session diff, per-model usage snapshot (`models`), statusline glyph integration, per-MCP-server token accounting, CSV trend export, configurable waste thresholds, `/compact` measurement harness (`bench compact` / `bench compare`).
+
+## Table of Contents
+
+**Get started**
+- [The fastest way to start](#the-fastest-way-to-start) — drop into the TUI
+- [Installation](#installation) — `npx`, `npm`, `bun`
+- [Quick Start](#quick-start) — every command in one glance
+- [Use inside Claude Code](#use-inside-claude-code) — `/crusts` slash command
+
+**CLI reference** (all 23 commands)
+- Interactive: [`tui`](#claude-crusts-tui-session-id)
+- Analysis: [`analyze`](#claude-crusts-analyze-session-id) · [`waste`](#claude-crusts-waste-session-id) · [`fix`](#claude-crusts-fix-session-id) · [`optimize`](#claude-crusts-optimize-session-id) · [`models`](#claude-crusts-models-session-id) · [`timeline`](#claude-crusts-timeline-session-id) · [`lost`](#claude-crusts-lost-session-id) · [`diff`](#claude-crusts-diff-session-id---from-n---to-n) · [`compare`](#claude-crusts-compare-session-a-session-b) · [`trend`](#claude-crusts-trend) · [`status`](#claude-crusts-status-session-id)
+- Live: [`watch`](#claude-crusts-watch-session-id) · [`report`](#claude-crusts-report-session-id) · [`list`](#claude-crusts-list)
+- Self-healing + active fix: [`hooks auto-inject`](#claude-crusts-hooks-auto-inject-enabledisablestatus) · [`optimize --apply`](#claude-crusts-optimize-session-id)
+- Claude Code integration: [`hooks`](#claude-crusts-hooks-enabledisablestatus) · [`statusline`](#claude-crusts-statusline-installuninstallstatus) · [`calibrate`](#claude-crusts-calibrate)
+- Install management: [`doctor`](#claude-crusts-doctor)
+- Measurement harness: [`bench compact`](#claude-crusts-bench-compact-session-id) · [`bench compare`](#claude-crusts-bench-compare-ajson-bjson) · [`bench reextract`](#claude-crusts-bench-reextract-resultjson)
+- Config: [Customising waste thresholds](#customising-waste-thresholds)
+
+**Under the hood**
+- [The CRUSTS framework](#the-crusts-framework) — what the 6 categories mean
+- [How it works](#how-it-works) — offline parsing, derived overhead, token estimation
+- [What the Claude Code leak revealed](#what-the-claude-code-leak-revealed) — the architectural insights CRUSTS uses
+- [CRUSTS vs `/context`](#crusts-vs-context) — when to use which
+- [Why CRUSTS?](#why-crusts) — the questions behind the number
+- [Recommendations in action](#recommendations-in-action) — example outputs
+- [Accuracy and limitations](#accuracy-and-limitations) — what's exact vs estimated
+
+**Meta**
+- [Contributing](#contributing) · [Feedback](#feedback) · [License](#license)
 
 ## The Fastest Way to Start
 
@@ -54,10 +204,53 @@ claude-crusts tui
 
 This drops you into an interactive shell that:
 - Auto-selects your most recent Claude Code session
-- Shows a session list so you can switch with `select <id>` (Tab-completes session IDs)
-- Runs every analysis command by name (`analyze`, `waste`, `fix`, `lost`, `trend`, …) — no flags to remember
-- Copies fix blocks straight to your clipboard with `copy 1|2|3`
+- Tab-completes both commands and session IDs
+- Runs every analysis / management command by name — no flags to remember
+- Copies fix blocks to your clipboard with `copy 1|2|3`
 - Type `help` for the full command list, `quit` to exit
+
+**Once you're inside, here's everything you can type:**
+
+```
+  CRUSTS Interactive Shell
+  Type a command, or "help" for a list of commands.
+
+  ID        Age   Size     Project
+  a1b2c3d4  2m    1.2 MB   my-project
+  e5f6a7b8  1h    856 KB   another-project
+  ...
+
+  Auto-selected most recent session: a1b2c3d4 (my-project)
+  Use "select <id>" to switch, or type a command.
+
+crusts:a1b2c3d4> analyze                  # full 6-category breakdown
+crusts:a1b2c3d4> waste                    # waste detection report
+crusts:a1b2c3d4> fix                      # pasteable fix prompts
+  Tip: use "copy 1", "copy 2", or "copy 3" to copy a block to clipboard.
+
+crusts:a1b2c3d4> copy 2                   # copy CLAUDE.md snippet to clipboard
+  Copied CLAUDE.md snippet to clipboard.
+
+crusts:a1b2c3d4> optimize                 # ranked fixes with ROI (dry-run)
+crusts:a1b2c3d4> models                   # per-model usage snapshot
+crusts:a1b2c3d4> timeline                 # message-by-message growth
+crusts:a1b2c3d4> diff 40 120              # intra-session delta
+crusts:a1b2c3d4> lost                     # what was lost in compaction
+crusts:a1b2c3d4> status                   # one-line health check
+crusts:a1b2c3d4> compare e5f6a7b8         # compare with another session
+crusts:a1b2c3d4> doctor                   # sanity-check the install
+crusts:a1b2c3d4> hooks status             # hook install state
+crusts:a1b2c3d4> auto-inject status       # self-healing state
+crusts:a1b2c3d4> bench compare a.json b.json
+crusts:a1b2c3d4> bench reextract blind.json
+crusts:a1b2c3d4> trend                    # cross-session trends
+crusts:a1b2c3d4> list                     # show all sessions
+crusts:a1b2c3d4> select e5f6              # Tab completes session IDs
+crusts:a1b2c3d4> help                     # show available commands
+crusts:a1b2c3d4> quit                     # exit
+```
+
+**CLI-only commands** (don't fit the REPL model): `optimize --apply` (spawns its own readline confirmation dialog), `bench compact` (blocks for minutes tailing a JSONL), `watch`, `calibrate`, `report`. Run those from a separate shell.
 
 The rest of this README documents the standalone CLI for scripting, CI, and advanced use. But for day-to-day use, `tui` is the recommended entry point.
 
@@ -75,49 +268,61 @@ bunx claude-crusts analyze
 bun install -g claude-crusts
 ```
 
+### Shell completion (optional)
+
+Tab-completes subcommands and session IDs at your prompt. One-time install, per shell:
+
+```bash
+# bash
+claude-crusts completion bash >> ~/.bashrc && source ~/.bashrc
+
+# zsh
+claude-crusts completion zsh  >> ~/.zshrc  && source ~/.zshrc
+```
+
+```powershell
+# PowerShell — append to $PROFILE to persist across sessions
+claude-crusts completion pwsh >> $PROFILE
+. $PROFILE
+```
+
+After installing: `claude-crusts an<TAB>` → `analyze`, `claude-crusts analyze 9b2<TAB>` → expands to the full session ID.
+
 ## Quick Start
 
 Start with the TUI — the other commands are here for scripting, CI, and power users.
 
 ```bash
-# 1. Interactive shell — recommended entry point. All commands in one session.
-claude-crusts tui
+# Friction reducers (install once, benefit every session):
+claude-crusts hooks auto-inject enable        # self-healing context
+claude-crusts optimize --apply                 # writes .claudeignore + CLAUDE.md
+claude-crusts statusline install               # ambient health glyph
 
-# 2. See what's in your context window right now
-claude-crusts analyze
+# Day-to-day:
+claude-crusts tui                              # interactive shell (recommended)
+claude-crusts analyze                          # 6-category breakdown
+claude-crusts waste                            # waste detection report
+claude-crusts status                           # one-line health check
 
-# 3. Find wasted tokens with specific file names and recommendations
-claude-crusts waste
+# Analysis & forensics:
+claude-crusts fix                              # pasteable fix prompts
+claude-crusts timeline                         # message-by-message growth
+claude-crusts lost                             # what was lost in compaction
+claude-crusts diff --from 40 --to 120          # intra-session delta
+claude-crusts models                           # per-model usage snapshot
+claude-crusts compare <a> <b>                  # side-by-side session diff
+claude-crusts trend                            # cross-session trends
+claude-crusts watch                            # live-monitor a running session
+claude-crusts report                           # standalone HTML or Markdown report
+claude-crusts calibrate                        # ground-truth against /context
 
-# 4. Get pasteable prompts to fix the waste — no LLM needed
-claude-crusts fix
+# Measurement (for A/B experiments around /compact):
+claude-crusts bench compact                    # tail JSONL, capture before/after
+claude-crusts bench compare a.json b.json      # diff two bench results
 
-# 5. Watch token growth over time with compaction markers
-claude-crusts timeline
-
-# 6. Analyze any past session — Claude Code forgot it, CRUSTS didn't
-claude-crusts analyze <session-id>
-
-# 7. See what was lost during auto-compaction
-claude-crusts lost
-
-# 8. Live-monitor a session as it runs
-claude-crusts watch
-
-# 9. Compare two sessions side by side
-claude-crusts compare <session-a> <session-b>
-
-# 10. Generate a shareable report (HTML or Markdown)
-claude-crusts report
-
-# 11. Track trends across sessions
-claude-crusts trend
-
-# 12. Quick health check (one line)
-claude-crusts status
-
-# 13. Auto-show health after every Claude Code response (opt-in)
-claude-crusts hooks enable
+# Management:
+claude-crusts doctor                           # install sanity check (9 checks)
+claude-crusts hooks enable                     # one-line health after every response
 ```
 
 ## Use Inside Claude Code
@@ -138,7 +343,7 @@ This works automatically when you clone or install claude-crusts, because the sl
 |--|--|--|
 | **Best for** | Quick check + immediate action | Deep analysis, monitoring, forensics |
 | **Token cost** | Uses some context tokens for Claude to process the JSON | Zero — doesn't touch your session |
-| **Features** | Analyze + actionable advice | All 14 commands: tui, watch, lost, timeline, compare, trend, hooks, etc. |
+| **Features** | Analyze + actionable advice | All 20+ commands: tui, analyze, waste, fix, optimize (+apply), models, doctor, diff, compare, timeline, lost, watch, trend, report, calibrate, bench, hooks, hooks auto-inject, statusline, status |
 | **When to use** | Mid-session: "should I compact?" | Separate terminal: detailed views, live monitoring, past session forensics |
 
 Use `/crusts` when you want a quick answer without leaving your session. Use the CLI when you want the full picture without spending tokens on it.
@@ -154,38 +359,7 @@ claude-crusts tui                    # launch, auto-selects latest session
 claude-crusts tui a1b2c3d4           # launch with a specific session pre-selected
 ```
 
-Once inside, type commands like you would in a shell:
-
-```
-  CRUSTS Interactive Shell
-  Type a command, or "help" for a list of commands.
-
-  ID        Age   Size     Project
-  a1b2c3d4  2m    1.2 MB   my-project
-  e5f6a7b8  1h    856 KB   another-project
-  ...
-
-  Auto-selected most recent session: a1b2c3d4 (my-project)
-  Use "select <id>" to switch, or type a command.
-
-crusts:a1b2c3d4> analyze             # full 6-category breakdown
-crusts:a1b2c3d4> waste               # waste detection report
-crusts:a1b2c3d4> fix                 # pasteable fix prompts
-  Tip: use "copy 1", "copy 2", or "copy 3" to copy a block to clipboard.
-
-crusts:a1b2c3d4> copy 2              # copy CLAUDE.md snippet to clipboard
-  Copied CLAUDE.md snippet to clipboard.
-
-crusts:a1b2c3d4> timeline            # message-by-message growth
-crusts:a1b2c3d4> lost                # what was lost in compaction
-crusts:a1b2c3d4> status              # one-line health check
-crusts:a1b2c3d4> compare e5f6a7b8    # compare with another session
-crusts:a1b2c3d4> trend               # cross-session trends
-crusts:a1b2c3d4> list                # show all sessions
-crusts:a1b2c3d4> select e5f6       # Tab completes session IDs
-crusts:a1b2c3d4> help                # show available commands
-crusts:a1b2c3d4> quit                # exit
-```
+**See [The Fastest Way to Start](#the-fastest-way-to-start) at the top for the full walkthrough of every command you can type inside the shell.** Below are the details that don't belong in a quickstart:
 
 **Tab completion** works for both commands and session IDs. Type `sel` + Tab to complete `select`, then type the first few characters of a session ID and press Tab to auto-fill it. Works with `select` and `compare` commands.
 
@@ -297,6 +471,108 @@ CRUSTS Fix — Session a1b2c3d4
 ```
 
 Every output is generated from your session data — different sessions produce different files, different urgency levels, and different CLAUDE.md advice.
+
+### `claude-crusts optimize [session-id]`
+
+Closes the last-mile friction of `fix`. Instead of three generic blocks to copy-paste, `optimize` generates a **ranked list of fixes with token-savings ROI**, and the safe ones can be applied directly with `--apply` (backed up to `~/.claude-crusts/backups/`).
+
+```bash
+claude-crusts optimize                           # dry-run, ranked report
+claude-crusts optimize --apply                   # apply with per-fix confirmation
+claude-crusts optimize --apply --yes             # apply without prompting (use with care)
+claude-crusts optimize --min-savings 500         # hide fixes below 500 tokens
+claude-crusts optimize --filter claudeignore,compact-focus
+```
+
+```
+CRUSTS Optimize — session a1b2c3d4
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Total saveable: 12,400 tokens (6.2% of window)
+
+1. ▶ [-4,200 tkns] Session-specific /compact command
+   Targets the top waste items in this session rather than a generic compact.
+   /compact focus "keep only latest read of renderer.ts; drop resolved exchange at #42-48"
+
+2. ⚙ [-3,100 tkns] Add 2 noise pattern(s) to .claudeignore
+   node_modules — 4 file(s), ~2,100 tokens
+   dist — 2 file(s), ~1,000 tokens
+   node_modules/
+   dist/
+   Target: /your/project/.claudeignore
+
+3. ⦿ [ info ]    1 MCP server(s) loaded but never invoked
+   Unused in this session: gmail
+```
+
+**Fix categories:**
+
+| Kind | Auto-apply | What it does |
+|------|:----------:|-------------|
+| `compact-focus` | copy to clipboard | Generates a `/compact focus "..."` tuned to your session's exact waste |
+| `claudeignore` | ✅ append | Adds noise patterns (`node_modules/`, `dist/`, `*.lock`, etc.) to `.claudeignore` |
+| `claudemd-rule` | ✅ append | Adds a "Files to avoid reading" rule block to your `CLAUDE.md` |
+| `mcp-disable` | copy to clipboard | Flags MCP servers loaded but never invoked this session |
+| `claudemd-oversized` | warn only | Flags a `CLAUDE.md` above the recommended 1,500-token budget |
+
+**Safety guarantees:**
+- `--apply` is opt-in; dry-run is the default.
+- Every file modification is **backed up** to `~/.claude-crusts/backups/<file>.<timestamp>.bak` before writing.
+- Every fix requires per-fix confirmation unless `--yes` is passed.
+- No fix ever touches Claude Code's live session state directly.
+
+### `claude-crusts models [session-id]`
+
+Per-session model usage snapshot. Shows every model Claude Code used in the session, in chronological order, with per-segment message counts and token totals. When you switch models mid-session (e.g. sonnet → opus → sonnet), CRUSTS keeps the full flow rather than fixating on the first or last model.
+
+```bash
+claude-crusts models                     # current session
+claude-crusts models 841f980f            # specific session
+claude-crusts models 841f980f --json     # machine-readable
+```
+
+```
+  Model history — session 841f980f
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Current : claude-opus-4-7  (switched 2 times)
+
+  ┌───┬───────────────────┬──────┬────────┬────────┬─────────┬─────────┬──────────────────┐
+  │ # │ Model             │ Msgs │  Input │ Output │ Cache R │ Cache W │ First → Last msg │
+  ├───┼───────────────────┼──────┼────────┼────────┼─────────┼─────────┼──────────────────┤
+  │ 1 │ claude-sonnet-4-6 │   42 │  8,520 │  3,100 │ 124,000 │   1,200 │ #3 → #184        │
+  │ 2 │ claude-opus-4-7   │   18 │  4,700 │  2,800 │  83,000 │     600 │ #186 → #245      │
+  │ 3 │ claude-sonnet-4-6 │   12 │  3,200 │  1,100 │  48,000 │     400 │ #247 → #289      │
+  └───┴───────────────────┴──────┴────────┴────────┴─────────┴─────────┴──────────────────┘
+  Totals: 72 assistant turns, 16,420 input + 7,000 output tokens across 3 segments.
+```
+
+When the session used a single model, the table still prints — just one row — so the command's output is always honest: you ran it, and these are the models that were used.
+
+The `analyze` header gets a `(switched from claude-sonnet-4-6)` hint whenever the session switched, so you don't have to run `models` just to notice.
+
+### `claude-crusts doctor`
+
+Sanity-check your install. Runs 9 checks — Claude Code install, settings.json validity, session discovery, hook/statusline presence, calibration data, trend history, backup dir writability — and reports a `pass | warn | fail` verdict.
+
+```bash
+claude-crusts doctor
+```
+
+```
+  CRUSTS Doctor
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ✓ pass  claude-crusts version         0.7.0
+  ✓ pass  Claude Code install           Found ~/.claude
+  ✓ pass  Session discovery             Found 12 session(s)
+  ✓ pass  Hook integration              CRUSTS hook installed
+  ✓ pass  Statusline integration        CRUSTS statusline installed
+  ! warn  Calibration data              No calibration saved.
+  ✓ pass  Trend history                 42 record(s), 12,276 bytes
+  ✓ pass  Optimize backup dir           writable
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Finished with warnings.
+```
+
+Exits non-zero on `fail`, so it's safe to wire into CI or a shell rc.
 
 ### `claude-crusts timeline [session-id]`
 
@@ -410,13 +686,44 @@ Also flags stale built-in tool baselines: if Claude Code adds or removes built-i
 Track how your context usage changes across sessions. Shows a sparkline, per-session averages, direction (improving/worsening/flat), and recent session history. Records are saved automatically each time you run `analyze`.
 
 ```bash
-claude-crusts trend                  # all sessions
-claude-crusts trend --project myapp  # filter by project
-claude-crusts trend --limit 10       # last 10 sessions
-claude-crusts trend --json           # machine-readable
+claude-crusts trend                              # all sessions
+claude-crusts trend --project myapp              # filter by project
+claude-crusts trend --limit 10                   # last 10 sessions
+claude-crusts trend --json                       # machine-readable
+claude-crusts trend --format csv                 # export as CSV to stdout
+claude-crusts trend --format csv --output t.csv  # export to a file
 ```
 
-History is stored at `~/.claude-crusts/history.jsonl` (append-only, deduped by session ID).
+History is stored at `~/.claude-crusts/history.jsonl` (append-only, deduped by session ID). CSV export is useful for spreadsheet-based analysis — 11 columns including `contextLimit` (blank for pre-v0.6.0 records).
+
+### `claude-crusts diff [session-id] --from <n> --to <n>`
+
+Diff two points within the **same** session. Unlike `compare` (which diffs two different sessions), `diff` shows per-category deltas between two message cutpoints of one session — useful for "which part of my session blew up my context?"
+
+```bash
+claude-crusts diff --from 40 --to 120
+claude-crusts diff a1b2c3d4 --from 100 --to 300 --json
+```
+
+Output is a coloured cli-table with green/yellow highlights for negative/positive deltas. Indices are clamped to the session length; `--from` must be less than `--to`.
+
+### Customising waste thresholds
+
+All waste thresholds (stale-read window, oversized-system limit, cache-overhead ratio, resolution lookback, CLAUDE.md-oversized threshold) can be overridden via `~/.claude-crusts/config.json`:
+
+```json
+{
+  "wasteThresholds": {
+    "staleReadThreshold": 30,
+    "oversizedSystemThreshold": 2500,
+    "cacheOverheadThreshold": 0.5,
+    "resolutionLookback": 15,
+    "claudeMdOversizedThreshold": 2000
+  }
+}
+```
+
+Run any analysis with `--verbose` to see which overrides are active. Missing or invalid values fall through to defaults; sibling config keys (hooks, auto-inject state) are preserved by the merge-safe writer.
 
 ### `claude-crusts status [session-id]`
 
@@ -438,6 +745,102 @@ claude-crusts hooks status           # check if enabled
 ```
 
 Not everyone wants context info after every response — this is strictly opt-in.
+
+### `claude-crusts hooks auto-inject enable|disable|status`
+
+**Your context self-heals.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every user prompt, crusts silently analyses the session; if usage has crossed the configured threshold (default 70%) and the last injection was more than `minGapMs` ago (default 5 min), it prepends a targeted advisory to Claude's context — including a `/compact focus "..."` tuned to the top waste items in **this** session.
+
+Claude reads the advisory as part of the turn and can act on it immediately — no copy-paste, no terminal switching, no user action.
+
+```bash
+claude-crusts hooks auto-inject enable       # opt in, installs UserPromptSubmit hook
+claude-crusts hooks auto-inject disable      # opt out, removes the hook
+claude-crusts hooks auto-inject status       # show install + enabled + last-injection-at state
+```
+
+Tune via `~/.claude-crusts/config.json`:
+
+```json
+{
+  "autoInject": {
+    "enabled": true,
+    "threshold": 70,
+    "minGapMs": 300000
+  }
+}
+```
+
+**Safety guarantees:**
+- Opt-in. Disabled by default.
+- Fire-and-forget. Any error in crusts is swallowed so the hook can never block your prompt.
+- Per-session min-gap prevents spam on long sessions.
+- Only emits when the threshold is crossed — quiet on healthy sessions.
+
+### `claude-crusts statusline install|uninstall|status`
+
+Ambient one-character context-health glyph in Claude Code's statusline. When installed, a colored `●` + percentage (e.g. `● 42%`) renders in the statusline on every refresh — green < 50%, yellow < 70%, red < 85%, bright-red ≥ 85%.
+
+```bash
+claude-crusts statusline install     # add statusLine entry to ~/.claude/settings.json
+claude-crusts statusline uninstall   # remove CRUSTS entry (safely; won't clobber other configs)
+claude-crusts statusline status      # check if installed
+```
+
+Install refuses to overwrite an existing `statusLine` configured by something else. The runtime command itself (`claude-crusts statusline`) reads Claude Code's JSON payload from stdin and swallows all errors — a broken statusline never blocks Claude Code.
+
+### `claude-crusts bench compact [session-id]`
+
+Measurement harness for `/compact` events. Runs a before snapshot, tails the session JSONL for a `compact_boundary` record, then captures the after snapshot the moment Claude Code finishes its summarization — no interactive paste-and-press-Enter pause.
+
+```bash
+claude-crusts bench compact                                   # latest session
+claude-crusts bench compact 841f980f                          # specific session
+claude-crusts bench compact 841f980f --focus "drop stale read of types.ts"
+claude-crusts bench compact --output blind.json --timeout 600
+```
+
+With `--focus`, the generated `/compact focus "<string>"` is copied to your clipboard before the tail loop starts — you paste it in Claude Code, bench captures the result. Exit codes: `0` on compaction, `2` on timeout, `1` on error.
+
+Output JSON includes before/after token counts, waste counts, compaction counts, and — crucially — `summaryFileRefs`: the list of file paths mentioned in the compact summary. This is the A/B payload: under a focused compact, these are the files you preserved; under a blind compact, these are the files Claude Code's summarizer chose for you.
+
+### `claude-crusts bench compare <a.json> <b.json>`
+
+Diff two bench-compact result files. Produces `onlyInA` / `onlyInB` / `inBoth` sets over the summary file-ref lists, plus side-by-side token metrics.
+
+```bash
+claude-crusts bench compare blind.json focused.json --label-a blind --label-b focused
+```
+
+```
+  CRUSTS bench compare
+  ════════════════════════════════════════════════════════════
+  Token metrics
+  BEFORE  A=180,000 tkns (90.0%)  |  B=175,000 tkns (87.5%)
+  AFTER   A=25,000 tkns (12.5%)   |  B=20,000 tkns (10.0%)
+
+  Summary survivor diff
+  In both       : 2   common.ts, src/hooks.ts
+  Only in A     : 1   tests/foo.test.ts
+  Only in B     : 3   src/calibrator.ts, src/watcher.ts, tests/bar.test.ts
+
+  Insights
+  · focused summary mentioned 2 more file path(s) than blind (5 vs 3).
+  · 3 file(s) referenced only in focused: src/calibrator.ts, src/watcher.ts, tests/bar.test.ts
+  · Both runs reclaimed a similar share of context — which is expected; the interesting delta is which content survived.
+```
+
+The reclaim amounts for blind vs. focused compacts are usually similar (that's what `/compact` does). The interesting signal is *which files survived* — that's the axis CRUSTS's focus string actually influences.
+
+### `claude-crusts bench reextract <result.json>`
+
+Re-run the file-ref extractor against an existing bench result, rewriting `summaryFileRefs` in place. Useful after tightening the extraction rules — the compact summary is still on disk in the session JSONL, so there's no need to compact again.
+
+```bash
+claude-crusts bench reextract blind.json
+claude-crusts bench reextract blind.json --session /path/to/session.jsonl  # override
+```
+
+The extractor uses an extension whitelist (ts, tsx, js, md, json, jsonl, lock, yml, toml, py, rs, go, etc.) so JavaScript method calls like `Math.abs` or `console.log` that superficially look like `name.ext` don't get counted as file references.
 
 ### Global Options
 
@@ -657,25 +1060,42 @@ bun install
 # Run locally
 bun run src/index.ts analyze
 
-# Type check
-bun run typecheck
+# Verify your change before committing
+bun run typecheck                   # strict TS typecheck
+bun test                            # 190+ unit tests (under 10s)
 ```
+
+Every new user-visible command must land with:
+1. Unit tests in `tests/*.test.ts`.
+2. A section in this README and the file-responsibilities block in `CLAUDE.md`.
+
+See the **Development Workflow** section of `CLAUDE.md` for the full convention.
 
 The codebase is organized as a pipeline:
 
 ```
 scanner.ts -> classifier.ts -> waste-detector.ts -> recommender.ts -> renderer.ts
-                  |                                                       |
-              analyzer.ts (orchestrates)                           calibrator.ts
-                  |                                                comparator.ts
-              trend.ts (history)                                   lost-detector.ts
-                                                                   watcher.ts
-                                                                   tui.ts
-                                                                   clipboard.ts
-                                                                   hooks.ts
-                                                                   html-report.ts
-                                                                   md-report.ts
+                   |                                                       |
+               analyzer.ts (orchestrates)                            calibrator.ts
+                   |                                                 comparator.ts
+               trend.ts (history)                                    lost-detector.ts
+                                                                     watcher.ts
+                                                                     tui.ts
+                                                                     clipboard.ts
+                                                                     hooks.ts
+                                                                     statusline.ts
+                                                                     model-context.ts
+                                                                     optimizer.ts
+                                                                     doctor.ts
+                                                                     auto-inject.ts
+                                                                     session-diff.ts
+                                                                     config.ts
+                                                                     bench.ts
+                                                                     html-report.ts
+                                                                     md-report.ts
 ```
+
+Supporting: `types.ts`, `built-in-tools.ts`, `version.ts`.
 
 ## Feedback
 

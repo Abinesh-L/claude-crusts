@@ -46,9 +46,6 @@ const CAT_COLOR: Record<CrustsCategory, (s: string) => string> = {
   state: chalk.white,
 };
 
-/** Context limit */
-const CONTEXT_LIMIT = 200_000;
-
 /** Compaction threshold */
 const COMPACTION_THRESHOLD = 0.80;
 
@@ -221,7 +218,7 @@ function renderDashboard(
   const empty = barWidth - filled;
   const barColor = pct >= 85 ? chalk.red : pct >= 70 ? chalk.yellow : chalk.green;
   const bar = barColor('\u2588'.repeat(filled)) + chalk.dim('\u2591'.repeat(empty));
-  console.log(`  ${bar} ${hc(`${pct.toFixed(1)}%`)} (${total.toLocaleString()} / ${CONTEXT_LIMIT.toLocaleString()})`);
+  console.log(`  ${bar} ${hc(`${pct.toFixed(1)}%`)} (${total.toLocaleString()} / ${breakdown.context_limit.toLocaleString()})`);
 
   // Inline compaction line — only if one happened during this watch session
   if (lastWatchCompaction) {
@@ -311,7 +308,7 @@ function renderJsonUpdate(
     messageCount: breakdown.messages.length,
     model: breakdown.model,
     totalTokens: total,
-    contextLimit: CONTEXT_LIMIT,
+    contextLimit: breakdown.context_limit,
     usagePercent: Math.round(pct * 10) / 10,
     categories: catMap,
     wasteCount,
@@ -350,7 +347,7 @@ async function renderExitSummary(
   console.log(`  Session: ${session.id.slice(0, 8)}`);
   console.log(`  Messages observed: ${observed >= 0 ? `+${observed}` : observed} (${startMessageCount} → ${endMessageCount})`);
   console.log(`  Compaction events during watch: ${watchCompactionCount}`);
-  console.log(`  Final context usage: ${total.toLocaleString()} / ${CONTEXT_LIMIT.toLocaleString()} (${pct.toFixed(1)}%)`);
+  console.log(`  Final context usage: ${total.toLocaleString()} / ${breakdown.context_limit.toLocaleString()} (${pct.toFixed(1)}%)`);
   console.log();
 }
 
