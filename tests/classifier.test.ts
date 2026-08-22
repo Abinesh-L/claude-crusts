@@ -300,20 +300,22 @@ describe('M4 usage drift: nested cache_creation and current usage shape', () => 
   });
 
   test('derived internal system prompt reads the first turn with non-zero effective input (input_tokens 2)', () => {
-    // 2 + 8_000 + 4_000 = 12_002 effective; known = 476 (skills fallback) +
-    // first user message, so derived lands inside the current 1K-15K band.
+    // 2 + 20_000 + 10_000 = 30_002 effective; known = 20_500 (core schema
+    // for the fixture's 2.1.239 version, M6) + 476 (skills fallback) + first
+    // user message, so derived lands inside the current 1K-15K band.
     const b = classifySession([
       userText('hi'),
       currentShapeAssistant({
         input_tokens: 2,
-        cache_creation_input_tokens: 8_000,
-        cache_read_input_tokens: 4_000,
-        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 8_000 },
+        cache_creation_input_tokens: 20_000,
+        cache_read_input_tokens: 10_000,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 20_000 },
       }),
     ], EMPTY_CONFIG);
     const derived = b.derivedOverhead!.internalSystemPrompt;
     expect(derived).not.toBeNull();
-    expect(derived!.derivation.firstAssistantInputTokens).toBe(12_002);
+    expect(derived!.derivation.firstAssistantInputTokens).toBe(30_002);
+    expect(derived!.derivation.knownToolSchemas).toBe(20_500);
   });
 
   test('cache-overhead waste rule sees nested cache_read ratio through the same helper', () => {
@@ -426,5 +428,334 @@ describe('M4 claudeCodeVersion on the breakdown', () => {
   test('is undefined when no record carries a version', () => {
     const b = classifySession([userText('hi'), assistant(1_000)], EMPTY_CONFIG);
     expect(b.claudeCodeVersion).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M6: built-in tool catalogue, ToolSearch-loaded deferred tools, PowerShell
+// self-call trimming, version-keyed core schema cost
+// ---------------------------------------------------------------------------
+
+/** Assistant record carrying one tool_use block and no usage (estimated from content). */
+function toolUse(name: string, id: string, input: Record<string, unknown>): SessionMessage {
+  return {
+    type: 'assistant',
+    uuid: `a-${id}`,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name, input }],
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  } as SessionMessage;
+}
+
+/** User record carrying one tool_result block (string or nested blocks). */
+function toolResult(
+  toolUseId: string,
+  content: string | ContentBlock[],
+  extra: Partial<SessionMessage> = {},
+): SessionMessage {
+  return {
+    type: 'user',
+    uuid: `u-${toolUseId}`,
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: toolUseId, content }],
+    },
+    ...extra,
+  } as SessionMessage;
+}
+
+/** A real-shaped ToolSearch load: tool_reference blocks plus the structured toolUseResult copy. */
+function toolSearchLoad(id: string, names: string[], totalDeferred = 87): [SessionMessage, SessionMessage] {
+  return [
+    toolUse('ToolSearch', id, { query: `select:${names.join(',')}`, max_results: names.length }),
+    toolResult(
+      id,
+      names.map((tool_name) => ({ type: 'tool_reference', tool_name }) as ContentBlock),
+      { toolUseResult: { matches: names, query: `select:${names.join(',')}`, total_deferred_tools: totalDeferred } },
+    ),
+  ];
+}
+
+/** A `deferred_tools_delta` attachment record as Claude Code writes it. */
+function deferredDelta(
+  addedNames: string[],
+  removedNames: string[] = [],
+  readdedNames: string[] = [],
+): SessionMessage {
+  return {
+    type: 'attachment',
+    uuid: `att-${addedNames.length}-${removedNames.length}`,
+    attachment: {
+      type: 'deferred_tools_delta',
+      addedNames,
+      addedLines: addedNames,
+      removedNames,
+      readdedNames,
+      pendingMcpServers: [],
+    },
+  } as SessionMessage;
+}
+
+const CRUSTS_OUTPUT = 'CRUSTS Context Window Analysis\n  TOTAL 12,000 tokens\n  Context health: healthy';
+
+describe('M6 PowerShell CRUSTS self-calls are trimmed like Bash ones', () => {
+  const base = [userText('hello'), assistant(1_000)];
+
+  test('a PowerShell claude-crusts call, its result, and the triggering prompt are cut', () => {
+    const powershell = [
+      userText('run crusts'),
+      toolUse('PowerShell', 'ps1', { command: 'bunx claude-crusts analyze --json' }),
+      toolResult('ps1', CRUSTS_OUTPUT, { toolUseResult: { stdout: CRUSTS_OUTPUT, stderr: '' } }),
+    ];
+    const b = classifySession([...base, ...powershell], EMPTY_CONFIG);
+    expect(b.messages.length).toBe(base.length);
+    expect(b.toolBreakdown.usedTools).not.toContain('PowerShell');
+  });
+
+  test('Bash and PowerShell self-calls trim to the same cutoff', () => {
+    const viaBash = classifySession([
+      ...base, userText('run crusts'),
+      toolUse('Bash', 'b1', { command: 'npx claude-crusts analyze' }),
+      toolResult('b1', CRUSTS_OUTPUT),
+    ], EMPTY_CONFIG);
+    const viaPowerShell = classifySession([
+      ...base, userText('run crusts'),
+      toolUse('PowerShell', 'p1', { command: 'npx claude-crusts analyze' }),
+      toolResult('p1', CRUSTS_OUTPUT),
+    ], EMPTY_CONFIG);
+    expect(viaPowerShell.messages.length).toBe(viaBash.messages.length);
+    expect(viaPowerShell.messages.length).toBe(base.length);
+  });
+
+  test('a PowerShell call that is not a CRUSTS invocation is kept', () => {
+    const msgs = [
+      ...base, userText('list files'),
+      toolUse('PowerShell', 'p2', { command: 'Get-ChildItem -Recurse' }),
+      toolResult('p2', 'a.ts\nb.ts'),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages.length).toBe(msgs.length);
+    expect(b.toolBreakdown.usedTools).toContain('PowerShell');
+  });
+});
+
+describe('M6 ToolSearch-loaded deferred tools', () => {
+  const DEFERRED = [
+    'WebSearch', 'WebFetch', 'Monitor', 'CronCreate',
+    'mcp__playwright__browser_click', 'mcp__playwright__browser_snapshot',
+  ];
+
+  /** Session: deferred pool announced, two loads (one repeat), WebSearch + PowerShell used. */
+  function fixture(): SessionMessage[] {
+    const [search1, result1] = toolSearchLoad('ts1', ['WebSearch', 'WebFetch']);
+    const [search2, result2] = toolSearchLoad('ts2', ['mcp__playwright__browser_snapshot', 'WebSearch'], 85);
+    return [
+      deferredDelta(DEFERRED),
+      userText('look this up'),
+      search1,
+      result1,
+      toolUse('WebSearch', 'ws1', { query: 'claude code context window' }),
+      toolResult('ws1', 'Result: the window is 200K or 1M.'),
+      toolUse('PowerShell', 'ps1', { command: 'Get-Date' }),
+      toolResult('ps1', 'Saturday'),
+      search2,
+      result2,
+      toolUse('mcp__playwright__browser_snapshot', 'snap1', {}),
+      toolResult('snap1', '- document\n  - heading "Home"'),
+    ];
+  }
+
+  test('loadedDeferred lists each loaded name once, in first-load order', () => {
+    const b = classifySession(fixture(), EMPTY_CONFIG);
+    expect(b.toolBreakdown.loadedDeferred).toEqual(['WebSearch', 'WebFetch', 'mcp__playwright__browser_snapshot']);
+    expect(b.toolBreakdown.totalDeferredReported).toBe(85);
+  });
+
+  test('loadedTools = core + used-without-ToolSearch + loaded; unused excludes unloaded deferred names', () => {
+    const config: ConfigData = {
+      ...EMPTY_CONFIG,
+      builtInTools: { tools: ['Read', 'Bash', 'ToolSearch'], totalEstimatedTokens: 0 },
+    };
+    const b = classifySession(fixture(), config);
+    const tb = b.toolBreakdown;
+    for (const name of ['Read', 'Bash', 'ToolSearch', 'PowerShell', 'WebSearch', 'WebFetch', 'mcp__playwright__browser_snapshot']) {
+      expect(tb.loadedTools).toContain(name);
+    }
+    // Deferred but never loaded: cost 0, never "loaded", never "unused"
+    for (const name of ['Monitor', 'CronCreate', 'mcp__playwright__browser_click']) {
+      expect(tb.loadedTools).not.toContain(name);
+      expect(tb.unusedTools).not.toContain(name);
+    }
+    expect(tb.unusedTools).toContain('WebFetch');
+    expect(tb.unusedTools).toContain('Read');
+    expect(tb.unusedTools).toContain('Bash');
+    expect(tb.unusedTools).not.toContain('PowerShell');
+    expect(tb.unusedTools).not.toContain('WebSearch');
+    expect(tb.unusedTools).not.toContain('ToolSearch');
+    expect(new Set(tb.loadedTools).size).toBe(tb.loadedTools.length);
+  });
+
+  test('deferredBuiltIn / deferredMcp come from deferred_tools_delta records and honour removals', () => {
+    const msgs = [
+      ...fixture(),
+      deferredDelta(['EndConversation'], ['CronCreate', 'mcp__playwright__browser_click'], ['Monitor']),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.toolBreakdown.deferredBuiltIn).toEqual(['WebSearch', 'WebFetch', 'Monitor', 'EndConversation']);
+    expect(b.toolBreakdown.deferredMcp).toEqual(['mcp__playwright__browser_snapshot']);
+  });
+
+  test('a session without deferred_tools_delta records reports empty deferred lists, not a crash', () => {
+    const b = classifySession([userText('hi'), assistant(1_000)], EMPTY_CONFIG);
+    expect(b.toolBreakdown.deferredBuiltIn).toEqual([]);
+    expect(b.toolBreakdown.deferredMcp).toEqual([]);
+    expect(b.toolBreakdown.loadedDeferred).toEqual([]);
+    expect(b.toolBreakdown.loadedSchemaTokens).toBe(0);
+    expect(b.toolBreakdown.totalDeferredReported).toBeUndefined();
+  });
+
+  test('each load is charged once at the ToolSearch result index: 1,000 per built-in, 330 per MCP tool', () => {
+    const msgs = fixture();
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.toolBreakdown.loadedSchemaTokens).toBe(2_330);
+    expect(b.toolBreakdown.schemaTokens).toBe(2_330);
+
+    const firstResult = b.messages[3]!;
+    const secondResult = b.messages[9]!;
+    expect(firstResult.category).toBe('tools');
+    expect(firstResult.accuracy).toBe('estimated');
+    expect(firstResult.tokens).toBeGreaterThanOrEqual(2_000);
+    expect(firstResult.tokens).toBeLessThan(2_100);
+    // Second load: browser_snapshot is new (330), WebSearch is a repeat (0)
+    expect(secondResult.tokens).toBeGreaterThanOrEqual(330);
+    expect(secondResult.tokens).toBeLessThan(430);
+
+    const toolsBucket = b.buckets.find((x) => x.category === 'tools')!;
+    const toolsFromMessages = b.messages
+      .filter((m) => m.category === 'tools')
+      .reduce((sum, m) => sum + m.tokens, 0);
+    expect(toolsBucket.tokens).toBe(toolsFromMessages);
+    expect(toolsBucket.tokens).toBeGreaterThanOrEqual(2_330);
+  });
+
+  test('falls back to tool_reference blocks when the structured toolUseResult copy is missing', () => {
+    const msgs = [
+      userText('load'),
+      toolUse('ToolSearch', 'ts9', { query: 'select:Monitor' }),
+      toolResult('ts9', [{ type: 'tool_reference', tool_name: 'Monitor' } as ContentBlock]),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.toolBreakdown.loadedDeferred).toEqual(['Monitor']);
+    expect(b.toolBreakdown.loadedSchemaTokens).toBe(1_000);
+    expect(b.toolBreakdown.loadedTools).toContain('Monitor');
+    expect(b.toolBreakdown.unusedTools).toContain('Monitor');
+  });
+
+  test('a ToolSearch miss (No matching deferred tools found) loads nothing', () => {
+    const msgs = [
+      userText('load'),
+      toolUse('ToolSearch', 'ts8', { query: 'select:Nope' }),
+      toolResult('ts8', [{ type: 'text', text: 'No matching deferred tools found' } as ContentBlock],
+        { toolUseResult: { matches: [], query: 'select:Nope', total_deferred_tools: 87 } }),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.toolBreakdown.loadedDeferred).toEqual([]);
+    expect(b.toolBreakdown.loadedSchemaTokens).toBe(0);
+    expect(b.toolBreakdown.totalDeferredReported).toBe(87);
+  });
+
+  test('a non-ToolSearch result whose toolUseResult happens to carry matches is not a load', () => {
+    const msgs = [
+      userText('grep'),
+      toolUse('Grep', 'g1', { pattern: 'matches' }),
+      toolResult('g1', 'src/a.ts:1:matches', { toolUseResult: { matches: ['WebSearch'], total_deferred_tools: 3 } }),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.toolBreakdown.loadedDeferred).toEqual([]);
+    expect(b.toolBreakdown.loadedSchemaTokens).toBe(0);
+  });
+
+  test('configured MCP server names are not listed as tools', () => {
+    const config: ConfigData = {
+      ...EMPTY_CONFIG,
+      mcpServers: [{ name: 'playwright', source: 'global', estimatedSchemaTokens: 0, toolCount: 0 } as ConfigData['mcpServers'][number]],
+    };
+    const b = classifySession(fixture(), config);
+    expect(b.toolBreakdown.loadedTools).not.toContain('playwright');
+    expect(b.toolBreakdown.unusedTools).not.toContain('playwright');
+  });
+});
+
+describe('M6 core schema cost: calibration override > version table > legacy baseline', () => {
+  test('a 2.1.239 session resolves 20,500 core tokens into the Tools bucket', () => {
+    const b = classifySession([userText('hi'), currentShapeAssistant({}, { version: '2.1.239' })], EMPTY_CONFIG);
+    expect(b.toolBreakdown.coreSchemaTokens).toBe(20_500);
+    expect(b.toolBreakdown.coreSchemaSource).toBe('version');
+    expect(b.toolBreakdown.schemaTokens).toBe(20_500);
+    const tools = b.buckets.find((x) => x.category === 'tools')!;
+    expect(tools.tokens).toBe(20_500);
+    expect(tools.accuracy).toBe('estimated');
+  });
+
+  test('a 2.1.92 session keeps the scanner baseline (legacy)', () => {
+    const config: ConfigData = { ...EMPTY_CONFIG, builtInTools: { tools: [], totalEstimatedTokens: 9_055 } };
+    const b = classifySession([userText('hi'), currentShapeAssistant({}, { version: '2.1.92' })], config);
+    expect(b.toolBreakdown.coreSchemaTokens).toBe(9_055);
+    expect(b.toolBreakdown.coreSchemaSource).toBe('legacy');
+  });
+
+  test('an unversioned fixture with a zero baseline adds no core cost', () => {
+    const b = classifySession([userText('hi'), assistant(1_000)], EMPTY_CONFIG);
+    expect(b.toolBreakdown.coreSchemaTokens).toBe(0);
+    expect(b.toolBreakdown.coreSchemaSource).toBe('legacy');
+    expect(b.buckets.find((x) => x.category === 'tools')!.tokens).toBe(0);
+  });
+
+  test('the calibration override wins over the version table and feeds the derivation', () => {
+    const config: ConfigData = {
+      ...EMPTY_CONFIG,
+      builtInTools: { tools: [], totalEstimatedTokens: 0, coreSchemaOverride: 21_100 },
+    };
+    const b = classifySession([
+      userText('hi'),
+      currentShapeAssistant({
+        input_tokens: 2,
+        cache_creation_input_tokens: 20_000,
+        cache_read_input_tokens: 10_000,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 20_000 },
+      }, { version: '2.1.239' }),
+    ], config);
+    expect(b.toolBreakdown.coreSchemaTokens).toBe(21_100);
+    expect(b.toolBreakdown.coreSchemaSource).toBe('calibration');
+    expect(b.buckets.find((x) => x.category === 'tools')!.tokens).toBe(21_100);
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownToolSchemas).toBe(21_100);
+  });
+
+  test('a null override is ignored', () => {
+    const config: ConfigData = {
+      ...EMPTY_CONFIG,
+      builtInTools: { tools: [], totalEstimatedTokens: 0, coreSchemaOverride: null },
+    };
+    const b = classifySession([userText('hi'), currentShapeAssistant({}, { version: '2.1.214' })], config);
+    expect(b.toolBreakdown.coreSchemaTokens).toBe(20_500);
+    expect(b.toolBreakdown.coreSchemaSource).toBe('version');
+  });
+
+  test('the same core cost is applied to the post-compaction window', () => {
+    const msgs: SessionMessage[] = [
+      userText('hi'),
+      currentShapeAssistant({ input_tokens: 2, cache_creation_input_tokens: 150_000, cache_read_input_tokens: 0,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 150_000 } }, { version: '2.1.239' }),
+      compactBoundary(150_000),
+      userText('after'),
+      currentShapeAssistant({ input_tokens: 2, cache_creation_input_tokens: 30_000, cache_read_input_tokens: 0,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 30_000 } }, { version: '2.1.239' }),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.compactionEvents.length).toBe(1);
+    const currentTools = b.currentContext!.buckets.find((x) => x.category === 'tools')!;
+    expect(currentTools.tokens).toBe(20_500);
   });
 });

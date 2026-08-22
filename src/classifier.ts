@@ -31,6 +31,7 @@ import type {
 import { resolveContextLimitWithSignal, effectiveInput, cacheCreationTokens } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
+import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName } from './built-in-tools.ts';
 
 /** Whether to print derivation debug info to stderr */
 let verbose = false;
@@ -447,6 +448,99 @@ function buildToolUseIdMap(messages: SessionMessage[]): Map<string, string> {
   return map;
 }
 
+/** Names a ToolSearch result loaded plus Claude Code's deferred-pool size */
+interface ToolSearchLoad {
+  /** Deferred tool names the call materialised, in result order (deduped) */
+  names: string[];
+  /** `toolUseResult.total_deferred_tools` when Claude Code reported it */
+  totalDeferred?: number;
+}
+
+/**
+ * Extract the deferred tools a ToolSearch result loaded into the window.
+ *
+ * Claude Code records a load two ways on the same user record: a top-level
+ * `toolUseResult: { matches: string[], query, total_deferred_tools }` and
+ * `tool_reference` blocks (`{ type: 'tool_reference', tool_name }`) inside
+ * the tool_result's content array. `matches` is preferred; the
+ * tool_reference blocks are the fallback for records without the
+ * structured copy. A tool_result is treated as a ToolSearch result when its
+ * tool_use_id maps to `ToolSearch` or when it carries tool_reference
+ * blocks (no other tool emits them).
+ *
+ * @param msg - A session message (only user tool_result carriers qualify)
+ * @param toolUseIdMap - Map of tool_use IDs to tool names
+ * @returns The loaded names, or null when the message is not a ToolSearch result
+ */
+function extractToolSearchLoad(
+  msg: SessionMessage,
+  toolUseIdMap: Map<string, string>,
+): ToolSearchLoad | null {
+  if (msg.type !== 'user') return null;
+  const content = msg.message?.content;
+  if (!Array.isArray(content)) return null;
+
+  let isToolSearchResult = false;
+  const referenced: string[] = [];
+  for (const block of content) {
+    if (block.type !== 'tool_result') continue;
+    if (block.tool_use_id && toolUseIdMap.get(block.tool_use_id) === 'ToolSearch') {
+      isToolSearchResult = true;
+    }
+    if (!Array.isArray(block.content)) continue;
+    for (const sub of block.content) {
+      if (sub.type === 'tool_reference' && typeof sub.tool_name === 'string' && sub.tool_name) {
+        isToolSearchResult = true;
+        referenced.push(sub.tool_name);
+      }
+    }
+  }
+  if (!isToolSearchResult) return null;
+
+  const structured = msg.toolUseResult;
+  let matches: string[] | null = null;
+  let totalDeferred: number | undefined;
+  if (structured && typeof structured === 'object') {
+    const record = structured as { matches?: unknown; total_deferred_tools?: unknown };
+    if (Array.isArray(record.matches)) {
+      matches = record.matches.filter((m): m is string => typeof m === 'string' && m.length > 0);
+    }
+    if (typeof record.total_deferred_tools === 'number' && Number.isFinite(record.total_deferred_tools)) {
+      totalDeferred = record.total_deferred_tools;
+    }
+  }
+
+  const names = [...new Set(matches ?? referenced)];
+  return totalDeferred !== undefined ? { names, totalDeferred } : { names };
+}
+
+/**
+ * Collect the deferred tool names Claude Code reported for a session.
+ *
+ * Reads `deferred_tools_delta` attachment records in order, applying
+ * `addedNames` and `readdedNames` as additions and `removedNames` as
+ * removals, so the result is the deferred pool as of the last delta.
+ * Returns an empty list when the parsed messages carry no attachment
+ * records.
+ *
+ * @param messages - All session messages
+ * @returns Deferred tool names in first-seen order
+ */
+function collectDeferredToolNames(messages: SessionMessage[]): string[] {
+  const deferred = new Set<string>();
+  const names = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string' && v.length > 0) : [];
+
+  for (const msg of messages) {
+    if (msg.type !== 'attachment' || msg.attachment?.type !== 'deferred_tools_delta') continue;
+    const delta = msg.attachment;
+    for (const name of names(delta.addedNames)) deferred.add(name);
+    for (const name of names(delta.readdedNames)) deferred.add(name);
+    for (const name of names(delta.removedNames)) deferred.delete(name);
+  }
+  return [...deferred];
+}
+
 /**
  * Find the index of the last real human text message.
  *
@@ -501,18 +595,29 @@ const CRUSTS_COMMAND_PATTERNS = [
 ];
 
 /**
- * Check if an assistant message contains a Bash tool call invoking CRUSTS.
+ * Shell tools whose `command` input can carry a CRUSTS invocation.
+ *
+ * Claude Code on Windows exposes `PowerShell` next to `Bash`; both run
+ * `claude-crusts ...` and both write its report back as a tool_result, so
+ * both must be recognised or the self-call output gets analysed as session
+ * content.
+ */
+const SHELL_TOOL_NAMES: ReadonlySet<string> = new Set(['Bash', 'PowerShell']);
+
+/**
+ * Check if an assistant message contains a shell tool call (Bash or
+ * PowerShell) invoking CRUSTS.
  *
  * @param msg - The session message to check
- * @returns True if the message contains a CRUSTS Bash invocation
+ * @returns True if the message contains a CRUSTS shell invocation
  */
-function isCrustsBashCall(msg: SessionMessage): boolean {
+function isCrustsShellCall(msg: SessionMessage): boolean {
   if (msg.type !== 'assistant') return false;
   const content = msg.message?.content;
   if (!Array.isArray(content)) return false;
 
   for (const block of content) {
-    if (block.type !== 'tool_use' || block.name !== 'Bash') continue;
+    if (block.type !== 'tool_use' || !block.name || !SHELL_TOOL_NAMES.has(block.name)) continue;
     const command = (block.input?.command as string) ?? '';
     if (CRUSTS_COMMAND_PATTERNS.some((p) => command.includes(p))) {
       return true;
@@ -556,7 +661,7 @@ function hasCrustsToolResult(msg: SessionMessage): boolean {
  * analysis itself, not the work being analyzed — so they're trimmed.
  *
  * Three-phase trim:
- * 1. Strip trailing CRUSTS Bash calls and their tool_results
+ * 1. Strip trailing CRUSTS shell calls (Bash or PowerShell) and their tool_results
  * 2. Strip preceding assistant text/thinking messages (same turn)
  * 3. Strip the user text message that triggered the analysis turn
  *
@@ -566,11 +671,11 @@ function hasCrustsToolResult(msg: SessionMessage): boolean {
 function findAnalysisCutoff(messages: SessionMessage[]): number {
   let end = messages.length;
 
-  // Phase 1: Walk backward, trim CRUSTS Bash calls and tool_results from tail
+  // Phase 1: Walk backward, trim CRUSTS shell calls and tool_results from tail
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]!;
 
-    if (msg.type === 'assistant' && isCrustsBashCall(msg)) {
+    if (msg.type === 'assistant' && isCrustsShellCall(msg)) {
       end = i;
       continue;
     }
@@ -587,7 +692,7 @@ function findAnalysisCutoff(messages: SessionMessage[]): number {
   if (end === messages.length) return end;
 
   // Phase 2: Continue backward through assistant text/thinking messages
-  // that are part of the same turn as the CRUSTS Bash call.
+  // that are part of the same turn as the CRUSTS shell call.
   // In Claude Code JSONL, a single assistant response can span multiple
   // messages: thinking, then text, then tool_use (each a separate line).
   for (let i = end - 1; i >= 0; i--) {
@@ -941,6 +1046,17 @@ export function classifySession(
   const toolUseIdMap = buildToolUseIdMap(effectiveMessages);
   const lastHumanIdx = findLastHumanTextIndex(effectiveMessages);
 
+  // Claude Code version that wrote these records (first non-empty `version`);
+  // feeds version-keyed constants such as the core tool schema cost.
+  const claudeCodeVersion = detectClaudeCodeVersion(effectiveMessages);
+  // Core (always-loaded) tool schema cost: calibration override > version
+  // table > the scanner's legacy baseline. Fixed per session, not in JSONL.
+  const coreSchema = resolveCoreSchemaTokens(
+    claudeCodeVersion,
+    configData.builtInTools.coreSchemaOverride,
+    configData.builtInTools.totalEstimatedTokens,
+  );
+
   // Detect compaction events
   const compactionEvents = detectCompactionEvents(effectiveMessages);
 
@@ -969,6 +1085,13 @@ export function classifySession(
   let toolCallTokens = 0;
   let toolResultTokens = 0;
 
+  // Deferred tools that ToolSearch results loaded (first-load order, each
+  // once: a loaded schema stays in the window) and their estimated cost.
+  const loadedDeferred: string[] = [];
+  const loadedDeferredSet = new Set<string>();
+  let loadedSchemaTokens = 0;
+  let totalDeferredReported: number | undefined;
+
   // Per-MCP-server invocation tokens (keyed by server name parsed from `mcp__<server>__<tool>`)
   const mcpServerTokens = new Map<string, number>();
   const mcpServerInvocations = new Map<string, number>();
@@ -983,7 +1106,32 @@ export function classifySession(
     const isFirst = i === 0;
 
     const { category, toolName } = classifyMessage(msg, isLastHuman, isFirst, toolUseIdMap);
-    const { tokens, accuracy } = estimateMessageTokens(msg);
+    const estimate = estimateMessageTokens(msg);
+    let tokens = estimate.tokens;
+    let accuracy = estimate.accuracy;
+
+    // ToolSearch results materialise deferred schemas into the request's
+    // tools array. The schema text is never written to the JSONL (the
+    // result is a list of bare `tool_reference` names), so the load cost is
+    // charged here, at the result index, once per distinct name.
+    const toolSearchLoad = extractToolSearchLoad(msg, toolUseIdMap);
+    if (toolSearchLoad) {
+      if (toolSearchLoad.totalDeferred !== undefined) {
+        totalDeferredReported = toolSearchLoad.totalDeferred;
+      }
+      let loadCost = 0;
+      for (const name of toolSearchLoad.names) {
+        if (loadedDeferredSet.has(name)) continue;
+        loadedDeferredSet.add(name);
+        loadedDeferred.push(name);
+        loadCost += deferredLoadCost(name);
+      }
+      if (loadCost > 0) {
+        tokens += loadCost;
+        loadedSchemaTokens += loadCost;
+        accuracy = 'estimated';
+      }
+    }
 
     // Track tool usage
     if (toolName) usedToolNames.add(toolName);
@@ -1032,10 +1180,10 @@ export function classifySession(
   }
 
   // Config overhead tokens (added to both lifetime and current context)
-  const configOverhead = computeConfigOverhead(configData);
+  const configOverhead = computeConfigOverhead(configData, coreSchema.tokens);
 
   // Derive overhead values from THIS SESSION's API usage data
-  const derivedSystemPrompt = deriveInternalSystemPrompt(effectiveMessages, configData);
+  const derivedSystemPrompt = deriveInternalSystemPrompt(effectiveMessages, configData, coreSchema.tokens);
   // Framing derivation is deferred until after compaction detection (below)
   // so it can sample from the post-compaction window for cleaner data
   let derivedFraming: DerivedOverhead['messageFraming'] = null;
@@ -1060,13 +1208,25 @@ export function classifySession(
   const totalTokens = effectiveInputTokens ?? contentSumTokens;
   const buckets = buildBuckets(categoryTokens, categoryAccuracy);
 
-  // Build loaded vs used tool lists
-  const loadedTools = [
-    ...configData.builtInTools.tools.map((t) => t.name),
-    ...configData.mcpServers.map((s) => s.name),
-  ];
+  // Build loaded vs used tool lists.
+  //
+  // A schema is in the window when the tool is core, when the session
+  // invoked it without a ToolSearch load (so it was core on that Claude
+  // Code version), or when a ToolSearch result loaded it. Names that only
+  // appear in the deferred list cost nothing and are never listed as loaded
+  // or unused.
   const usedToolsArray = [...usedToolNames];
+  const loadedToolSet = new Set<string>(configData.builtInTools.tools);
+  for (const name of usedToolsArray) {
+    if (!loadedDeferredSet.has(name)) loadedToolSet.add(name);
+  }
+  for (const name of loadedDeferred) loadedToolSet.add(name);
+  const loadedTools = [...loadedToolSet];
   const unusedTools = loadedTools.filter((t) => !usedToolNames.has(t));
+
+  const deferredToolNames = collectDeferredToolNames(effectiveMessages);
+  const deferredBuiltIn = deferredToolNames.filter((name) => !isMcpToolName(name));
+  const deferredMcp = deferredToolNames.filter((name) => isMcpToolName(name));
 
   const mcpSchemaTokens = configData.mcpServers.reduce(
     (sum, s) => sum + s.estimatedSchemaTokens, 0,
@@ -1076,9 +1236,16 @@ export function classifySession(
     loadedTools,
     usedTools: usedToolsArray,
     unusedTools,
-    schemaTokens: configData.builtInTools.totalEstimatedTokens + mcpSchemaTokens,
+    schemaTokens: coreSchema.tokens + mcpSchemaTokens + loadedSchemaTokens,
     callTokens: toolCallTokens,
     resultTokens: toolResultTokens,
+    coreSchemaTokens: coreSchema.tokens,
+    coreSchemaSource: coreSchema.source,
+    deferredBuiltIn,
+    deferredMcp,
+    loadedDeferred,
+    loadedSchemaTokens,
+    ...(totalDeferredReported !== undefined ? { totalDeferredReported } : {}),
   };
 
   // Build per-MCP-server breakdown — only if any MCP server is configured
@@ -1144,9 +1311,6 @@ export function classifySession(
   // `[1m]` variant JSONL strips) takes precedence when supplied.
   const modelHistory = computeModelHistory(effectiveMessages);
   const model = modelOverride ?? modelHistory.current;
-  // Claude Code version that wrote these records (first non-empty `version`);
-  // feeds version-keyed constants such as the core tool schema cost.
-  const claudeCodeVersion = detectClaudeCodeVersion(effectiveMessages);
   // Claude Code strips the `[1m]` variant from the recorded model ID, so we
   // combine model-ID lookup with a usage-based heuristic: if any assistant
   // message observed an effective input > 200K, the window must be 1M.
@@ -1158,6 +1322,14 @@ export function classifySession(
       contextResolution.signal === 'usage' ? 'an observed message exceeded 200K effective input (conclusive 1M)' :
       'neither model-ID nor usage signal fired — defaulting to 200K. If this is a 1M session below that usage, pass --path or run the statusline to detect via the live model override.';
     console.error(`[verbose] Context limit: ${contextLimit.toLocaleString()} (signal: ${contextResolution.signal}) \u2014 ${signalExplanation}`);
+    const coreExplanation =
+      coreSchema.source === 'calibration' ? 'pinned by `claude-crusts calibrate` (/context "System tools" row)' :
+      coreSchema.source === 'version' ? `version table for Claude Code ${claudeCodeVersion}` :
+      'legacy baseline (no version signal, no calibration)';
+    console.error(`[verbose] Core tool schemas: ${coreSchema.tokens.toLocaleString()} tokens (${coreExplanation})`);
+    if (loadedDeferred.length > 0) {
+      console.error(`[verbose] ToolSearch loaded ${loadedDeferred.length} deferred schema(s) (~${loadedSchemaTokens.toLocaleString()} tokens): ${loadedDeferred.join(', ')}`);
+    }
     const thresholdOverrides = describeThresholdOverrides();
     if (thresholdOverrides.length > 0) {
       console.error(`[verbose] Waste thresholds overridden via ~/.claude-crusts/config.json:`);
@@ -1281,6 +1453,7 @@ export function classifySession(
 function deriveInternalSystemPrompt(
   messages: SessionMessage[],
   configData: ConfigData,
+  coreSchemaTokens: number,
 ): DerivedOverhead['internalSystemPrompt'] {
   // Find first assistant message with non-zero effective input. On current
   // Claude Code the first turn's input_tokens is typically 2 with the real
@@ -1294,7 +1467,8 @@ function deriveInternalSystemPrompt(
 
   // Known components
   const knownClaudeMd = configData.systemPrompt.totalEstimatedTokens;
-  const knownToolSchemas = configData.builtInTools.totalEstimatedTokens;
+  // Core schema cost resolved per session (calibration > version > legacy)
+  const knownToolSchemas = coreSchemaTokens;
   const knownMemory = configData.memoryFiles.totalEstimatedTokens;
   // Sum discovered skills' estimated cost. Falls back to 476 (the historical
   // /context ground-truth observation) when no skills are discovered, so
@@ -1462,12 +1636,13 @@ interface ConfigOverhead {
  * Compute config overhead tokens from scanner data.
  *
  * @param configData - Config data from scanner
+ * @param coreSchemaTokens - Core tool schema cost resolved for this session
  * @returns Overhead token values per category
  */
-function computeConfigOverhead(configData: ConfigData): ConfigOverhead {
+function computeConfigOverhead(configData: ConfigData, coreSchemaTokens: number): ConfigOverhead {
   return {
     systemTokens: configData.systemPrompt.totalEstimatedTokens,
-    toolTokens: configData.builtInTools.totalEstimatedTokens,
+    toolTokens: coreSchemaTokens,
     mcpTokens: configData.mcpServers.reduce((sum, s) => sum + s.estimatedSchemaTokens, 0),
     memoryTokens: configData.memoryFiles.totalEstimatedTokens,
   };

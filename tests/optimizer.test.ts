@@ -13,6 +13,8 @@ function emptyBreakdown(extra?: Partial<CrustsBreakdown>): CrustsBreakdown {
     toolBreakdown: {
       loadedTools: [], usedTools: [], unusedTools: [],
       schemaTokens: 0, callTokens: 0, resultTokens: 0,
+      coreSchemaTokens: 0, coreSchemaSource: 'legacy',
+      deferredBuiltIn: [], deferredMcp: [], loadedDeferred: [], loadedSchemaTokens: 0,
     },
     model: 'claude-opus-4-7',
     durationSeconds: null,

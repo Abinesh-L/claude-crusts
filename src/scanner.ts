@@ -28,9 +28,10 @@ import type {
   MCPServerInfo,
   MemoryFileSummary,
   SkillInfo,
+  ConfigData,
 } from './types.ts';
-import { BUILT_IN_TOOLS, TOTAL_BUILTIN_TOOL_TOKENS } from './built-in-tools.ts';
-import type { BuiltInTool } from './built-in-tools.ts';
+import { CORE_TOOL_NAMES, LEGACY_CORE_SCHEMA_TOKENS } from './built-in-tools.ts';
+import { loadCoreSchemaOverride } from './calibrator.ts';
 
 /** Average tokens per character (rough English text heuristic) */
 const CHARS_PER_TOKEN = 4;
@@ -638,19 +639,20 @@ export function readSkillsConfig(projectPath?: string): SkillInfo[] {
 }
 
 /**
- * Get the hardcoded list of built-in Claude Code tools.
+ * Get the core built-in tool catalogue for the classifier.
  *
- * Returns the known ~40 built-in tools with their names and estimated
- * schema token costs. Total is approximately 11,600 tokens.
+ * Returns the always-loaded tool names (`CORE_TOOL_NAMES`), the legacy
+ * baseline schema cost, and any calibration override saved by
+ * `claude-crusts calibrate`. The effective per-session cost is resolved in
+ * the classifier from the session's Claude Code version, so the baseline
+ * here only applies to unversioned (pre-2.1.150) sessions.
  *
- * @returns Object with tool list and total token estimate
+ * @returns Core tool names, legacy baseline tokens, and the calibration override (null when none)
  */
-export function getBuiltInToolList(): {
-  tools: BuiltInTool[];
-  totalEstimatedTokens: number;
-} {
+export function getBuiltInToolList(): ConfigData['builtInTools'] {
   return {
-    tools: BUILT_IN_TOOLS,
-    totalEstimatedTokens: TOTAL_BUILTIN_TOOL_TOKENS,
+    tools: [...CORE_TOOL_NAMES],
+    totalEstimatedTokens: LEGACY_CORE_SCHEMA_TOKENS,
+    coreSchemaOverride: loadCoreSchemaOverride(),
   };
 }

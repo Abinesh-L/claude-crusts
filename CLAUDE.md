@@ -109,7 +109,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 - **md-report.ts**: Standalone Markdown report generator (session + comparison modes)
 - **lost-detector.ts**: Compaction loss analysis — reconstructs what was dropped. Detects tool_use ID filenames and replaces with "Agent sub-task result". Extracts meaningful descriptions from agent/tool results
 - **watcher.ts**: Live session monitor with compact dashboard, inline compaction line (flash effect on new compaction, settles to yellow), category labels `C R U Sys T St`
-- **built-in-tools.ts**: 40 built-in tool schemas, total 9,055 tokens
+- **built-in-tools.ts**: core tool catalogue. `CORE_TOOL_NAMES` (20 always-loaded names, no per-tool token guesses; Task* and AskUserQuestion are version-dependent), `CORE_SCHEMA_TOKENS_BY_VERSION` (core schema cost per Claude Code version band: >=2.1.214 -> 20,500; 2.1.160+ -> 17,500; 2.1.150+ -> 15,000; else `LEGACY_CORE_SCHEMA_TOKENS` 9,055, which `TOTAL_BUILTIN_TOOL_TOKENS` aliases for back-compat), `resolveCoreSchemaTokens(version, override, legacy)` (calibration override > version table > legacy), and the deferred load costs `DEFERRED_BUILTIN_LOAD_TOKENS` 1,000 / `DEFERRED_MCP_LOAD_TOKENS` 330 charged per distinct tool at the ToolSearch result that loaded it. The classifier derives `toolBreakdown.loadedTools` = core names + tools invoked without a ToolSearch load + `loadedDeferred` (from `toolUseResult.matches` / `tool_reference` blocks); `deferredBuiltIn` / `deferredMcp` come from `deferred_tools_delta` attachment records and are never listed as loaded or unused. `isCrustsShellCall` treats `PowerShell` like `Bash` so Windows self-calls are trimmed
 - **tui.ts**: Interactive REPL shell — session picker, command dispatch (analyze/waste/fix/copy/timeline/lost/status/compare/trend), readline-based prompt with session ID indicator, tab completion for commands + session IDs, clipboard copy for fix blocks
 - **clipboard.ts**: Cross-platform clipboard utility — `clip` (Windows), `pbcopy` (macOS), `xclip`/`xsel` (Linux)
 - **hooks.ts**: Claude Code hook integration — reads/writes `~/.claude/settings.json` hooks, manages `~/.claude-crusts/config.json` toggle state
@@ -140,7 +140,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 - NOT counted: `block.signature`. Thinking text is never persisted in the JSONL (every thinking block has `thinking: ''`); the signature is an opaque verification token, not content
 
 **Derived overhead** — per-session, not hardcoded:
-- Internal system prompt: first assistant `input_tokens` − known components (CLAUDE.md + tools 9,055 + memory + discovered skills [fallback 476] + first user message). Range 1K-15K.
+- Internal system prompt: first assistant `input_tokens` − known components (CLAUDE.md + core tool schemas [version-keyed, calibration-pinned; see built-in-tools.ts] + memory + discovered skills [fallback 476] + first user message). Range 1K-15K.
 - Message framing: median of ≤20 consecutive assistant pair deltas from post-compaction window. Range 0-50 tokens/msg. Distributed proportionally across categories.
 
 **Edit-aware waste detection**:
@@ -152,7 +152,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 2. Strip preceding assistant text/thinking (same turn)
 3. Strip the triggering user prompt
 
-**MCP tools** — `MCP_TOKENS_PER_TOOL = 0`. Loaded on-demand by Claude Code, no upfront schema cost.
+**MCP tools**: `MCP_TOKENS_PER_TOOL = 0` for configured-but-deferred servers. Deferred schemas (MCP and deferred built-ins) cost 0 until a `ToolSearch` call loads them; each load is then charged once per distinct tool at the result index (~330 per MCP tool, ~1,000 per deferred built-in).
 
 **Dynamic context limit** — resolved per-session via `resolveContextLimit(model, messages)` in `model-context.ts`. Two signals combined: (1) model-ID regex (`[1m]` → 1M); (2) usage heuristic — if any assistant message's `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` exceeded 200K, the window must be 1M (a 200K model would have errored). Default is 200K for both signals.
 
@@ -177,7 +177,8 @@ Supporting: `types.ts`, `built-in-tools.ts`
 | `COMPACTION_THRESHOLD` | recommender.ts | 0.80 | Auto-compaction trigger (~80%, actual fires at turn boundaries so heavy turns overshoot to ~85-90%) |
 | `HEALTH_THRESHOLDS` | recommender.ts | 50/70/85 | healthy/warming/hot/critical |
 | `MCP_TOKENS_PER_TOOL` | scanner.ts | 0 | MCP tools loaded on-demand |
-| `TOTAL_BUILTIN_TOOL_TOKENS` | built-in-tools.ts | 9,055 | Sum of 40 tool schemas |
+| `CORE_SCHEMA_TOKENS_BY_VERSION` | built-in-tools.ts | 20,500 / 17,500 / 15,000 | Core tool schema cost by Claude Code version band (>=2.1.214 / >=2.1.160 / >=2.1.150); `LEGACY_CORE_SCHEMA_TOKENS` 9,055 below that (aliased as `TOTAL_BUILTIN_TOOL_TOKENS`); a saved calibrate override wins |
+| `DEFERRED_BUILTIN_LOAD_TOKENS` / `DEFERRED_MCP_LOAD_TOKENS` | built-in-tools.ts | 1,000 / 330 | Per-tool window cost charged when ToolSearch loads a deferred schema |
 | `CRUSTS_DIR` | calibrator.ts | `~/.claude-crusts` | Calibration + trend data directory |
 | `HISTORY_PATH` | trend.ts | `~/.claude-crusts/history.jsonl` | Append-only trend history |
 | `DEFAULT_SKILL_TOKENS` | scanner.ts | 60 | Per-skill token estimate fallback |

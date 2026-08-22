@@ -104,7 +104,7 @@ program
     );
 
     if (result.calibration) {
-      renderCalibrationComparison(result.calibration);
+      renderCalibrationComparison(result.calibration, result.breakdown);
     }
   });
 
@@ -141,7 +141,10 @@ program
     if (configData.memoryFiles.files.length > 0) {
       console.log(`    Memory files: ${configData.memoryFiles.files.length} (~${configData.memoryFiles.totalEstimatedTokens.toLocaleString()} tokens)`);
     }
-    console.log(`    Built-in tools: ${configData.builtInTools.tools.length} (~${configData.builtInTools.totalEstimatedTokens.toLocaleString()} tokens)`);
+    const coreNote = configData.builtInTools.coreSchemaOverride
+      ? `~${configData.builtInTools.coreSchemaOverride.toLocaleString()} tokens, pinned by calibrate`
+      : 'schema cost resolved per session from its Claude Code version';
+    console.log(`    Core built-in tools: ${configData.builtInTools.tools.length} (${coreNote})`);
     if (configData.skills.items.length > 0) {
       console.log(`    Skills: ${configData.skills.items.length} (${configData.skills.items.map((s) => s.name).join(', ')})`);
     }

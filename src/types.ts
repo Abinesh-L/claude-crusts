@@ -145,6 +145,14 @@ export interface SessionMessage {
   };
   /** On user records that carry a tool's follow-up content (e.g. Skill bodies): the originating tool_use id */
   sourceToolUseID?: string;
+  /**
+   * Structured copy of a tool's result that Claude Code writes next to the
+   * tool_result block. Shape depends on the tool (string for some, objects
+   * such as `{ stdout, stderr }` for shells). On ToolSearch results it is
+   * `{ matches: string[], query, total_deferred_tools }`, the list of
+   * deferred schemas that call loaded into the window.
+   */
+  toolUseResult?: unknown;
   /** Parent uuid in the logical (pre-replay) conversation chain */
   logicalParentUuid?: string | null;
   /** Prompt id linking a user record to its `last-prompt` entry */
@@ -265,8 +273,21 @@ export interface ConfigData {
     totalEstimatedTokens: number;
   };
   builtInTools: {
-    tools: { name: string; estimated_tokens: number }[];
+    /** Always-loaded (core) built-in tool names, see `CORE_TOOL_NAMES` */
+    tools: string[];
+    /**
+     * Baseline core schema cost used only when the session carries no
+     * Claude Code version signal and no calibration override (the scanner
+     * supplies `LEGACY_CORE_SCHEMA_TOKENS`; fixtures pass 0 to opt out).
+     * The classifier resolves the effective cost per session via
+     * `resolveCoreSchemaTokens(claudeCodeVersion, coreSchemaOverride, this)`.
+     */
     totalEstimatedTokens: number;
+    /**
+     * Core schema cost pinned by `claude-crusts calibrate` (the /context
+     * "System tools" row). Wins over the version table when > 0.
+     */
+    coreSchemaOverride?: number | null;
   };
   skills: {
     items: SkillInfo[];
@@ -287,16 +308,45 @@ export interface ClassifiedMessage {
 
 /** Breakdown of tool token usage */
 export interface ToolBreakdown {
-  /** Tools loaded (schema overhead) */
+  /**
+   * Tools whose schema is in the window: core built-ins, every tool the
+   * session invoked without a ToolSearch load (treated as core for that
+   * Claude Code version), and the deferred tools ToolSearch loaded.
+   * Deferred-but-unloaded names are never listed here.
+   */
   loadedTools: string[];
   /** Tools actually invoked during the session */
   usedTools: string[];
   /** Tools loaded but never used */
   unusedTools: string[];
-  /** Token cost per tool category */
+  /**
+   * Schema tokens in the window: core schema cost + configured MCP schema
+   * cost + `loadedSchemaTokens`.
+   */
   schemaTokens: number;
   callTokens: number;
   resultTokens: number;
+  /** Core schema cost resolved for this session (calibration > version > legacy) */
+  coreSchemaTokens: number;
+  /** Which signal produced `coreSchemaTokens` */
+  coreSchemaSource: 'calibration' | 'version' | 'legacy';
+  /**
+   * Built-in tools Claude Code deferred in this session (from
+   * `deferred_tools_delta` attachment records; empty when those records
+   * are not part of the parsed messages). Cost 0 until loaded.
+   */
+  deferredBuiltIn: string[];
+  /** MCP tools Claude Code deferred in this session (same source). Cost 0 until loaded. */
+  deferredMcp: string[];
+  /**
+   * Deferred tools a ToolSearch result loaded, in first-load order
+   * (each name once; the schema stays in the window after the first load).
+   */
+  loadedDeferred: string[];
+  /** Estimated schema tokens the `loadedDeferred` schemas added to the window */
+  loadedSchemaTokens: number;
+  /** Latest `total_deferred_tools` Claude Code reported on a ToolSearch result */
+  totalDeferredReported?: number;
 }
 
 /** Per-MCP-server invocation stats */

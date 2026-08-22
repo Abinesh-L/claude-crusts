@@ -48,7 +48,7 @@ import type {
   CalibrationComparison,
   CrustsBreakdown,
 } from './types.ts';
-import { TOTAL_BUILTIN_TOOL_TOKENS } from './built-in-tools.ts';
+import { lookupCoreSchemaTokens } from './built-in-tools.ts';
 
 /** Directory where CRUSTS stores its own data */
 export const CRUSTS_DIR = join(homedir(), '.claude-crusts');
@@ -634,7 +634,10 @@ export async function runCalibration(): Promise<void> {
  *
  * @param comparisons - Array of per-category comparisons
  */
-export function renderCalibrationComparison(comparisons: CalibrationComparison[]): void {
+export function renderCalibrationComparison(
+  comparisons: CalibrationComparison[],
+  breakdown?: CrustsBreakdown,
+): void {
   if (comparisons.length === 0) return;
 
   console.log(chalk.bold('\n  CALIBRATION COMPARISON:'));
@@ -677,19 +680,22 @@ export function renderCalibrationComparison(comparisons: CalibrationComparison[]
     console.log(`  Overall accuracy: ${accColor(overallAccuracy.toFixed(1) + '%')}`);
   }
 
-  // Built-in tool schema baseline check: if /context's "System tools"
-  // diverges from our constant by >5%, the per-tool estimates in
-  // built-in-tools.ts are stale and should be updated.
-  const toolsRow = comparisons.find((c) => c.category === 'Tools');
-  if (toolsRow && toolsRow.contextActual > 0) {
-    const delta = ((TOTAL_BUILTIN_TOOL_TOKENS - toolsRow.contextActual) / toolsRow.contextActual) * 100;
+  // Core tool schema table check: the analysis already uses the pinned
+  // /context "System tools" value when one is saved. If the version-keyed
+  // table in built-in-tools.ts disagrees with it by >5%, the table is stale
+  // for this Claude Code version and a new band should be added.
+  const tb = breakdown?.toolBreakdown;
+  if (tb && tb.coreSchemaSource === 'calibration' && tb.coreSchemaTokens > 0) {
+    const tableTokens = lookupCoreSchemaTokens(breakdown?.claudeCodeVersion);
+    const delta = ((tableTokens - tb.coreSchemaTokens) / tb.coreSchemaTokens) * 100;
     if (Math.abs(delta) > 5) {
+      const version = breakdown?.claudeCodeVersion ?? 'unknown version';
       console.log();
-      console.log(chalk.yellow(`  !  Built-in tool baseline looks stale:`));
-      console.log(chalk.dim(`     TOTAL_BUILTIN_TOOL_TOKENS = ${TOTAL_BUILTIN_TOOL_TOKENS.toLocaleString()}`));
-      console.log(chalk.dim(`     /context System tools     = ${toolsRow.contextActual.toLocaleString()}`));
+      console.log(chalk.yellow(`  !  Core tool schema table looks stale for Claude Code ${version}:`));
+      console.log(chalk.dim(`     CORE_SCHEMA_TOKENS_BY_VERSION = ${tableTokens.toLocaleString()}`));
+      console.log(chalk.dim(`     calibrated /context System tools = ${tb.coreSchemaTokens.toLocaleString()} (used for this analysis)`));
       console.log(chalk.dim(`     Delta: ${delta > 0 ? '+' : ''}${delta.toFixed(1)}%`));
-      console.log(chalk.dim(`     Update per-tool estimates in src/built-in-tools.ts`));
+      console.log(chalk.dim(`     Add a band for this version in src/built-in-tools.ts`));
     }
   }
 
