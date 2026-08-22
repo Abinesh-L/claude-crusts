@@ -679,6 +679,8 @@ claude-crusts calibrate
 # Then paste your /context output and press Enter twice
 ```
 
+Understands the current `/context` markdown table (`| System tools | 21.1k | 2.1% |`, with `k`/`m` suffixes and the `**Tokens:** 419.2k / 1m` header) as well as the older colon format. Rows marked `(deferred)` list schemas that are not loaded into the window; they are recorded but excluded from the used total. The parsed window size is stored, and the "System tools" row is saved as a core tool-schema override so later analyses pin that fixed cost to ground truth.
+
 Also flags stale built-in tool baselines: if Claude Code adds or removes built-in tools, `calibrate` will warn when CRUSTS's internal tool-schema constant drifts more than 5% from `/context`'s reported "System tools" total.
 
 ### `claude-crusts trend`

@@ -565,20 +565,50 @@ export interface RecommendationReport {
   context_health: ContextHealth;
 }
 
+/**
+ * Per-bucket token counts parsed from /context output.
+ *
+ * The first seven rows are the in-window buckets that have existed since
+ * the original colon-format output. The remaining four were added with the
+ * markdown-table format (Claude Code 2.1.150+): `skills` is in-window;
+ * the two `*_deferred` rows list schemas that are NOT loaded (excluded from
+ * the window total), and `autocompact_buffer` is reserved headroom (also not
+ * counted as used).
+ */
+export interface CalibrationBuckets {
+  system_prompt: number;
+  system_tools: number;
+  custom_agents: number;
+  memory_files: number;
+  mcp_tools: number;
+  messages: number;
+  free_space: number;
+  skills: number;
+  system_tools_deferred: number;
+  mcp_tools_deferred: number;
+  autocompact_buffer: number;
+}
+
 /** Parsed calibration data from /context output */
 export interface CalibrationData {
   timestamp: string;
-  buckets: {
-    system_prompt: number;
-    system_tools: number;
-    custom_agents: number;
-    memory_files: number;
-    mcp_tools: number;
-    messages: number;
-    free_space: number;
-  };
+  buckets: CalibrationBuckets;
+  /** Sum of the in-window bucket rows (deferred rows and the buffer excluded) */
   total_used: number;
+  /** Context window size: header window, else a Total line, else used + free (+ buffer) */
   total_capacity: number;
+  /** Window size parsed from the `**Tokens:** used / window` header, null when absent */
+  window_size: number | null;
+  /** Used total reported by the `**Tokens:**` header, null when absent */
+  reported_used: number | null;
+  /** Model id from the `**Model:**` header (may carry a `[1m]` suffix), null when absent */
+  model: string | null;
+  /**
+   * Core tool-schema cost pinned from the /context "System tools" row.
+   * Consumers prefer this over any version-keyed constant; null when the
+   * row was absent.
+   */
+  core_schema_tokens_override: number | null;
   raw_output: string;
 }
 

@@ -5,24 +5,45 @@
  * exact token totals per bucket. Saves calibration data so future
  * analyses can show accuracy comparisons.
  *
- * Expected /context output format (approximate):
+ * Two output formats are understood:
+ *
+ * Current (Claude Code 2.1.150+), a markdown document:
+ *   ## Context Usage
+ *   **Model:** claude-opus-5
+ *   **Tokens:** 419.2k / 1m (42%)
+ *   ### Estimated usage by category
+ *   | Category | Tokens | Percentage |
+ *   | System prompt | 4.1k | 0.4% |
+ *   | System tools | 21.1k | 2.1% |
+ *   | MCP tools (deferred) | 23.4k | 2.3% |
+ *   | System tools (deferred) | 16.2k | 1.6% |
+ *   | Messages | 376.9k | 37.7% |
+ *   | Free space | 580.8k | 58.1% |
+ *   | Autocompact buffer | 33k | 3.3% |
+ *   (followed by per-tool / memory / skills sub-tables that are ignored)
+ *
+ * Legacy (colon format):
  *   System prompt:  11,200 tokens
  *   System tools:   14,600 tokens
- *   Custom agents:   0 tokens
- *   Memory files:    800 tokens
- *   MCP tools:       0 tokens
  *   Messages:       98,000 tokens
  *   Free space:     74,400 tokens
  *   Total:         200,000 tokens
+ *
+ * Rows tagged "(deferred)" list schemas that are NOT loaded into the
+ * window and the autocompact buffer is reserved headroom; neither is
+ * counted in `total_used`. The "System tools" row is persisted as the
+ * core tool-schema override so the classifier can pin its fixed cost to
+ * ground truth instead of a version-keyed constant.
  */
 
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { createInterface } from 'readline';
 import chalk from 'chalk';
 import Table from 'cli-table3';
 import type {
+  CalibrationBuckets,
   CalibrationData,
   CalibrationComparison,
   CrustsBreakdown,
@@ -32,33 +53,226 @@ import { TOTAL_BUILTIN_TOOL_TOKENS } from './built-in-tools.ts';
 /** Directory where CRUSTS stores its own data */
 export const CRUSTS_DIR = join(homedir(), '.claude-crusts');
 
-/** Path to saved calibration data */
-const CALIBRATION_PATH = join(CRUSTS_DIR, 'calibration.json');
+/**
+ * Resolve the calibration file path.
+ *
+ * Respects the `CRUSTS_CALIBRATION_DIR_OVERRIDE` env var as an escape hatch
+ * for tests that must sandbox writes away from the developer's real
+ * `~/.claude-crusts/calibration.json`. Production never sets this.
+ *
+ * @returns Absolute path to calibration.json
+ */
+function calibrationPath(): string {
+  const override = process.env.CRUSTS_CALIBRATION_DIR_OVERRIDE;
+  const dir = override && override.length > 0 ? override : CRUSTS_DIR;
+  return join(dir, 'calibration.json');
+}
 
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
 
+/** A token figure as printed by /context: `11,200`, `21.1k`, `1m`, `~120` */
+const FIGURE_SOURCE = '~?\\d[\\d,]*(?:\\.\\d+)?\\s*[km]?';
+/** Strict full-string figure matcher (for validating a table cell) */
+const FIGURE_EXACT = /^~?(\d[\d,]*(?:\.\d+)?)\s*([km])?$/i;
+/** `**Tokens:** 419.2k / 1m (42%)`, also `Total: 419.2k / 1m` */
+const TOKENS_HEADER = new RegExp(
+  '^\\s*\\**\\s*(?:tokens|total|context(?: window)?)\\s*\\**\\s*:?\\s*\\**\\s*'
+  + `(${FIGURE_SOURCE})\\s*(?:tokens?)?\\s*/\\s*(${FIGURE_SOURCE})`,
+  'i',
+);
+/** Legacy `Label: 11,200 tokens` row (label may not contain a colon or pipe) */
+const COLON_ROW = new RegExp(
+  `^\\s*([^:|]+?)\\s*:\\s*\\**\\s*(${FIGURE_SOURCE})\\s*(?:tokens?)?\\s*$`,
+  'i',
+);
+/** Markdown row: first two cells */
+const TABLE_ROW = /^\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|/;
+
 /**
- * Parse a token count from a line like "System prompt:  11,200 tokens".
+ * Parse a token figure with an optional k/m suffix.
  *
- * Handles comma-separated numbers, optional "tokens" suffix, and
- * various whitespace patterns.
+ * `21.1k` -> 21,100; `1m` -> 1,000,000; `11,200` -> 11,200; `~120` -> 120.
+ * Values are rounded to whole tokens.
+ *
+ * @param raw - The figure text, with or without surrounding whitespace
+ * @returns Token count, or null if the text is not a figure
+ */
+export function parseTokenFigure(raw: string): number | null {
+  const match = raw.trim().replace(/\s*tokens?$/i, '').match(FIGURE_EXACT);
+  if (!match) return null;
+  const base = parseFloat(match[1]!.replace(/,/g, ''));
+  if (!Number.isFinite(base)) return null;
+  const suffix = (match[2] ?? '').toLowerCase();
+  const multiplier = suffix === 'k' ? 1_000 : suffix === 'm' ? 1_000_000 : 1;
+  return Math.round(base * multiplier);
+}
+
+/**
+ * Normalise a bucket label for matching: strip markdown emphasis, lowercase,
+ * collapse whitespace.
+ *
+ * @param label - Raw label text
+ * @returns Normalised label
+ */
+function normalizeLabel(label: string): string {
+  return label.replace(/\*/g, '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Parse a bucket row from either format.
+ *
+ * Markdown: `| System tools | 21.1k | 2.1% |` (the second cell must be a
+ * bare figure, so the per-tool / memory / skills sub-tables whose second
+ * column is a server, path, or source never match).
+ * Legacy: `System prompt:  11,200 tokens` or `Skills: 5k`.
  *
  * @param line - A single line from /context output
- * @returns Parsed token count, or null if the line doesn't match
+ * @returns Normalised label and token count, or null if the line is not a row
  */
 function parseTokenLine(line: string): { label: string; tokens: number } | null {
-  // Match patterns like "  System prompt:  11,200 tokens" or "System prompt: 11200"
-  const match = line.match(/^\s*([^:]+):\s*([\d,]+)\s*(?:tokens?)?\s*$/i);
-  if (!match) return null;
+  const row = line.match(TABLE_ROW);
+  if (row) {
+    const tokens = parseTokenFigure(row[2]!);
+    if (tokens === null) return null;
+    return { label: normalizeLabel(row[1]!), tokens };
+  }
 
-  const label = match[1]!.trim().toLowerCase();
-  const tokens = parseInt(match[2]!.replace(/,/g, ''), 10);
-  if (isNaN(tokens)) return null;
-
-  return { label, tokens };
+  const colon = line.match(COLON_ROW);
+  if (!colon) return null;
+  const tokens = parseTokenFigure(colon[2]!);
+  if (tokens === null) return null;
+  return { label: normalizeLabel(colon[1]!), tokens };
 }
+
+/**
+ * Parse the `**Tokens:** 419.2k / 1m (42%)` header line.
+ *
+ * @param line - A single line from /context output
+ * @returns Used and window token counts, or null if the line is not the header
+ */
+function parseTokensHeaderLine(line: string): { used: number; window: number } | null {
+  const match = line.match(TOKENS_HEADER);
+  if (!match) return null;
+  const used = parseTokenFigure(match[1]!);
+  const window = parseTokenFigure(match[2]!);
+  if (used === null || window === null || window <= 0) return null;
+  return { used, window };
+}
+
+/**
+ * Find the `**Tokens:** used / window` header anywhere in a /context block.
+ *
+ * Exposed so the context-limit resolver can read the window size straight
+ * from a transcript's `## Context Usage` record without a calibration paste.
+ *
+ * @param text - Full /context output (or any text containing the header)
+ * @returns Used and window token counts, or null if no header is present
+ */
+export function parseTokensHeader(text: string): { used: number; window: number } | null {
+  for (const line of text.split('\n')) {
+    const parsed = parseTokensHeaderLine(line);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+/**
+ * Convenience wrapper: the context window size a /context block reports.
+ *
+ * @param text - Full /context output
+ * @returns Window size in tokens (e.g. 200,000 / 500,000 / 1,000,000), or null
+ */
+export function parseContextWindowSize(text: string): number | null {
+  return parseTokensHeader(text)?.window ?? null;
+}
+
+/**
+ * Parse the `**Model:** claude-opus-5` header.
+ *
+ * @param text - Full /context output
+ * @returns Model id as printed (a `[1m]` suffix is retained), or null
+ */
+function parseModelHeader(text: string): string | null {
+  const match = text.match(/^\s*\**\s*model\s*\**\s*:\s*\**\s*(\S+)/im);
+  return match ? match[1]!.replace(/\*+$/, '') : null;
+}
+
+/**
+ * Restrict bucket parsing to the "Estimated usage by category" section when
+ * the markdown format is detected, so the per-tool, memory-file, and skills
+ * sub-tables that follow cannot be mistaken for bucket rows. Output without
+ * that heading (legacy colon format, or a bare pasted table) is returned
+ * unchanged.
+ *
+ * @param output - Full /context output
+ * @returns The text region that holds the bucket rows
+ */
+function extractCategorySection(output: string): string {
+  const heading = output.match(/^#{2,4}\s*estimated usage by category.*$/im);
+  if (!heading || heading.index === undefined) return output;
+  const rest = output.slice(heading.index + heading[0].length);
+  const next = rest.search(/^#{1,4}\s/m);
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
+/**
+ * Build an all-zero bucket set.
+ *
+ * @returns Fresh CalibrationBuckets with every field at 0
+ */
+function emptyBuckets(): CalibrationBuckets {
+  return {
+    system_prompt: 0,
+    system_tools: 0,
+    custom_agents: 0,
+    memory_files: 0,
+    mcp_tools: 0,
+    messages: 0,
+    free_space: 0,
+    skills: 0,
+    system_tools_deferred: 0,
+    mcp_tools_deferred: 0,
+    autocompact_buffer: 0,
+  };
+}
+
+/**
+ * Sum the rows that /context counts inside the window.
+ *
+ * @param b - Bucket set
+ * @returns In-window total (deferred rows and the buffer excluded)
+ */
+function sumInWindow(b: CalibrationBuckets): number {
+  return b.system_prompt + b.system_tools + b.custom_agents
+    + b.memory_files + b.mcp_tools + b.skills + b.messages;
+}
+
+/**
+ * Bucket matching rules, applied in order. Each parsed label is claimed by
+ * at most one bucket, so the specific rows (deferred, buffer, MCP) are
+ * consumed before the broad substring keys (`tools`, `agent`, `memory`) get
+ * a chance to swallow them.
+ */
+const BUCKET_RULES: ReadonlyArray<{
+  bucket: keyof CalibrationBuckets | 'total';
+  exact?: string[];
+  contains?: string[];
+}> = [
+  { bucket: 'system_tools_deferred', exact: ['system tools (deferred)', 'built-in tools (deferred)'] },
+  { bucket: 'mcp_tools_deferred', exact: ['mcp tools (deferred)'] },
+  { bucket: 'autocompact_buffer', exact: ['autocompact buffer', 'auto-compact buffer', 'compact buffer'] },
+  { bucket: 'skills', exact: ['skills', 'skill'] },
+  { bucket: 'system_prompt', contains: ['system prompt', 'system instructions'] },
+  { bucket: 'mcp_tools', contains: ['mcp tool', 'mcp'] },
+  { bucket: 'system_tools', contains: ['system tool', 'built-in tool', 'builtin tool', 'tools'] },
+  { bucket: 'custom_agents', contains: ['custom agent', 'agent'] },
+  { bucket: 'memory_files', contains: ['memory file', 'memory', 'memdir'] },
+  { bucket: 'messages', contains: ['message', 'conversation'] },
+  { bucket: 'free_space', contains: ['free space', 'free', 'remaining', 'available'] },
+  { bucket: 'total', contains: ['total', 'capacity', 'context window'] },
+];
 
 /**
  * Parse the full /context output into structured calibration data.
@@ -70,52 +284,72 @@ function parseTokenLine(line: string): { label: string; tokens: number } | null 
  * @returns Parsed CalibrationData, or null if parsing fails
  */
 export function parseContextOutput(output: string): CalibrationData | null {
-  const lines = output.split('\n');
-  const parsed: Record<string, number> = {};
+  const header = parseTokensHeader(output);
+  const model = parseModelHeader(output);
 
-  for (const line of lines) {
+  // Ordered label -> tokens map (first occurrence wins).
+  const parsed = new Map<string, number>();
+  for (const line of extractCategorySection(output).split('\n')) {
+    if (parseTokensHeaderLine(line)) continue;
     const result = parseTokenLine(line);
-    if (result) {
-      parsed[result.label] = result.tokens;
+    if (result && !parsed.has(result.label)) {
+      parsed.set(result.label, result.tokens);
     }
   }
 
-  // Try to find known buckets with flexible key matching
-  const find = (keys: string[]): number =>
-    keys.reduce((found, key) => {
-      if (found > 0) return found;
-      for (const [k, v] of Object.entries(parsed)) {
-        if (k.includes(key)) return v;
-      }
-      return 0;
-    }, 0);
+  const buckets = emptyBuckets();
+  let totalLine = 0;
+  const claimed = new Set<string>();
 
-  const buckets = {
-    system_prompt: find(['system prompt', 'system instructions']),
-    system_tools: find(['system tool', 'built-in tool', 'tools']),
-    custom_agents: find(['custom agent', 'agent']),
-    memory_files: find(['memory file', 'memory', 'memdir']),
-    mcp_tools: find(['mcp tool', 'mcp']),
-    messages: find(['message', 'conversation']),
-    free_space: find(['free space', 'free', 'remaining', 'available']),
+  const claimFirst = (predicate: (label: string) => boolean): number | null => {
+    for (const [label, tokens] of parsed) {
+      if (!claimed.has(label) && predicate(label)) {
+        claimed.add(label);
+        return tokens;
+      }
+    }
+    return null;
   };
 
-  const totalUsed = buckets.system_prompt + buckets.system_tools
-    + buckets.custom_agents + buckets.memory_files
-    + buckets.mcp_tools + buckets.messages;
+  for (const rule of BUCKET_RULES) {
+    let value: number | null = null;
+    for (const key of rule.exact ?? []) {
+      value = claimFirst((label) => label === key);
+      if (value !== null) break;
+    }
+    if (value === null) {
+      for (const key of rule.contains ?? []) {
+        // A generic key never claims a deferred row; those are handled by
+        // the exact rules above (or ignored if unrecognised).
+        value = claimFirst((label) => !label.includes('(deferred)') && label.includes(key));
+        if (value !== null) break;
+      }
+    }
+    if (value === null) continue;
+    if (rule.bucket === 'total') totalLine = value;
+    else buckets[rule.bucket] = value;
+  }
+
+  const totalUsed = sumInWindow(buckets);
+  const deferredSeen = buckets.system_tools_deferred > 0 || buckets.mcp_tools_deferred > 0;
 
   // If we didn't parse anything useful, return null
-  if (totalUsed === 0 && buckets.free_space === 0) {
+  if (totalUsed === 0 && buckets.free_space === 0 && header === null && !deferredSeen) {
     return null;
   }
 
-  const totalCapacity = find(['total', 'capacity', 'context window']);
+  const totalCapacity = header?.window
+    ?? (totalLine > 0 ? totalLine : totalUsed + buckets.free_space + buckets.autocompact_buffer);
 
   return {
     timestamp: new Date().toISOString(),
     buckets,
     total_used: totalUsed,
-    total_capacity: totalCapacity || (totalUsed + buckets.free_space),
+    total_capacity: totalCapacity,
+    window_size: header?.window ?? null,
+    reported_used: header?.used ?? null,
+    model,
+    core_schema_tokens_override: buckets.system_tools > 0 ? buckets.system_tools : null,
     raw_output: output,
   };
 }
@@ -127,15 +361,53 @@ export function parseContextOutput(output: string): CalibrationData | null {
 /**
  * Save calibration data to ~/.claude-crusts/calibration.json.
  *
- * Creates the ~/.claude-crusts/ directory if it doesn't exist.
+ * Creates the directory if it doesn't exist.
  *
  * @param data - The calibration data to save
  */
 export function saveCalibration(data: CalibrationData): void {
-  if (!existsSync(CRUSTS_DIR)) {
-    mkdirSync(CRUSTS_DIR, { recursive: true });
+  const path = calibrationPath();
+  const dir = dirname(path);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
   }
-  writeFileSync(CALIBRATION_PATH, JSON.stringify(data, null, 2), 'utf-8');
+  writeFileSync(path, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+/**
+ * Coerce a stored calibration (possibly written by an older release that
+ * lacked the 0.8.0 fields) into the current shape so consumers never see
+ * `undefined` buckets.
+ *
+ * @param raw - Parsed JSON of unknown vintage
+ * @returns Normalised CalibrationData, or null if the payload is not a calibration
+ */
+function normalizeCalibration(raw: unknown): CalibrationData | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const obj = raw as Record<string, unknown>;
+  const rawBuckets = typeof obj.buckets === 'object' && obj.buckets !== null
+    ? obj.buckets as Record<string, unknown>
+    : {};
+  const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+  const buckets = emptyBuckets();
+  for (const key of Object.keys(buckets) as Array<keyof CalibrationBuckets>) {
+    buckets[key] = num(rawBuckets[key]) ?? 0;
+  }
+  const totalUsed = num(obj.total_used) ?? sumInWindow(buckets);
+
+  return {
+    timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : 'unknown',
+    buckets,
+    total_used: totalUsed,
+    total_capacity: num(obj.total_capacity) ?? totalUsed + buckets.free_space,
+    window_size: num(obj.window_size),
+    reported_used: num(obj.reported_used),
+    model: typeof obj.model === 'string' ? obj.model : null,
+    core_schema_tokens_override: num(obj.core_schema_tokens_override)
+      ?? (buckets.system_tools > 0 ? buckets.system_tools : null),
+    raw_output: typeof obj.raw_output === 'string' ? obj.raw_output : '',
+  };
 }
 
 /**
@@ -144,14 +416,31 @@ export function saveCalibration(data: CalibrationData): void {
  * @returns CalibrationData if available, or null
  */
 export function loadCalibration(): CalibrationData | null {
-  if (!existsSync(CALIBRATION_PATH)) return null;
+  const path = calibrationPath();
+  if (!existsSync(path)) return null;
 
   try {
-    const content = readFileSync(CALIBRATION_PATH, 'utf-8');
-    return JSON.parse(content) as CalibrationData;
+    const content = readFileSync(path, 'utf-8');
+    return normalizeCalibration(JSON.parse(content));
   } catch {
     return null;
   }
+}
+
+/**
+ * The core tool-schema token cost pinned by the last calibration, if any.
+ *
+ * This is the /context "System tools" row (loaded schemas only; deferred
+ * schemas are excluded). Consumers should prefer it over any version-keyed
+ * constant.
+ *
+ * @returns Pinned token count, or null when no calibration carries one
+ */
+export function loadCoreSchemaOverride(): number | null {
+  const data = loadCalibration();
+  if (!data) return null;
+  const value = data.core_schema_tokens_override;
+  return value !== null && value > 0 ? value : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +451,8 @@ export function loadCalibration(): CalibrationData | null {
  * Compare CRUSTS estimates against /context ground truth.
  *
  * Maps CRUSTS categories to /context buckets and calculates the
- * percentage delta for each.
+ * percentage delta for each. Deferred rows are not loaded, so the Tools
+ * comparison uses `system_tools + mcp_tools` only.
  *
  * @param breakdown - The CRUSTS analysis breakdown
  * @param calibration - The /context calibration data
@@ -207,6 +497,55 @@ export function compareWithEstimates(
 // ---------------------------------------------------------------------------
 
 /**
+ * Collect a pasted block from a line stream.
+ *
+ * The /context markdown contains single blank lines between its sections,
+ * so a single empty line cannot terminate input. The block ends on two
+ * consecutive empty lines after at least one non-empty line, or on stream
+ * close. Trailing blank lines are trimmed.
+ *
+ * @param input - Readable stream to consume (stdin in production)
+ * @param output - Optional writable for readline echo (stdout in production)
+ * @returns The pasted text joined with newlines
+ */
+export function readPastedBlock(
+  input: NodeJS.ReadableStream,
+  output?: NodeJS.WritableStream,
+): Promise<string> {
+  const rl = createInterface(output ? { input, output } : { input });
+  const lines: string[] = [];
+  let emptyCount = 0;
+  let settled = false;
+
+  return new Promise<string>((resolve) => {
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      while (lines.length > 0 && lines[lines.length - 1]!.trim() === '') lines.pop();
+      resolve(lines.join('\n'));
+    };
+
+    rl.on('line', (line) => {
+      if (settled) return;
+      if (line.trim() === '') {
+        emptyCount++;
+        if (emptyCount >= 2 && lines.some((l) => l.trim() !== '')) {
+          rl.close();
+          finish();
+          return;
+        }
+        if (lines.length > 0) lines.push('');
+      } else {
+        emptyCount = 0;
+        lines.push(line);
+      }
+    });
+
+    rl.on('close', finish);
+  });
+}
+
+/**
  * Run the interactive calibration flow.
  *
  * Prompts the user to paste /context output, parses it, saves the
@@ -215,44 +554,25 @@ export function compareWithEstimates(
 export async function runCalibration(): Promise<void> {
   console.log(chalk.bold('\n  CRUSTS Calibration\n'));
   console.log('  Run /context in your Claude Code session, then paste the output below.');
-  console.log('  Press Enter twice (empty line) when done.\n');
+  console.log('  Press Enter twice (two empty lines) when done.\n');
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const lines: string[] = [];
-  let emptyCount = 0;
+  const output = await readPastedBlock(process.stdin, process.stdout);
 
-  const output = await new Promise<string>((resolve) => {
-    rl.on('line', (line) => {
-      if (line.trim() === '') {
-        emptyCount++;
-        if (emptyCount >= 1 && lines.length > 0) {
-          rl.close();
-          resolve(lines.join('\n'));
-          return;
-        }
-      } else {
-        emptyCount = 0;
-        lines.push(line);
-      }
-    });
-
-    rl.on('close', () => {
-      resolve(lines.join('\n'));
-    });
-  });
-
-  if (lines.length === 0) {
+  if (output.trim().length === 0) {
     console.error(chalk.red('\n  No input received. Calibration cancelled.\n'));
     return;
   }
 
   const data = parseContextOutput(output);
   if (!data) {
-    console.error(chalk.red('\n  Could not parse /context output. Expected format:'));
+    console.error(chalk.red('\n  Could not parse /context output. Expected either the /context table:'));
+    console.error(chalk.dim('    **Tokens:** 419.2k / 1m (42%)'));
+    console.error(chalk.dim('    | System prompt | 4.1k | 0.4% |'));
+    console.error(chalk.dim('    | System tools | 21.1k | 2.1% |'));
+    console.error(chalk.dim('    | Messages | 376.9k | 37.7% |'));
+    console.error(chalk.dim('  or the legacy colon format:'));
     console.error(chalk.dim('    System prompt:  11,200 tokens'));
-    console.error(chalk.dim('    System tools:   14,600 tokens'));
-    console.error(chalk.dim('    Messages:       98,000 tokens'));
-    console.error(chalk.dim('    Free space:     74,400 tokens\n'));
+    console.error(chalk.dim('    Messages:       98,000 tokens\n'));
     return;
   }
 
@@ -271,20 +591,39 @@ export async function runCalibration(): Promise<void> {
   if (b.custom_agents > 0) table.push(['Custom agents', b.custom_agents.toLocaleString()]);
   if (b.memory_files > 0) table.push(['Memory files', b.memory_files.toLocaleString()]);
   if (b.mcp_tools > 0) table.push(['MCP tools', b.mcp_tools.toLocaleString()]);
+  if (b.skills > 0) table.push(['Skills', b.skills.toLocaleString()]);
   if (b.messages > 0) table.push(['Messages', b.messages.toLocaleString()]);
   if (b.free_space > 0) table.push(['Free space', b.free_space.toLocaleString()]);
-  table.push([chalk.bold('Total'), chalk.bold(data.total_capacity.toLocaleString())]);
+  if (b.autocompact_buffer > 0) {
+    table.push([chalk.dim('Autocompact buffer (reserved)'), chalk.dim(b.autocompact_buffer.toLocaleString())]);
+  }
+  if (b.system_tools_deferred > 0) {
+    table.push([chalk.dim('System tools (deferred, not loaded)'), chalk.dim(b.system_tools_deferred.toLocaleString())]);
+  }
+  if (b.mcp_tools_deferred > 0) {
+    table.push([chalk.dim('MCP tools (deferred, not loaded)'), chalk.dim(b.mcp_tools_deferred.toLocaleString())]);
+  }
+  table.push([chalk.bold('Used (in window)'), chalk.bold(data.total_used.toLocaleString())]);
+  table.push([chalk.bold('Window'), chalk.bold(data.total_capacity.toLocaleString())]);
 
   console.log(table.toString());
 
-  // MCP assumption check — warn immediately on calibration, not just on later analyze.
+  if (data.model) {
+    console.log(chalk.dim(`\n  Model: ${data.model}`));
+  }
+
+  if (data.core_schema_tokens_override !== null) {
+    console.log();
+    console.log(chalk.dim(`  Core tool-schema cost pinned to ${data.core_schema_tokens_override.toLocaleString()} tokens`));
+    console.log(chalk.dim('  (the /context "System tools" row; deferred schemas excluded).'));
+  }
+
+  // Loaded MCP schemas cost real tokens; deferred ones do not. Report the
+  // loaded figure so the user knows what the comparison is measured against.
   if (b.mcp_tools > 0) {
     console.log();
-    console.log(chalk.yellow(`  !  MCP tools baseline looks wrong:`));
-    console.log(chalk.dim(`     MCP_TOKENS_PER_TOOL = 0 (assumed on-demand load)`));
-    console.log(chalk.dim(`     /context MCP tools  = ${b.mcp_tools.toLocaleString()}`));
-    console.log(chalk.dim(`     Claude Code on this install costs real tokens for MCP schemas.`));
-    console.log(chalk.dim(`     Update MCP_TOKENS_PER_TOOL in src/scanner.ts based on per-server measurement.`));
+    console.log(chalk.yellow(`  !  /context reports ${b.mcp_tools.toLocaleString()} tokens of loaded MCP tool schemas.`));
+    console.log(chalk.dim(`     Deferred MCP schemas (${b.mcp_tools_deferred.toLocaleString()} tokens) stay outside the window until ToolSearch loads them.`));
   }
 
   console.log(chalk.dim('\n  Future analyses will show accuracy comparison against this data.\n'));
