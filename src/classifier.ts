@@ -706,15 +706,29 @@ function computeModelHistory(messages: SessionMessage[]): ModelHistory {
  *   2. user (isCompactSummary: true) — the compressed summary
  *   3. assistant — first response in the new context window
  *
+ * Two guards keep the event list faithful to the real window:
+ *   - Boundaries are deduplicated by `uuid`. The scanner already drops
+ *     resume replays at parse time; this is the belt for callers that build
+ *     message arrays themselves. Boundaries without a uuid are never merged.
+ *   - `tokensAfter` comes from the first REAL assistant after the boundary:
+ *     `<synthetic>` placeholders and zero-usage records are skipped, so a
+ *     "No response requested." stub directly after the boundary no longer
+ *     reports tokensAfter = 0 (and tokensDropped = preTokens).
+ *
  * @param messages - Parsed session messages
  * @returns Array of compaction events detected from markers
  */
 function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
   const events: CompactionEvent[] = [];
+  const seenBoundaryUuids = new Set<string>();
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
     if (msg.type !== 'system' || msg.subtype !== 'compact_boundary') continue;
+    if (msg.uuid) {
+      if (seenBoundaryUuids.has(msg.uuid)) continue;
+      seenBoundaryUuids.add(msg.uuid);
+    }
 
     const preTokens = msg.compactMetadata?.preTokens ?? 0;
 
@@ -737,12 +751,14 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
     let tokensAfter = 0;
     for (let j = i + 1; j < Math.min(i + 10, messages.length); j++) {
       const m = messages[j]!;
-      if (m.type === 'assistant' && m.message?.usage) {
-        afterIndex = j;
-        const u = m.message.usage;
-        tokensAfter = u.input_tokens + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
-        break;
-      }
+      if (m.type !== 'assistant' || !m.message?.usage) continue;
+      if (m.message.model === '<synthetic>') continue;
+      const u = m.message.usage;
+      const effective = u.input_tokens + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+      if (effective <= 0) continue;
+      afterIndex = j;
+      tokensAfter = effective;
+      break;
     }
 
     events.push({

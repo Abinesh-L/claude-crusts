@@ -103,8 +103,13 @@ export interface SessionMessage {
     preTokens: number;
     preCompactDiscoveredTools?: string[];
   };
-  /** Model identifier — "<synthetic>" for session exit/resume artifacts */
-  model?: string;
+  /**
+   * True on API error placeholder assistants ("API Error: ...").
+   * These carry all-zero usage and are dropped at parse time. The model
+   * marker for placeholders lives on `message.model` ("<synthetic>");
+   * no record carries a top-level `model` key.
+   */
+  isApiErrorMessage?: boolean;
 }
 
 // ---------------------------------------------------------------------------

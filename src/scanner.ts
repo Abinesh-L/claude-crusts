@@ -103,6 +103,53 @@ export function discoverSessions(basePath?: string): SessionInfo[] {
   return sessions;
 }
 
+/** Record types that carry conversation the model actually receives */
+const ANALYZED_RECORD_TYPES: ReadonlySet<string> = new Set(['user', 'assistant', 'system']);
+
+/** Model marker Claude Code writes on placeholder assistant records */
+const SYNTHETIC_MODEL = '<synthetic>';
+
+/**
+ * Decide whether one parsed JSONL record takes part in context analysis.
+ *
+ * Keeps exactly the records that are part of the API conversation:
+ *   - `user` and `assistant` turns
+ *   - `system` records ONLY when `subtype === 'compact_boundary'`. Every
+ *     other system subtype (turn_duration, api_error, away_summary,
+ *     local_command, scheduled_task_fire, model_refusal_fallback, ...) is
+ *     transcript bookkeeping that never reaches the model; keeping them
+ *     inflated message counts and spread framing overhead over phantom rows.
+ *
+ * Drops placeholder assistants even when their type matches:
+ *   - `message.model === '<synthetic>'` ("No response requested.", API error
+ *     stand-ins). The marker lives on `message.model`; no record carries a
+ *     top-level `model` key, which is why the old top-level check never fired.
+ *   - `isApiErrorMessage === true`, the explicit flag on API error placeholders.
+ *
+ * Everything else (progress, last-prompt, file-history-snapshot, queue
+ * operations, mode changes, ...) is not conversation and is ignored.
+ *
+ * @param parsed - One JSON-parsed JSONL line
+ * @returns True when the record should be pushed into the session message list
+ */
+export function isAnalyzedRecord(parsed: Record<string, unknown>): boolean {
+  const type = parsed.type;
+  if (typeof type !== 'string' || !ANALYZED_RECORD_TYPES.has(type)) return false;
+
+  if (type === 'system') {
+    return parsed.subtype === 'compact_boundary';
+  }
+
+  if (parsed.isApiErrorMessage === true) return false;
+
+  const message = parsed.message as { model?: unknown } | undefined;
+  if (message && typeof message === 'object' && message.model === SYNTHETIC_MODEL) {
+    return false;
+  }
+
+  return true;
+}
+
 /**
  * Stream-parse a JSONL session file line by line.
  *
@@ -110,6 +157,13 @@ export function discoverSessions(basePath?: string): SessionInfo[] {
  * offset. This ensures that when CRUSTS is invoked from within Claude
  * Code (as a Bash tool call), any messages appended to the JSONL during
  * the analysis itself are excluded.
+ *
+ * Two parse-time filters keep the result honest:
+ *   - Resume replays: resuming a session re-appends whole branches with
+ *     their original `uuid`s (a compact_boundary plus hundreds of assistant
+ *     records in real files). The first occurrence of a uuid wins; every
+ *     later copy is skipped. Records without a uuid are never deduplicated.
+ *   - Record selection: see `isAnalyzedRecord` for which types survive.
  *
  * Malformed lines are skipped with a warning logged to stderr.
  *
@@ -127,6 +181,7 @@ export async function parseSession(filePath: string): Promise<SessionMessage[]> 
   const snapshotSize = statSync(filePath).size;
 
   const messages: SessionMessage[] = [];
+  const seenUuids = new Set<string>();
   let lineNumber = 0;
   let skippedLines = 0;
 
@@ -143,21 +198,16 @@ export async function parseSession(filePath: string): Promise<SessionMessage[]> 
     try {
       const parsed = JSON.parse(line) as Record<string, unknown>;
 
-      // Skip non-message types we don't analyze
-      const type = parsed.type as string;
-      if (type === 'file-history-snapshot' || type === 'progress' || type === 'last-prompt') {
-        continue;
+      // Resume replays: first occurrence of a uuid wins, later copies skipped.
+      const uuid = parsed.uuid;
+      if (typeof uuid === 'string' && uuid.length > 0) {
+        if (seenUuids.has(uuid)) continue;
+        seenUuids.add(uuid);
       }
 
-      // Filter out synthetic messages (session exit/resume artifacts)
-      if (type === 'assistant' && parsed.model === '<synthetic>') {
-        continue;
-      }
+      if (!isAnalyzedRecord(parsed)) continue;
 
-      // Accept user, assistant, and system types
-      if (type === 'user' || type === 'assistant' || type === 'system') {
-        messages.push(parsed as unknown as SessionMessage);
-      }
+      messages.push(parsed as unknown as SessionMessage);
     } catch {
       skippedLines++;
     }
