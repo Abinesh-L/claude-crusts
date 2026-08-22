@@ -15,6 +15,7 @@ import type {
   ConfigData,
 } from './types.ts';
 import { loadWasteThresholds, describeThresholdOverrides } from './config.ts';
+import { effectiveInput } from './model-context.ts';
 
 // Thresholds are bound at the top of `detectWaste` from user config (with
 // defaults from `config.ts`). Kept as module-level `let`s so the internal
@@ -442,9 +443,7 @@ function detectCacheOverhead(messages: SessionMessage[]): WasteItem[] {
     const usage = msg.message?.usage;
     if (!usage) continue;
 
-    totalInput += usage.input_tokens
-      + (usage.cache_creation_input_tokens ?? 0)
-      + (usage.cache_read_input_tokens ?? 0);
+    totalInput += effectiveInput(usage);
     totalCacheRead += usage.cache_read_input_tokens ?? 0;
   }
 

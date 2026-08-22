@@ -13,10 +13,17 @@
  * under ~/.claude or ~/.claude-crusts is touched.
  */
 import { describe, test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseSession, isAnalyzedRecord } from '../src/scanner.ts';
+import {
+  parseSession,
+  isAnalyzedRecord,
+  discoverSessions,
+  detectClaudeCodeVersion,
+  readClaudeCodeVersion,
+  VERSION_PROBE_MAX_BYTES,
+} from '../src/scanner.ts';
 import { classifySession, detectCompactionEvents } from '../src/classifier.ts';
 import type { SessionMessage, ConfigData } from '../src/types.ts';
 
@@ -401,5 +408,102 @@ describe('parseSession malformed input', () => {
   test('returns an empty array for a missing file', async () => {
     const messages = await parseSession(join(sandbox, 'does-not-exist.jsonl'));
     expect(messages).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.0 M4 — claudeCodeVersion capture
+// ---------------------------------------------------------------------------
+
+describe('claudeCodeVersion (M4)', () => {
+  /**
+   * Fixture mirroring a real file head: unversioned bookkeeping records
+   * first, then a large versioned SessionStart attachment, then turns.
+   *
+   * @returns Records ready for `writeFixture`
+   */
+  function versionedRecords(): unknown[] {
+    return [
+      { type: 'last-prompt', lastPrompt: 'hi' },
+      { type: 'mode', mode: 'default' },
+      { type: 'permission-mode', permissionMode: 'auto' },
+      { type: 'attachment', uuid: 'att-1', version: '2.1.239', attachment: { type: 'hook_success', content: 'x'.repeat(20_000) } },
+      { ...userRecord('u1', 'hello'), version: '2.1.239' },
+      { ...assistantRecord('a1', 100, 10), version: '2.1.240' },
+    ];
+  }
+
+  test('readClaudeCodeVersion returns the first non-empty version in the file head', () => {
+    const path = writeFixture(versionedRecords());
+    expect(readClaudeCodeVersion(path)).toBe('2.1.239');
+  });
+
+  test('readClaudeCodeVersion finds a version that sits beyond the first 64 KB chunk', () => {
+    const records = [
+      { type: 'last-prompt', lastPrompt: 'hi' },
+      // 100 KB unversioned line pushes the first versioned record past one chunk
+      { type: 'file-history-snapshot', snapshot: { blob: 'y'.repeat(100_000) } },
+      { ...userRecord('u1', 'hello'), version: '2.1.224' },
+    ];
+    expect(readClaudeCodeVersion(writeFixture(records))).toBe('2.1.224');
+  });
+
+  test('readClaudeCodeVersion survives a multi-byte character straddling the chunk boundary', () => {
+    const head = JSON.stringify({ type: 'last-prompt', lastPrompt: 'hi' }) + '\n';
+    const prefix = '{"type":"user","version":"2.1.239","message":{"role":"user","content":"';
+    let start = Buffer.byteLength(head) + prefix.length;
+    let filler = '';
+    // Make byte 65,536 land on the SECOND byte of a 2-byte character.
+    if ((65_536 - start) % 2 === 0) {
+      filler = 'a';
+      start += 1;
+    }
+    const body = filler + 'é'.repeat(40_000);
+    const line = prefix + body + '"}}\n';
+    const path = join(sandbox, 'utf8-boundary.jsonl');
+    writeFileSync(path, head + line, 'utf-8');
+    expect(readClaudeCodeVersion(path)).toBe('2.1.239');
+  });
+
+  test('readClaudeCodeVersion ignores a "version" key that is not top-level', () => {
+    const records = [
+      userRecord('u1', 'paste: {"version":"9.9.9"}'),
+      { ...assistantRecord('a1', 100, 10), version: '2.1.224' },
+    ];
+    expect(readClaudeCodeVersion(writeFixture(records))).toBe('2.1.224');
+  });
+
+  test('readClaudeCodeVersion returns undefined when nothing in the probe window is versioned', () => {
+    expect(readClaudeCodeVersion(writeFixture([userRecord('u1', 'hello'), assistantRecord('a1', 1, 1)]))).toBeUndefined();
+    expect(readClaudeCodeVersion(join(sandbox, 'missing.jsonl'))).toBeUndefined();
+    // Versioned record only after the probe cap: not found, and no crash
+    const late = [
+      { type: 'file-history-snapshot', snapshot: { blob: 'z'.repeat(VERSION_PROBE_MAX_BYTES + 10) } },
+      { ...userRecord('u1', 'hello'), version: '2.1.224' },
+    ];
+    expect(readClaudeCodeVersion(writeFixture(late))).toBeUndefined();
+  });
+
+  test('discoverSessions populates SessionInfo.claudeCodeVersion', () => {
+    const base = join(sandbox, 'projects');
+    const projectDir = join(base, 'C--proj');
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, 'sess-1.jsonl'), versionedRecords().map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf-8');
+    writeFileSync(join(projectDir, 'sess-2.jsonl'), JSON.stringify(userRecord('u9', 'legacy')) + '\n', 'utf-8');
+    const sessions = discoverSessions(base);
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    expect(byId.get('sess-1')!.claudeCodeVersion).toBe('2.1.239');
+    expect(byId.get('sess-2')!.claudeCodeVersion).toBeUndefined();
+  });
+
+  test('parseSession keeps version on records and detectClaudeCodeVersion picks the first non-empty one', async () => {
+    const messages = await parseSession(writeFixture([
+      { ...userRecord('u0', 'first'), version: '' },
+      ...versionedRecords(),
+    ]));
+    // attachment records are not yet analysed (M11), so the first surviving versioned record is the user turn
+    expect(messages[0]!.version).toBe('');
+    expect(detectClaudeCodeVersion(messages)).toBe('2.1.239');
+    expect(detectClaudeCodeVersion([])).toBeUndefined();
   });
 });

@@ -8,8 +8,18 @@
 
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
-import { createReadStream, existsSync, statSync, readdirSync, readFileSync } from 'fs';
+import {
+  createReadStream,
+  existsSync,
+  statSync,
+  readdirSync,
+  readFileSync,
+  openSync,
+  readSync,
+  closeSync,
+} from 'fs';
 import { createInterface } from 'readline';
+import { StringDecoder } from 'string_decoder';
 import chalk from 'chalk';
 import type {
   SessionMessage,
@@ -86,6 +96,7 @@ export function discoverSessions(basePath?: string): SessionInfo[] {
           project,
           modifiedAt: stat.mtime,
           sizeBytes: stat.size,
+          claudeCodeVersion: readClaudeCodeVersion(filePath),
         });
       } catch {
         continue;
@@ -101,6 +112,101 @@ export function discoverSessions(basePath?: string): SessionInfo[] {
 
   sessions.sort((a, b) => b.modifiedAt.getTime() - a.modifiedAt.getTime());
   return sessions;
+}
+
+/** Bytes read per probe step while looking for the first versioned record */
+const VERSION_PROBE_CHUNK_BYTES = 64 * 1024;
+
+/** Upper bound on bytes scanned for a version before giving up */
+export const VERSION_PROBE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Extract a non-empty `version` string from one parsed JSONL record.
+ *
+ * @param record - JSON-parsed record
+ * @returns The version, or undefined when absent or empty
+ */
+function recordVersion(record: unknown): string | undefined {
+  if (!record || typeof record !== 'object') return undefined;
+  const version = (record as { version?: unknown }).version;
+  return typeof version === 'string' && version.length > 0 ? version : undefined;
+}
+
+/**
+ * Claude Code version that wrote a parsed session: the first record that
+ * carries a non-empty `version` field.
+ *
+ * Every API-conversation record (user, assistant, system, attachment)
+ * carries the version of the Claude Code build that appended it, so the
+ * first one is the version the session started on.
+ *
+ * @param messages - Parsed session messages in file order
+ * @returns Version string (e.g. `2.1.239`), or undefined when none is present
+ */
+export function detectClaudeCodeVersion(messages: SessionMessage[]): string | undefined {
+  for (const msg of messages) {
+    const version = recordVersion(msg);
+    if (version) return version;
+  }
+  return undefined;
+}
+
+/**
+ * Read the Claude Code version from the head of a session file without
+ * parsing the whole file.
+ *
+ * Real files open with a few small unversioned bookkeeping records
+ * (`last-prompt`, `mode`, `permission-mode`) before the first versioned
+ * record, which is usually a SessionStart hook attachment that can be tens
+ * of KB. The probe reads 64 KB chunks, parses each complete line, and stops
+ * at the first version found or after `VERSION_PROBE_MAX_BYTES`, so
+ * `discoverSessions` stays cheap on multi-MB files.
+ *
+ * @param filePath - Absolute path to the .jsonl file
+ * @returns Version string, or undefined when none is found in the probed head
+ */
+export function readClaudeCodeVersion(filePath: string): string | undefined {
+  let fd: number | null = null;
+  try {
+    fd = openSync(filePath, 'r');
+    const chunk = Buffer.alloc(VERSION_PROBE_CHUNK_BYTES);
+    // StringDecoder carries a multi-byte sequence split across chunks
+    // instead of emitting a replacement char that would break that line.
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    let position = 0;
+
+    while (position < VERSION_PROBE_MAX_BYTES) {
+      const bytesRead = readSync(fd, chunk, 0, chunk.length, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      pending += decoder.write(chunk.subarray(0, bytesRead));
+
+      const lines = pending.split('\n');
+      // The last element is either an incomplete line or '' after a newline.
+      pending = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.includes('"version"')) continue;
+        try {
+          const version = recordVersion(JSON.parse(line));
+          if (version) return version;
+        } catch {
+          // Malformed line: keep probing
+        }
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing to recover from a failed close on a read-only handle
+      }
+    }
+  }
 }
 
 /** Record types that carry conversation the model actually receives */

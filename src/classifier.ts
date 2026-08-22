@@ -28,8 +28,9 @@ import type {
   ModelHistory,
   ModelSegment,
 } from './types.ts';
-import { resolveContextLimitWithSignal } from './model-context.ts';
+import { resolveContextLimitWithSignal, effectiveInput, cacheCreationTokens } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
+import { detectClaudeCodeVersion } from './scanner.ts';
 
 /** Whether to print derivation debug info to stderr */
 let verbose = false;
@@ -113,17 +114,49 @@ function charsPerToken(text: string): number {
 }
 
 /**
+ * Flat token cost charged for one image block.
+ *
+ * The API prices an image at roughly (width * height) / 750 tokens; the
+ * JSONL keeps only base64 data, not dimensions, so a fixed estimate near
+ * the cost of a typical screenshot is used (a 1568 px long-edge image
+ * tops out around 1,600 tokens).
+ */
+export const IMAGE_BLOCK_TOKENS = 1_500;
+
+/**
  * Estimate the token count of a content block.
  *
- * Counts characters from all content-bearing fields including text,
- * thinking, tool input, tool_result content, and thinking block
- * signatures (which are real data in the JSONL that occupy context).
+ * Counts characters from the content-bearing fields: text, thinking,
+ * tool input, tool_result content, and tool block metadata (ids, names).
  * Uses a content-aware divisor: ~3.3 for code, ~4.0 for English text.
+ *
+ * Deliberately NOT counted: `signature` on thinking blocks. Claude Code
+ * never persists thinking text (every observed block has `thinking: ''`)
+ * and the signature is an opaque verification token, not content the model
+ * re-reads; counting its 800-14,000 chars gave 200-3,500 phantom tokens
+ * to every assistant line without `output_tokens`.
+ *
+ * Media blocks have no text but do occupy context: image blocks cost a
+ * flat `IMAGE_BLOCK_TOKENS`, document blocks (PDFs) cost their base64
+ * length / 4.
+ *
+ * Nested sub-blocks (tool_result content arrays) are estimated with their
+ * own divisor and added as tokens, so media and code nested inside a
+ * result keep their own cost instead of being re-divided by the parent's
+ * divisor.
  *
  * @param block - The content block to estimate
  * @returns Estimated token count
  */
 function estimateBlockTokens(block: ContentBlock): number {
+  if (block.type === 'image') return IMAGE_BLOCK_TOKENS;
+  if (block.type === 'document') {
+    const data = block.source?.data;
+    return typeof data === 'string' && data.length > 0
+      ? Math.ceil(data.length / CHARS_PER_TOKEN_TEXT)
+      : 0;
+  }
+
   let chars = 0;
   let sampleText = '';
 
@@ -132,7 +165,6 @@ function estimateBlockTokens(block: ContentBlock): number {
     sampleText = block.text;
   }
   if (block.thinking) chars += block.thinking.length;
-  if (block.signature) chars += block.signature.length;
   if (block.input) {
     const inputStr = JSON.stringify(block.input);
     chars += inputStr.length;
@@ -144,19 +176,18 @@ function estimateBlockTokens(block: ContentBlock): number {
   if (block.tool_use_id) chars += block.tool_use_id.length;
   if (block.name) chars += block.name.length;
 
+  let nestedTokens = 0;
   if (typeof block.content === 'string') {
     chars += block.content.length;
     if (!sampleText) sampleText = block.content;
   } else if (Array.isArray(block.content)) {
     for (const sub of block.content) {
-      // Recursion: sub-blocks get their own divisor, so convert back to chars
-      // using a neutral divisor for accumulation, then apply final divisor below
-      chars += estimateBlockTokens(sub) * CHARS_PER_TOKEN_TEXT;
+      nestedTokens += estimateBlockTokens(sub);
     }
   }
 
   const divisor = sampleText ? charsPerToken(sampleText) : CHARS_PER_TOKEN_TEXT;
-  return Math.ceil(chars / divisor);
+  return Math.ceil(chars / divisor) + nestedTokens;
 }
 
 /**
@@ -663,7 +694,8 @@ function computeModelHistory(messages: SessionMessage[]): ModelHistory {
       current.assistantMessageCount++;
       current.totalInputTokens += usage?.input_tokens ?? 0;
       current.totalOutputTokens += usage?.output_tokens ?? 0;
-      current.cacheCreationTokens += usage?.cache_creation_input_tokens ?? 0;
+      // Flat vs nested cache_creation reconciled the same way effectiveInput does
+      current.cacheCreationTokens += cacheCreationTokens(usage);
       current.cacheReadTokens += usage?.cache_read_input_tokens ?? 0;
       current.lastSeenAt = timestamp;
       continue;
@@ -677,7 +709,7 @@ function computeModelHistory(messages: SessionMessage[]): ModelHistory {
       assistantMessageCount: 1,
       totalInputTokens: usage?.input_tokens ?? 0,
       totalOutputTokens: usage?.output_tokens ?? 0,
-      cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
+      cacheCreationTokens: cacheCreationTokens(usage),
       cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
@@ -753,8 +785,7 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       const m = messages[j]!;
       if (m.type !== 'assistant' || !m.message?.usage) continue;
       if (m.message.model === '<synthetic>') continue;
-      const u = m.message.usage;
-      const effective = u.input_tokens + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+      const effective = effectiveInput(m.message.usage);
       if (effective <= 0) continue;
       afterIndex = j;
       tokensAfter = effective;
@@ -792,10 +823,7 @@ function detectViaHeuristic(messages: SessionMessage[]): CompactionEvent[] {
     const msg = messages[i]!;
     if (msg.type !== 'assistant' || !msg.message?.usage) continue;
 
-    const usage = msg.message.usage;
-    const inputTokens = usage.input_tokens
-      + (usage.cache_creation_input_tokens ?? 0)
-      + (usage.cache_read_input_tokens ?? 0);
+    const inputTokens = effectiveInput(msg.message.usage);
 
     if (prevAssistantIdx >= 0 && prevInputTokens - inputTokens > COMPACTION_DROP_THRESHOLD) {
       events.push({
@@ -819,8 +847,8 @@ function detectViaHeuristic(messages: SessionMessage[]): CompactionEvent[] {
  * Pull the authoritative "current window size" from the last non-synthetic
  * assistant turn's API-reported usage.
  *
- * `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` is
- * what Claude Code sends to the API on that turn — the bounded, correct
+ * `effectiveInput(usage)` (input + reconciled cache_creation + cache_read)
+ * is what Claude Code sent to the API on that turn — the bounded, correct
  * number. The classifier's per-message content-sum diverges from this: it
  * under-reports short sessions (cached prior conversation re-sent each turn
  * is a single API hit but isn't classified per message) and over-reports
@@ -845,14 +873,9 @@ function computeEffectiveInputTokens(
     const msg = messages[i];
     if (!msg || msg.type !== 'assistant') continue;
     if (msg.message?.model === '<synthetic>') continue;
-    const usage = msg.message?.usage as
-      | { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
-      | undefined;
+    const usage = msg.message?.usage;
     if (!usage) continue;
-    const input = usage.input_tokens ?? 0;
-    const cacheCreation = usage.cache_creation_input_tokens ?? 0;
-    const cacheRead = usage.cache_read_input_tokens ?? 0;
-    const effective = input + cacheCreation + cacheRead;
+    const effective = effectiveInput(usage);
     if (effective > 0) return effective;
   }
   return null;
@@ -1121,6 +1144,9 @@ export function classifySession(
   // `[1m]` variant JSONL strips) takes precedence when supplied.
   const modelHistory = computeModelHistory(effectiveMessages);
   const model = modelOverride ?? modelHistory.current;
+  // Claude Code version that wrote these records (first non-empty `version`);
+  // feeds version-keyed constants such as the core tool schema cost.
+  const claudeCodeVersion = detectClaudeCodeVersion(effectiveMessages);
   // Claude Code strips the `[1m]` variant from the recorded model ID, so we
   // combine model-ID lookup with a usage-based heuristic: if any assistant
   // message observed an effective input > 200K, the window must be 1M.
@@ -1222,6 +1248,7 @@ export function classifySession(
     mcpBreakdown,
     model,
     modelHistory,
+    claudeCodeVersion,
     durationSeconds,
     compactionEvents,
     currentContext,
@@ -1255,16 +1282,15 @@ function deriveInternalSystemPrompt(
   messages: SessionMessage[],
   configData: ConfigData,
 ): DerivedOverhead['internalSystemPrompt'] {
-  // Find first assistant message with usage data
+  // Find first assistant message with non-zero effective input. On current
+  // Claude Code the first turn's input_tokens is typically 2 with the real
+  // context in cache_creation / cache_read, so the sum is what matters.
   const firstAssistant = messages.find(
-    (m) => m.type === 'assistant' && m.message?.usage && m.message.usage.input_tokens > 0,
+    (m) => m.type === 'assistant' && effectiveInput(m.message?.usage) > 0,
   );
   if (!firstAssistant?.message?.usage) return null;
 
-  const usage = firstAssistant.message.usage;
-  const totalInput = usage.input_tokens
-    + (usage.cache_creation_input_tokens ?? 0)
-    + (usage.cache_read_input_tokens ?? 0);
+  const totalInput = effectiveInput(firstAssistant.message.usage);
 
   // Known components
   const knownClaudeMd = configData.systemPrompt.totalEstimatedTokens;
@@ -1358,8 +1384,7 @@ function deriveMessageFraming(
   for (let i = startIndex; i < messages.length; i++) {
     const msg = messages[i]!;
     if (msg.type !== 'assistant' || !msg.message?.usage) continue;
-    const u = msg.message.usage;
-    const totalInput = u.input_tokens + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+    const totalInput = effectiveInput(msg.message.usage);
     if (totalInput > 0) {
       assistants.push({ index: i, totalInput });
     }

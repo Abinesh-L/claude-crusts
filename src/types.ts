@@ -28,17 +28,64 @@ export const CRUSTS_LABELS: Record<CrustsCategory, string> = {
 // JSONL message types
 // ---------------------------------------------------------------------------
 
+/**
+ * Cache-creation breakdown by TTL, nested under `usage.cache_creation`
+ * on Claude Code >= 2.1.1xx records.
+ *
+ * The flat `cache_creation_input_tokens` can disagree with this nested
+ * sum (one real turn recorded flat 0 against ephemeral_1h 815,917), which
+ * is why `effectiveInput()` in model-context.ts takes the larger of the two.
+ */
+export interface CacheCreationBreakdown {
+  ephemeral_5m_input_tokens?: number;
+  ephemeral_1h_input_tokens?: number;
+}
+
+/**
+ * One server-side iteration inside a single assistant turn.
+ *
+ * `usage.iterations[]` has more than one entry when the API edited the
+ * context mid-turn; `iterations[0]` can then exceed the final usage.
+ */
+export interface TokenUsageIteration {
+  type?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation?: CacheCreationBreakdown;
+}
+
 /** Token usage data attached to assistant messages */
 export interface TokenUsage {
   input_tokens: number;
   output_tokens: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  /** Nested cache-creation breakdown (see `CacheCreationBreakdown`) */
+  cache_creation?: CacheCreationBreakdown;
+  /** Per-iteration usage when the server edited context inside the turn */
+  iterations?: TokenUsageIteration[];
+  /** Server-side tool invocation counters (web search / fetch) */
+  server_tool_use?: {
+    web_search_requests?: number;
+    web_fetch_requests?: number;
+  };
+  /** Output split; `thinking_tokens` is the only observed key */
+  output_tokens_details?: {
+    thinking_tokens?: number;
+  };
 }
 
 /** A content block inside a message */
 export interface ContentBlock {
-  type: 'text' | 'tool_use' | 'tool_result' | 'thinking' | 'image' | 'document';
+  /**
+   * Block kind. `fallback` marks a model fallback notice
+   * (`{ from: { model }, to: { model } }`, assistant side); `tool_reference`
+   * is a ToolSearch result entry (`{ tool_name }`) nested inside a
+   * tool_result's content array. Neither carries text.
+   */
+  type: 'text' | 'tool_use' | 'tool_result' | 'thinking' | 'image' | 'document' | 'fallback' | 'tool_reference';
   text?: string;
   thinking?: string;
   signature?: string;
@@ -53,6 +100,12 @@ export interface ContentBlock {
     media_type?: string;
     data?: string;
   };
+  /** Referenced tool name on `tool_reference` blocks */
+  tool_name?: string;
+  /** Source model on `fallback` blocks */
+  from?: { model?: string };
+  /** Target model on `fallback` blocks */
+  to?: { model?: string };
 }
 
 /**
@@ -64,15 +117,38 @@ export interface ContentBlock {
  * - "system" — system events (turn_duration, etc.)
  * - "progress" — tool execution progress updates
  * - "file-history-snapshot" — file state snapshots (ignored by CRUSTS)
+ * - "attachment" — per-turn context injected by Claude Code (hook output,
+ *   skill/tool/agent listings, task reminders, auto-loaded files)
  */
 export interface SessionMessage {
-  type: 'user' | 'assistant' | 'system' | 'progress' | 'file-history-snapshot' | 'last-prompt';
+  type: 'user' | 'assistant' | 'system' | 'progress' | 'file-history-snapshot' | 'last-prompt' | 'attachment';
   message?: {
     role: string;
     content: string | ContentBlock[];
     model?: string;
     usage?: TokenUsage;
+    /**
+     * API message id (`msg_...`). Since Claude Code 2.1.114 one API
+     * response is written as several assistant lines that share this id
+     * (and `requestId`) and repeat the same final `usage`.
+     */
+    id?: string;
   };
+  /** API request id (`req_...`); groups the split lines of one response */
+  requestId?: string;
+  /** Claude Code version that wrote the record (e.g. `2.1.239`) */
+  version?: string;
+  /** Attachment payload on `type === 'attachment'` records; `type` names the kind */
+  attachment?: {
+    type: string;
+    [key: string]: unknown;
+  };
+  /** On user records that carry a tool's follow-up content (e.g. Skill bodies): the originating tool_use id */
+  sourceToolUseID?: string;
+  /** Parent uuid in the logical (pre-replay) conversation chain */
+  logicalParentUuid?: string | null;
+  /** Prompt id linking a user record to its `last-prompt` entry */
+  promptId?: string;
   /** System event subtype (e.g., "turn_duration", "compact_boundary") */
   subtype?: string;
   /** Progress data for tool execution */
@@ -102,6 +178,17 @@ export interface SessionMessage {
     trigger: 'auto' | 'manual';
     preTokens: number;
     preCompactDiscoveredTools?: string[];
+    /** Window size right after compaction, as measured by Claude Code */
+    postTokens?: number;
+    /** Wall-clock duration of the compaction in ms */
+    durationMs?: number;
+    /** Running total of tokens dropped by every compaction so far */
+    cumulativeDroppedTokens?: number;
+    /** Messages Claude Code carried across the boundary verbatim */
+    preservedMessages?: {
+      anchorUuid?: string;
+      uuids: string[];
+    };
   };
   /**
    * True on API error placeholder assistants ("API Error: ...").
@@ -123,6 +210,12 @@ export interface SessionInfo {
   project: string;
   modifiedAt: Date;
   sizeBytes: number;
+  /**
+   * Claude Code version that wrote the session (first non-empty `version`
+   * field in the file, e.g. `2.1.239`). Undefined for files whose head
+   * carries no versioned record.
+   */
+  claudeCodeVersion?: string;
 }
 
 /** A file read with its content and token estimate */
@@ -390,6 +483,12 @@ export interface CrustsBreakdown {
    * the type for backward compatibility with pre-v0.7.0 consumers.
    */
   modelHistory?: ModelHistory;
+  /**
+   * Claude Code version that wrote the analysed records (first non-empty
+   * `version` field). Drives version-keyed constants such as the core tool
+   * schema cost. Undefined when no record carries a version.
+   */
+  claudeCodeVersion?: string;
   /** Session duration in seconds, or null if timestamps unavailable */
   durationSeconds: number | null;
   /** Detected compaction events */

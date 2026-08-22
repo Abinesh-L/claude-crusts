@@ -43,14 +43,82 @@ export function getContextLimit(modelId: string | undefined): number {
 }
 
 /**
+ * Minimal usage shape accepted by the effective-input helpers.
+ *
+ * Structurally compatible with `TokenUsage` from types.ts, but every
+ * field is optional so fixtures, `iterations[]` entries, and statusline
+ * payload fragments all qualify.
+ */
+export interface UsageLike {
+  input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number;
+    ephemeral_1h_input_tokens?: number;
+  };
+}
+
+/** Message shape accepted by the usage-based context-limit helpers. */
+export type UsageMessage = { message?: { usage?: UsageLike } };
+
+/**
+ * Coerce a usage field to a finite non-negative number.
+ *
+ * @param value - Raw field value from the JSONL
+ * @returns The value, or 0 when it is missing, NaN, infinite, or negative
+ */
+function usageField(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * Cache-creation tokens for one turn, reconciling the flat and nested fields.
+ *
+ * Claude Code >= 2.1.1xx writes both `cache_creation_input_tokens` and a
+ * nested `cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}`
+ * breakdown. They usually agree, but 18 real records disagree (one turn:
+ * flat 0 vs nested 815,917). The larger of the two is the one the API
+ * actually billed and the one that bounds the window, so that is returned.
+ *
+ * @param usage - Usage object from an assistant record (or undefined)
+ * @returns Cache-creation tokens, 0 when no usage is present
+ */
+export function cacheCreationTokens(usage: UsageLike | undefined): number {
+  if (!usage) return 0;
+  const flat = usageField(usage.cache_creation_input_tokens);
+  const nested = usageField(usage.cache_creation?.ephemeral_5m_input_tokens)
+    + usageField(usage.cache_creation?.ephemeral_1h_input_tokens);
+  return Math.max(flat, nested);
+}
+
+/**
+ * Effective input of one API turn: everything the request carried.
+ *
+ * `input_tokens + cache_creation + cache_read`, where cache_creation is
+ * reconciled by `cacheCreationTokens`. This is the single definition of
+ * "how big was the window on this turn" used by the classifier (window
+ * total, compaction detection, framing derivation, model history) and by
+ * the usage-based context-limit heuristic below.
+ *
+ * @param usage - Usage object from an assistant record (or undefined)
+ * @returns Effective input tokens, 0 when no usage is present
+ */
+export function effectiveInput(usage: UsageLike | undefined): number {
+  if (!usage) return 0;
+  return usageField(usage.input_tokens)
+    + cacheCreationTokens(usage)
+    + usageField(usage.cache_read_input_tokens);
+}
+
+/**
  * Detect the session's context window from observed API usage.
  *
  * Claude Code strips the `[1m]` variant from the `model` field it writes
  * to JSONL, so the model ID alone cannot tell us whether a recorded
  * session used the 1M-token window. However, a single message whose
- * effective input (`input_tokens + cache_creation_input_tokens +
- * cache_read_input_tokens`) exceeds 200K is conclusive proof — a
- * standard 200K model would have errored before accepting it.
+ * effective input (see `effectiveInput`) exceeds 200K is conclusive
+ * proof — a standard 200K model would have errored before accepting it.
  *
  * Returns 1,000,000 if any message exceeds the 200K ceiling, otherwise
  * DEFAULT_CONTEXT_LIMIT. Conservative by design: sessions that never
@@ -60,14 +128,11 @@ export function getContextLimit(modelId: string | undefined): number {
  * @param messages - Session messages with API usage metadata
  * @returns Detected window size in tokens
  */
-export function detectContextLimitFromUsage(
-  messages: Array<{ message?: { usage?: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } } }>,
-): number {
+export function detectContextLimitFromUsage(messages: UsageMessage[]): number {
   for (const m of messages) {
     const u = m.message?.usage;
     if (!u) continue;
-    const effective = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
-    if (effective > DEFAULT_CONTEXT_LIMIT) return 1_000_000;
+    if (effectiveInput(u) > DEFAULT_CONTEXT_LIMIT) return 1_000_000;
   }
   return DEFAULT_CONTEXT_LIMIT;
 }
@@ -101,7 +166,7 @@ export interface ResolvedContextLimit {
  */
 export function resolveContextLimitWithSignal(
   modelId: string | undefined,
-  messages: Array<{ message?: { usage?: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } } }>,
+  messages: UsageMessage[],
 ): ResolvedContextLimit {
   const modelLimit = getContextLimit(modelId);
   const usageLimit = detectContextLimitFromUsage(messages);
@@ -120,7 +185,7 @@ export function resolveContextLimitWithSignal(
  */
 export function resolveContextLimit(
   modelId: string | undefined,
-  messages: Array<{ message?: { usage?: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } } }>,
+  messages: UsageMessage[],
 ): number {
   return resolveContextLimitWithSignal(modelId, messages).limit;
 }
