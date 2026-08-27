@@ -15,6 +15,7 @@ import {
   readMemoryFiles,
   readSkillsConfig,
   getBuiltInToolList,
+  collectObservedMcpServers,
 } from './scanner.ts';
 import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
@@ -34,14 +35,22 @@ import type {
  * by the classifier for accurate token estimation.
  *
  * @param projectPath - Optional project path for project-level configs
+ * @param projectSlug - Optional encoded project dir name (the session file's
+ *   parent directory), for `~/.claude/projects/<slug>/memory/` discovery
+ * @param observedMcpServers - Optional MCP server names observed in the
+ *   session JSONL (see `collectObservedMcpServers`), merged as 'observed'
  * @returns Aggregated config data
  */
-export function gatherConfigData(projectPath?: string): ConfigData {
+export function gatherConfigData(
+  projectPath?: string,
+  projectSlug?: string,
+  observedMcpServers?: string[],
+): ConfigData {
   const skillItems = readSkillsConfig(projectPath);
   return {
     systemPrompt: readSystemPromptFiles(projectPath),
-    mcpServers: readMCPConfig(projectPath),
-    memoryFiles: readMemoryFiles(projectPath),
+    mcpServers: readMCPConfig(projectPath, observedMcpServers),
+    memoryFiles: readMemoryFiles(projectPath, projectSlug),
     builtInTools: getBuiltInToolList(),
     skills: {
       items: skillItems,
@@ -109,8 +118,15 @@ export async function analyzeSession(
   // 2. Derive project path if not explicitly provided
   const resolvedProjectPath = options?.projectPath ?? deriveProjectPath(sessionPath);
 
-  // 3. Read config files
-  const configData = gatherConfigData(resolvedProjectPath);
+  // 3. Read config files. The session file's parent directory name is the
+  // encoded project slug Claude Code keys its per-project memory by, and
+  // the parsed messages reveal which MCP servers were actually connected.
+  const projectSlug = basename(dirname(sessionPath));
+  const configData = gatherConfigData(
+    resolvedProjectPath,
+    projectSlug,
+    collectObservedMcpServers(messages),
+  );
 
   // 4. Classify (auto-trims CRUSTS invocation unless untilIndex overrides)
   const breakdown = classifySession(messages, configData, options?.untilIndex);

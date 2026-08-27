@@ -234,12 +234,20 @@ export interface FileContent {
   exists: boolean;
 }
 
-/** An MCP server discovered from config */
+/**
+ * An MCP server discovered from config files or observed in the session.
+ *
+ * Sources: 'global' (~/.claude/settings.json or ~/.claude.json `mcpServers`),
+ * 'project' (~/.claude.json `projects[<cwd>].mcpServers` or <project>/.mcp.json),
+ * 'plugin' (an installed plugin's .mcp.json, named `plugin_<plugin>_<server>`),
+ * 'observed' (an `mcp__<server>__` prefix seen in the session JSONL — the
+ * JSONL is authoritative for what the session actually had connected).
+ */
 export interface MCPServerInfo {
   name: string;
   toolCount: number | null;
   estimatedSchemaTokens: number;
-  source: 'global' | 'project';
+  source: 'global' | 'project' | 'plugin' | 'observed';
 }
 
 /** Summary of memory files */
@@ -250,10 +258,17 @@ export interface MemoryFileSummary {
   source: 'global' | 'project';
 }
 
-/** A skill discovered from Claude Code settings */
+/**
+ * A skill discovered from Claude Code settings or skill directories.
+ *
+ * Sources: 'global' (~/.claude/settings.json `skills` or a
+ * ~/.claude/skills/<name>/SKILL.md directory), 'project'
+ * (<project>/.claude/settings.json), 'plugin' (an installed plugin's
+ * skills/<name>/SKILL.md, named `<plugin>:<name>`).
+ */
 export interface SkillInfo {
   name: string;
-  source: 'global' | 'project';
+  source: 'global' | 'project' | 'plugin';
   estimatedTokens: number;
 }
 
@@ -369,8 +384,8 @@ export interface ToolBreakdown {
 export interface MCPServerStats {
   /** Server name (e.g., "gmail", "calendar") */
   name: string;
-  /** Where the server is configured */
-  source: 'global' | 'project';
+  /** Where the server was discovered (see MCPServerInfo.source) */
+  source: 'global' | 'project' | 'plugin' | 'observed';
   /** Number of tool invocations from this server in the session */
   invocationCount: number;
   /** Sum of tool_use + tool_result tokens for this server's calls */

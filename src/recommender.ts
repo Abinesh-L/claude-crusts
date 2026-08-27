@@ -175,15 +175,18 @@ function recommendMCPInfo(
   const servers = configData.mcpServers;
   if (servers.length === 0) return [];
 
-  // Find MCP tools that were actually invoked
-  const mcpToolNames = new Set(servers.map((s) => s.name));
+  // Find MCP tools that were actually invoked. Tool names follow
+  // Anthropic's `mcp__<server>__<tool>` convention, so a server matches
+  // when a tool_use name starts with its prefix (the old exact-name
+  // comparison against server names could never match).
   const invokedMcp: string[] = [];
   for (const msg of messages) {
     if (!Array.isArray(msg.message?.content)) continue;
     for (const block of msg.message.content) {
-      if (block.type === 'tool_use' && block.name && mcpToolNames.has(block.name)) {
-        if (!invokedMcp.includes(block.name)) invokedMcp.push(block.name);
-      }
+      if (block.type !== 'tool_use' || !block.name) continue;
+      const name = block.name;
+      if (!servers.some((s) => name.startsWith('mcp__' + s.name + '__'))) continue;
+      if (!invokedMcp.includes(name)) invokedMcp.push(name);
     }
   }
 

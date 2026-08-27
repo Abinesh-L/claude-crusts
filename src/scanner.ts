@@ -30,7 +30,7 @@ import type {
   SkillInfo,
   ConfigData,
 } from './types.ts';
-import { CORE_TOOL_NAMES, LEGACY_CORE_SCHEMA_TOKENS } from './built-in-tools.ts';
+import { CORE_TOOL_NAMES, LEGACY_CORE_SCHEMA_TOKENS, mcpServerName } from './built-in-tools.ts';
 import { loadCoreSchemaOverride } from './calibrator.ts';
 
 /** Average tokens per character (rough English text heuristic) */
@@ -421,66 +421,193 @@ export function readSystemPromptFiles(projectPath?: string): {
 }
 
 /**
- * Read MCP server configurations from global and project settings.
+ * Parse a JSON file into a plain object, tolerating absence and corruption.
  *
- * Parses ~/.claude/settings.json and <project>/.mcp.json to discover
- * configured MCP servers. Estimates schema token cost based on the
- * number of tools each server exposes.
+ * @param path - Absolute path to the JSON file
+ * @returns The parsed object, or null when missing / unreadable / not an object
+ */
+function readJsonRecord(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Corrupted config -- treat as absent
+  }
+  return null;
+}
+
+/**
+ * Extract the server names from a parsed `mcpServers` config value.
+ *
+ * @param value - The `mcpServers` value from a config file
+ * @returns Object keys, or an empty array when the value is not an object
+ */
+function mcpServerNamesFrom(value: unknown): string[] {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return Object.keys(value as Record<string, unknown>);
+  }
+  return [];
+}
+
+/**
+ * Normalise a filesystem path for comparison across slash styles.
+ *
+ * ~/.claude.json keys project paths with forward slashes while callers
+ * often hold backslash paths on Windows; compare them case-insensitively
+ * with a single separator style.
+ *
+ * @param path - Path in either slash style
+ * @returns Lower-cased forward-slash form without a trailing separator
+ */
+function normalizePathKey(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+/** One install record inside ~/.claude/plugins/installed_plugins.json */
+interface PluginInstall {
+  plugin: string;
+  installPath: string;
+}
+
+/**
+ * Read the installed-plugin registry and resolve each install's cache path.
+ *
+ * User-scoped installs always apply; project-scoped installs apply only
+ * when their recorded `projectPath` matches the analyzed project (both
+ * slash styles accepted). Installs whose cache directory no longer exists
+ * are skipped.
+ *
+ * @param projectPath - The analyzed project directory, when known
+ * @returns One entry per applicable install with the bare plugin name
+ */
+function readInstalledPlugins(projectPath?: string): PluginInstall[] {
+  const registry = readJsonRecord(join(homedir(), '.claude', 'plugins', 'installed_plugins.json'));
+  const plugins = registry?.plugins;
+  if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) return [];
+
+  const installs: PluginInstall[] = [];
+  const projectKey = projectPath ? normalizePathKey(projectPath) : null;
+  for (const [key, value] of Object.entries(plugins as Record<string, unknown>)) {
+    // Keys look like `vercel@claude-plugins-official` -- the bare plugin
+    // name is what tool names embed (`mcp__plugin_vercel_vercel__*`).
+    const plugin = key.split('@')[0];
+    if (!plugin || !Array.isArray(value)) continue;
+    for (const entry of value) {
+      if (!entry || typeof entry !== 'object') continue;
+      const install = entry as { scope?: unknown; installPath?: unknown; projectPath?: unknown };
+      if (typeof install.installPath !== 'string' || install.installPath.length === 0) continue;
+      if (install.scope === 'project') {
+        if (!projectKey || typeof install.projectPath !== 'string') continue;
+        if (normalizePathKey(install.projectPath) !== projectKey) continue;
+      }
+      if (!existsSync(install.installPath)) continue;
+      installs.push({ plugin, installPath: install.installPath });
+    }
+  }
+  return installs;
+}
+
+/**
+ * Read MCP server configurations from every location Claude Code uses.
+ *
+ * Discovery order (first occurrence of a name wins):
+ * 1. ~/.claude/settings.json `mcpServers` (legacy location) -- 'global'
+ * 2. ~/.claude.json `mcpServers` -- 'global'
+ * 3. ~/.claude.json `projects[<projectPath>].mcpServers` -- 'project'
+ *    (project keys matched across slash styles)
+ * 4. installed plugins' <installPath>/.mcp.json, named
+ *    `plugin_<plugin>_<server>` to match their tool-name prefix -- 'plugin'
+ * 5. <projectPath>/.mcp.json -- 'project'
+ * 6. servers observed in the session itself (`mcp__<server>__` tool-name
+ *    prefixes; see `collectObservedMcpServers`) -- 'observed'
+ *
+ * MCP schemas are deferred, so every server carries a 0-token upfront cost
+ * (`MCP_TOKENS_PER_TOOL`); the classifier charges ToolSearch loads.
  *
  * @param projectPath - Path to the project directory
- * @returns Array of MCPServerInfo objects
+ * @param observedServers - Server names observed in the session JSONL
+ * @returns Array of MCPServerInfo objects, deduped by name
  */
-export function readMCPConfig(projectPath?: string): MCPServerInfo[] {
+export function readMCPConfig(projectPath?: string, observedServers?: string[]): MCPServerInfo[] {
   const servers: MCPServerInfo[] = [];
+  const push = (name: string, source: MCPServerInfo['source']): void => {
+    if (servers.some((s) => s.name === name)) return;
+    servers.push({ name, toolCount: null, estimatedSchemaTokens: MCP_TOKENS_PER_TOOL, source });
+  };
 
-  // Global settings
-  const globalSettingsPath = join(homedir(), '.claude', 'settings.json');
-  if (existsSync(globalSettingsPath)) {
-    try {
-      const settings = JSON.parse(readFileSync(globalSettingsPath, 'utf-8'));
-      const mcpServers = settings.mcpServers as Record<string, unknown> | undefined;
-      if (mcpServers && typeof mcpServers === 'object') {
-        for (const name of Object.keys(mcpServers)) {
-          servers.push({
-            name,
-            toolCount: null,
-            estimatedSchemaTokens: MCP_TOKENS_PER_TOOL, // 1 tool minimum estimate
-            source: 'global',
-          });
-        }
-      }
-    } catch {
-      // Skip corrupted settings
+  // 1. Legacy global settings
+  const settings = readJsonRecord(join(homedir(), '.claude', 'settings.json'));
+  for (const name of mcpServerNamesFrom(settings?.mcpServers)) push(name, 'global');
+
+  // 2 + 3. ~/.claude.json -- where current Claude Code keeps MCP servers
+  const claudeJson = readJsonRecord(join(homedir(), '.claude.json'));
+  for (const name of mcpServerNamesFrom(claudeJson?.mcpServers)) push(name, 'global');
+  if (projectPath && claudeJson?.projects && typeof claudeJson.projects === 'object' && !Array.isArray(claudeJson.projects)) {
+    const wanted = normalizePathKey(projectPath);
+    for (const [key, value] of Object.entries(claudeJson.projects as Record<string, unknown>)) {
+      if (normalizePathKey(key) !== wanted) continue;
+      const project = value as { mcpServers?: unknown } | null;
+      for (const name of mcpServerNamesFrom(project?.mcpServers)) push(name, 'project');
     }
   }
 
-  // Project-level MCP config
+  // 4. Installed plugins' bundled MCP servers
+  for (const install of readInstalledPlugins(projectPath)) {
+    const pluginMcp = readJsonRecord(join(install.installPath, '.mcp.json'));
+    for (const name of mcpServerNamesFrom(pluginMcp?.mcpServers)) {
+      push('plugin_' + install.plugin + '_' + name, 'plugin');
+    }
+  }
+
+  // 5. Project-level MCP config
   if (projectPath) {
-    const mcpJsonPath = join(projectPath, '.mcp.json');
-    if (existsSync(mcpJsonPath)) {
-      try {
-        const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-        const mcpServers = mcpConfig.mcpServers as Record<string, unknown> | undefined;
-        if (mcpServers && typeof mcpServers === 'object') {
-          for (const name of Object.keys(mcpServers)) {
-            // Don't duplicate if already in global
-            if (!servers.some((s) => s.name === name)) {
-              servers.push({
-                name,
-                toolCount: null,
-                estimatedSchemaTokens: MCP_TOKENS_PER_TOOL,
-                source: 'project',
-              });
-            }
-          }
-        }
-      } catch {
-        // Skip corrupted MCP config
-      }
-    }
+    const mcpConfig = readJsonRecord(join(projectPath, '.mcp.json'));
+    for (const name of mcpServerNamesFrom(mcpConfig?.mcpServers)) push(name, 'project');
   }
+
+  // 6. Servers the session itself proves were connected
+  for (const name of observedServers ?? []) push(name, 'observed');
 
   return servers;
+}
+
+/**
+ * Collect the MCP server names a session's JSONL proves were connected.
+ *
+ * Scans assistant `tool_use` block names and `deferred_tools_delta`
+ * attachment listings for Anthropic's `mcp__<server>__<tool>` prefix. The
+ * JSONL is authoritative: config files may be absent or stale, but a
+ * recorded tool name or deferred listing means the server was connected.
+ *
+ * @param messages - Parsed session messages
+ * @returns Distinct server names in first-seen order
+ */
+export function collectObservedMcpServers(messages: SessionMessage[]): string[] {
+  const servers = new Set<string>();
+  const add = (name: unknown): void => {
+    if (typeof name !== 'string') return;
+    const server = mcpServerName(name);
+    if (server) servers.add(server);
+  };
+
+  for (const msg of messages) {
+    if (msg.type === 'attachment' && msg.attachment?.type === 'deferred_tools_delta') {
+      for (const value of [msg.attachment.addedNames, msg.attachment.readdedNames]) {
+        if (!Array.isArray(value)) continue;
+        for (const name of value) add(name);
+      }
+      continue;
+    }
+    const content = msg.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block.type === 'tool_use') add(block.name);
+    }
+  }
+  return [...servers];
 }
 
 /**
@@ -537,22 +664,39 @@ function readMemdirAt(memdir: string, source: 'global' | 'project'): MemoryFileS
 }
 
 /**
- * Read memory files from the global and (optionally) project-scoped memdirs.
+ * Read memory files from every location Claude Code uses.
  *
- * Counts MEMORY.md and files referenced from it. Claude Code loads memory
- * on-demand, so this produces a conservative estimate that matches /context
- * ground truth (~1.8K tokens for typical sessions).
+ * Current Claude Code keeps per-project auto-memory at
+ * `~/.claude/projects/<projectSlug>/memory/MEMORY.md`; the legacy memdir
+ * locations (`~/.claude/memdir/`, `<project>/.claude/memdir/`) are still
+ * scanned for old installs. `files` lists each MEMORY.md plus the topic
+ * files it links.
+ *
+ * `totalEstimatedTokens` counts ONLY the MEMORY.md index files: that is
+ * what Claude Code injects into the fixed context at session start. Linked
+ * topic files load on demand during the session (they arrive as `file`
+ * attachment records, which the classifier already counts as Retrieved),
+ * so summing them here would double-count and break the fixed-context
+ * derivation.
  *
  * @param projectPath - Optional project directory; when provided, also scans
- *   `<projectPath>/.claude/memdir/` for project-scoped memory.
- * @returns Object with individual file summaries and total estimated tokens
+ *   `<projectPath>/.claude/memdir/` for legacy project-scoped memory.
+ * @param projectSlug - Optional encoded project dir name (the session file's
+ *   parent directory name), used for `~/.claude/projects/<slug>/memory/`.
+ * @returns Object with individual file summaries and the injected-at-start
+ *   token estimate
  */
-export function readMemoryFiles(projectPath?: string): {
+export function readMemoryFiles(projectPath?: string, projectSlug?: string): {
   files: MemoryFileSummary[];
   totalEstimatedTokens: number;
 } {
   const globalMemdir = join(homedir(), '.claude', 'memdir');
   const files: MemoryFileSummary[] = [...readMemdirAt(globalMemdir, 'global')];
+
+  if (projectSlug) {
+    const projectMemoryDir = join(homedir(), '.claude', 'projects', projectSlug, 'memory');
+    files.push(...readMemdirAt(projectMemoryDir, 'project'));
+  }
 
   if (projectPath) {
     const projectMemdir = join(projectPath, '.claude', 'memdir');
@@ -560,7 +704,7 @@ export function readMemoryFiles(projectPath?: string): {
   }
 
   const totalEstimatedTokens = files.reduce(
-    (sum, f) => sum + f.estimatedTokens,
+    (sum, f) => sum + (basename(f.path) === 'MEMORY.md' ? f.estimatedTokens : 0),
     0,
   );
 
@@ -599,44 +743,99 @@ function extractSkillNames(raw: unknown): string[] {
 }
 
 /**
- * Discover Claude Code skills configured in global and project settings.
+ * Estimate the listing cost of one skill from its SKILL.md frontmatter.
  *
- * Mirrors the structure of `readMCPConfig`. Reads `~/.claude/settings.json`
- * and `<projectPath>/.claude/settings.json` for a `skills` key. Each skill is
- * given a flat token estimate (`DEFAULT_SKILL_TOKENS`); the classifier sums
- * the discovered tokens to replace the legacy hardcoded constant.
+ * The session's skill listing carries each skill's name plus its
+ * frontmatter description, not the SKILL.md body (bodies load on invoke),
+ * so the estimate is name + description at chars/4 with a
+ * `DEFAULT_SKILL_TOKENS` floor.
+ *
+ * @param skillMdPath - Absolute path to the SKILL.md file
+ * @param name - Skill name as it appears in the listing
+ * @returns Estimated listing tokens for this skill
+ */
+function estimateSkillListingTokens(skillMdPath: string, name: string): number {
+  try {
+    const head = readFileSync(skillMdPath, 'utf-8').slice(0, 4096);
+    const match = head.match(/^description:\s*(.+)$/m);
+    if (match?.[1]) {
+      return Math.max(
+        DEFAULT_SKILL_TOKENS,
+        estimateTokensFromText(name + ': ' + match[1]),
+      );
+    }
+  } catch {
+    // Unreadable SKILL.md -- fall through to the flat estimate
+  }
+  return DEFAULT_SKILL_TOKENS;
+}
+
+/**
+ * List the skill directories (those containing a SKILL.md) under a path.
+ *
+ * @param skillsDir - Directory whose children are candidate skill dirs
+ * @returns Pairs of skill dir name and absolute SKILL.md path
+ */
+function listSkillDirs(skillsDir: string): Array<{ name: string; skillMdPath: string }> {
+  if (!existsSync(skillsDir)) return [];
+  const found: Array<{ name: string; skillMdPath: string }> = [];
+  try {
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const skillMdPath = join(skillsDir, entry.name, 'SKILL.md');
+      if (existsSync(skillMdPath)) found.push({ name: entry.name, skillMdPath });
+    }
+  } catch {
+    // Unreadable skills dir -- treat as empty
+  }
+  return found;
+}
+
+/**
+ * Discover Claude Code skills from settings, skill dirs, and plugins.
+ *
+ * Discovery order (first occurrence of a name wins):
+ * 1. `skills` keys in `~/.claude/settings.json` / project settings (legacy)
+ * 2. `~/.claude/skills/<name>/SKILL.md` directories -- 'global'
+ * 3. installed plugins' <installPath>/skills/<name>/SKILL.md, named
+ *    `<plugin>:<name>` to match Claude Code's listing -- 'plugin'
+ *
+ * Note the session's own `skill_listing` attachment, when present, is
+ * preferred over this discovery by the classifier (it is the authoritative
+ * record of what that session actually loaded).
  *
  * @param projectPath - Optional project directory
  * @returns Array of SkillInfo objects, deduped by name
  */
 export function readSkillsConfig(projectPath?: string): SkillInfo[] {
   const skills: SkillInfo[] = [];
+  const push = (name: string, source: SkillInfo['source'], estimatedTokens: number): void => {
+    if (skills.some((s) => s.name === name)) return;
+    skills.push({ name, source, estimatedTokens });
+  };
 
-  const globalSettingsPath = join(homedir(), '.claude', 'settings.json');
-  if (existsSync(globalSettingsPath)) {
-    try {
-      const settings = JSON.parse(readFileSync(globalSettingsPath, 'utf-8'));
-      for (const name of extractSkillNames(settings.skills)) {
-        skills.push({ name, source: 'global', estimatedTokens: DEFAULT_SKILL_TOKENS });
-      }
-    } catch {
-      // Skip corrupted settings
+  // 1. Legacy settings.json `skills` keys
+  const settings = readJsonRecord(join(homedir(), '.claude', 'settings.json'));
+  for (const name of extractSkillNames(settings?.skills)) {
+    push(name, 'global', DEFAULT_SKILL_TOKENS);
+  }
+  if (projectPath) {
+    const projectSettings = readJsonRecord(join(projectPath, '.claude', 'settings.json'));
+    for (const name of extractSkillNames(projectSettings?.skills)) {
+      push(name, 'project', DEFAULT_SKILL_TOKENS);
     }
   }
 
-  if (projectPath) {
-    const projectSettingsPath = join(projectPath, '.claude', 'settings.json');
-    if (existsSync(projectSettingsPath)) {
-      try {
-        const settings = JSON.parse(readFileSync(projectSettingsPath, 'utf-8'));
-        for (const name of extractSkillNames(settings.skills)) {
-          if (!skills.some((s) => s.name === name)) {
-            skills.push({ name, source: 'project', estimatedTokens: DEFAULT_SKILL_TOKENS });
-          }
-        }
-      } catch {
-        // Skip corrupted settings
-      }
+  // 2. User skill directories
+  for (const { name, skillMdPath } of listSkillDirs(join(homedir(), '.claude', 'skills'))) {
+    push(name, 'global', estimateSkillListingTokens(skillMdPath, name));
+  }
+
+  // 3. Installed plugins' bundled skills
+  for (const install of readInstalledPlugins(projectPath)) {
+    for (const { name, skillMdPath } of listSkillDirs(join(install.installPath, 'skills'))) {
+      const qualified = install.plugin + ':' + name;
+      push(qualified, 'plugin', estimateSkillListingTokens(skillMdPath, qualified));
     }
   }
 

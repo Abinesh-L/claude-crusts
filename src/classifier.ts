@@ -32,6 +32,7 @@ import type {
   ConfigData,
   ToolBreakdown,
   MCPBreakdown,
+  MCPServerInfo,
   CompactionEvent,
   DerivedOverhead,
   ModelHistory,
@@ -40,7 +41,7 @@ import type {
 import { resolveContextLimitWithSignal, effectiveInput, cacheCreationTokens } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
-import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName } from './built-in-tools.ts';
+import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName } from './built-in-tools.ts';
 
 /** Whether to print derivation debug info to stderr */
 let verbose = false;
@@ -131,6 +132,9 @@ type NonHumanUserKind = 'task-notification' | 'local-command' | 'interrupt';
 const STATE_MARKERS = [
   'memdir/',
   'memdir\\',
+  '/memory/',
+  '\\memory\\',
+  'This memory is',
   'extracted_memories',
   'memory_extraction',
   'plan_mode',
@@ -1772,8 +1776,8 @@ export function classifySession(
         toolResultTokens += tokens;
       }
       // Per-MCP-server accounting: `mcp__<server>__<tool>` is Anthropic's naming convention
-      if (toolName?.startsWith('mcp__')) {
-        const server = toolName.split('__')[1];
+      if (toolName) {
+        const server = mcpServerName(toolName);
         if (server) {
           mcpServerTokens.set(server, (mcpServerTokens.get(server) ?? 0) + tokens);
           if (msg.type === 'assistant') {
@@ -1898,10 +1902,28 @@ export function classifySession(
     ...(totalDeferredReported !== undefined ? { totalDeferredReported } : {}),
   };
 
-  // Build per-MCP-server breakdown — only if any MCP server is configured
+  // Build per-MCP-server breakdown whenever any server is configured OR
+  // observed in the session itself. Config files can be absent or stale
+  // (they moved to ~/.claude.json and plugin caches), but recorded
+  // `mcp__<server>__` tool names and the deferred-tools listing prove
+  // which servers the session actually had connected.
+  const observedServers = new Set<string>([
+    ...mcpServerTokens.keys(),
+    ...mcpServerInvocations.keys(),
+  ]);
+  for (const name of [...deferredMcp, ...loadedDeferred, ...usedToolNames]) {
+    const server = mcpServerName(name);
+    if (server) observedServers.add(server);
+  }
+  const mcpServerInfos: MCPServerInfo[] = [...configData.mcpServers];
+  for (const server of observedServers) {
+    if (!mcpServerInfos.some((s) => s.name === server)) {
+      mcpServerInfos.push({ name: server, toolCount: null, estimatedSchemaTokens: 0, source: 'observed' });
+    }
+  }
   let mcpBreakdown: MCPBreakdown | undefined;
-  if (configData.mcpServers.length > 0) {
-    const servers = configData.mcpServers.map((s) => {
+  if (mcpServerInfos.length > 0) {
+    const servers = mcpServerInfos.map((s) => {
       const invocationCount = mcpServerInvocations.get(s.name) ?? 0;
       const tokensSpent = mcpServerTokens.get(s.name) ?? 0;
       return {

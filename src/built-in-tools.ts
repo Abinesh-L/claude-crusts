@@ -142,6 +142,21 @@ export function isMcpToolName(name: string): boolean {
 }
 
 /**
+ * Extract the server segment from an MCP tool name.
+ *
+ * `mcp__playwright__browser_click` -> `playwright`;
+ * `mcp__plugin_vercel_vercel__list_teams` -> `plugin_vercel_vercel`.
+ *
+ * @param name - Tool name as written in tool_use / tool_reference blocks
+ * @returns The server name, or null when the name is not an MCP tool name
+ */
+export function mcpServerName(name: string): string | null {
+  if (!isMcpToolName(name)) return null;
+  const server = name.slice('mcp__'.length).split('__')[0];
+  return server && server.length > 0 ? server : null;
+}
+
+/**
  * Estimated window cost of loading one deferred tool via ToolSearch.
  *
  * @param name - Tool name as reported in the ToolSearch result

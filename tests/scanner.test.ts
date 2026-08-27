@@ -23,8 +23,14 @@ import {
   detectClaudeCodeVersion,
   readClaudeCodeVersion,
   VERSION_PROBE_MAX_BYTES,
+  readMemoryFiles,
+  readMCPConfig,
+  readSkillsConfig,
+  collectObservedMcpServers,
 } from '../src/scanner.ts';
 import { classifySession, detectCompactionEvents } from '../src/classifier.ts';
+import { detectWaste } from '../src/waste-detector.ts';
+import { generateRecommendations } from '../src/recommender.ts';
 import type { SessionMessage, ConfigData } from '../src/types.ts';
 
 const sandbox = mkdtempSync(join(tmpdir(), 'crusts-scanner-test-'));
@@ -536,5 +542,231 @@ describe('claudeCodeVersion (M4)', () => {
     expect(messages[0]!.version).toBe('');
     expect(detectClaudeCodeVersion(messages)).toBe('2.1.239');
     expect(detectClaudeCodeVersion([])).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M12 — config discovery moved with Claude Code
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a callback with HOME / USERPROFILE redirected to a fresh sandbox dir,
+ * so scanner functions that call `homedir()` never touch the real ~/.claude.
+ *
+ * @param fn - Callback receiving the fake home directory
+ * @returns The callback's return value
+ */
+function withTempHome<T>(fn: (home: string) => T): T {
+  const home = mkdtempSync(join(sandbox, 'home-'));
+  const savedHome = process.env.HOME;
+  const savedProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    return fn(home);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedProfile;
+  }
+}
+
+describe('readMemoryFiles project-slug memory (M12)', () => {
+  test('reads ~/.claude/projects/<slug>/memory/MEMORY.md plus linked files', () => {
+    withTempHome((home) => {
+      const memDir = join(home, '.claude', 'projects', 'C--proj-app', 'memory');
+      mkdirSync(memDir, { recursive: true });
+      writeFileSync(join(memDir, 'MEMORY.md'), '- [topic note](topic.md)\n' + 'index text '.repeat(40), 'utf-8');
+      writeFileSync(join(memDir, 'topic.md'), 'topic body '.repeat(200), 'utf-8');
+
+      const result = readMemoryFiles(undefined, 'C--proj-app');
+      expect(result.files.length).toBe(2);
+      expect(result.files.every((f) => f.source === 'project')).toBe(true);
+      const index = result.files.find((f) => f.path.endsWith('MEMORY.md'))!;
+      const topic = result.files.find((f) => f.path.endsWith('topic.md'))!;
+      expect(index.estimatedTokens).toBeGreaterThan(0);
+      expect(topic.estimatedTokens).toBeGreaterThan(0);
+      // Only the injected-at-start index counts toward the total; linked
+      // topic files load on demand and arrive as `file` attachments.
+      expect(result.totalEstimatedTokens).toBe(index.estimatedTokens);
+      expect(result.totalEstimatedTokens).toBeLessThan(index.estimatedTokens + topic.estimatedTokens);
+    });
+  });
+
+  test('missing slug memory dir yields no files', () => {
+    withTempHome(() => {
+      const result = readMemoryFiles(undefined, 'no-such-slug');
+      expect(result.files.length).toBe(0);
+      expect(result.totalEstimatedTokens).toBe(0);
+    });
+  });
+});
+
+describe('readMCPConfig discovery (M12)', () => {
+  test('discovers ~/.claude.json mcpServers and the project entry across slash styles', () => {
+    withTempHome((home) => {
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { playwright: { type: 'stdio' } },
+        projects: { 'C:/proj/app': { mcpServers: { sqlite: { type: 'stdio' } } } },
+      }), 'utf-8');
+
+      const servers = readMCPConfig('C:\\proj\\app');
+      const playwright = servers.find((s) => s.name === 'playwright')!;
+      const sqlite = servers.find((s) => s.name === 'sqlite')!;
+      expect(playwright.source).toBe('global');
+      expect(sqlite.source).toBe('project');
+      // MCP schemas are deferred — 0 upfront tokens
+      expect(playwright.estimatedSchemaTokens).toBe(0);
+    });
+  });
+
+  test('discovers plugin MCP servers as plugin_<plugin>_<server>', () => {
+    withTempHome((home) => {
+      const installPath = join(home, '.claude', 'plugins', 'cache', 'official', 'vercel', '1.0.0');
+      mkdirSync(installPath, { recursive: true });
+      writeFileSync(join(installPath, '.mcp.json'), JSON.stringify({
+        mcpServers: { vercel: { type: 'http' } },
+      }), 'utf-8');
+      mkdirSync(join(home, '.claude', 'plugins'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+        version: 2,
+        plugins: { 'vercel@claude-plugins-official': [{ scope: 'user', installPath, version: '1.0.0' }] },
+      }), 'utf-8');
+
+      const servers = readMCPConfig();
+      const plugin = servers.find((s) => s.name === 'plugin_vercel_vercel')!;
+      expect(plugin).toBeDefined();
+      expect(plugin.source).toBe('plugin');
+    });
+  });
+
+  test('observed servers are appended and deduped against config', () => {
+    withTempHome((home) => {
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { playwright: {} },
+      }), 'utf-8');
+
+      const servers = readMCPConfig(undefined, ['playwright', 'custom']);
+      expect(servers.filter((s) => s.name === 'playwright').length).toBe(1);
+      expect(servers.find((s) => s.name === 'playwright')!.source).toBe('global');
+      expect(servers.find((s) => s.name === 'custom')!.source).toBe('observed');
+    });
+  });
+
+  test('collectObservedMcpServers reads tool_use names and the deferred listing', async () => {
+    const messages = await parseSession(writeFixture([
+      userRecord('u1', 'go'),
+      { type: 'attachment', uuid: 'att-1', attachment: {
+        type: 'deferred_tools_delta',
+        addedNames: ['mcp__plugin_vercel_vercel__deploy', 'WebSearch'],
+      } },
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', model: 'claude-sonnet-4-5',
+        content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__playwright__browser_click', input: {} }],
+        usage: { input_tokens: 100, output_tokens: 10 } } },
+    ]));
+    const observed = collectObservedMcpServers(messages);
+    expect(observed.sort()).toEqual(['playwright', 'plugin_vercel_vercel']);
+  });
+});
+
+describe('readSkillsConfig discovery (M12)', () => {
+  test('enumerates ~/.claude/skills and plugin cache SKILL.md dirs', () => {
+    withTempHome((home) => {
+      const skillDir = join(home, '.claude', 'skills', 'alpha');
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, 'SKILL.md'),
+        '---\nname: alpha\ndescription: ' + 'Turns notes into graphs. '.repeat(20) + '\n---\n# alpha\n', 'utf-8');
+
+      const installPath = join(home, '.claude', 'plugins', 'cache', 'official', 'vercel', '1.0.0');
+      mkdirSync(join(installPath, 'skills', 'deploy'), { recursive: true });
+      writeFileSync(join(installPath, 'skills', 'deploy', 'SKILL.md'),
+        '---\ndescription: Deploy the project.\n---\n', 'utf-8');
+      writeFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+        version: 2,
+        plugins: { 'vercel@claude-plugins-official': [{ scope: 'user', installPath, version: '1.0.0' }] },
+      }), 'utf-8');
+
+      const skills = readSkillsConfig();
+      const alpha = skills.find((s) => s.name === 'alpha')!;
+      const deploy = skills.find((s) => s.name === 'vercel:deploy')!;
+      expect(alpha.source).toBe('global');
+      expect(deploy.source).toBe('plugin');
+      // Long description estimates above the flat floor; short ones floor at 60
+      expect(alpha.estimatedTokens).toBeGreaterThan(60);
+      expect(deploy.estimatedTokens).toBe(60);
+    });
+  });
+});
+
+describe('observed MCP servers build mcpBreakdown (M12)', () => {
+  test('an invoked mcp__playwright__ tool yields a breakdown row with token sum', async () => {
+    const messages = await parseSession(writeFixture([
+      userRecord('u1', 'click it'),
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', model: 'claude-sonnet-4-5',
+        content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__playwright__browser_click', input: { selector: '#go' } }],
+        usage: { input_tokens: 100, output_tokens: 12 } } },
+      { type: 'user', uuid: 'u2', message: { role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'clicked the button, page settled after load' }] } },
+    ]));
+    const breakdown = classifySession(messages, EMPTY_CONFIG);
+    expect(breakdown.mcpBreakdown).toBeDefined();
+    const row = breakdown.mcpBreakdown!.servers.find((s) => s.name === 'playwright')!;
+    expect(row).toBeDefined();
+    expect(row.source).toBe('observed');
+    expect(row.invocationCount).toBe(1);
+    expect(row.tokensSpent).toBeGreaterThan(0);
+    expect(row.unused).toBe(false);
+  });
+
+  test('a deferred-listing-only server appears as unused', async () => {
+    const messages = await parseSession(writeFixture([
+      { type: 'attachment', uuid: 'att-1', attachment: {
+        type: 'deferred_tools_delta',
+        addedNames: ['mcp__plugin_vercel_vercel__deploy'],
+      } },
+      userRecord('u1', 'hello'),
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', model: 'claude-sonnet-4-5',
+        content: [{ type: 'text', text: 'hi there' }],
+        usage: { input_tokens: 50, output_tokens: 5 } } },
+    ]));
+    const breakdown = classifySession(messages, EMPTY_CONFIG);
+    expect(breakdown.mcpBreakdown).toBeDefined();
+    const row = breakdown.mcpBreakdown!.servers.find((s) => s.name === 'plugin_vercel_vercel')!;
+    expect(row.invocationCount).toBe(0);
+    expect(row.unused).toBe(true);
+    expect(breakdown.mcpBreakdown!.unusedServers).toContain('plugin_vercel_vercel');
+  });
+
+  test('no MCP activity and no config leaves mcpBreakdown undefined', async () => {
+    const messages = await parseSession(writeFixture([
+      userRecord('u1', 'hello'),
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', model: 'claude-sonnet-4-5',
+        content: [{ type: 'text', text: 'hi' }],
+        usage: { input_tokens: 50, output_tokens: 5 } } },
+    ]));
+    const breakdown = classifySession(messages, EMPTY_CONFIG);
+    expect(breakdown.mcpBreakdown).toBeUndefined();
+  });
+
+  test('recommender matches invoked tools by mcp__<server>__ prefix', async () => {
+    const messages = await parseSession(writeFixture([
+      userRecord('u1', 'click it'),
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', model: 'claude-sonnet-4-5',
+        content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__playwright__browser_click', input: {} }],
+        usage: { input_tokens: 100, output_tokens: 12 } } },
+      { type: 'user', uuid: 'u2', message: { role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] } },
+    ]));
+    const config: ConfigData = {
+      ...EMPTY_CONFIG,
+      mcpServers: [{ name: 'playwright', toolCount: null, estimatedSchemaTokens: 0, source: 'observed' }],
+    };
+    const breakdown = classifySession(messages, config);
+    const waste = detectWaste(messages, breakdown, config);
+    const report = generateRecommendations(breakdown, waste, config, messages);
+    const mcpRec = report.recommendations.find((r) => r.action.startsWith('MCP tools invoked'))!;
+    expect(mcpRec).toBeDefined();
+    expect(mcpRec.action).toContain('mcp__playwright__browser_click');
   });
 });
