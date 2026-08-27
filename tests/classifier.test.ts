@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { classifySession, detectCompactionEvents, isHumanUserText, IMAGE_BLOCK_TOKENS } from '../src/classifier.ts';
+import { classifySession, detectCompactionEvents, estimateAttachmentTokens, isHumanUserText, IMAGE_BLOCK_TOKENS } from '../src/classifier.ts';
 import { detectWaste } from '../src/waste-detector.ts';
 import type { SessionMessage, ConfigData, TokenUsage, ContentBlock, CrustsCategory } from '../src/types.ts';
 
@@ -1129,5 +1129,139 @@ describe('M8 split assistant lines: output_tokens counted once per message.id gr
     expect(b.messages[1]!.requestId).toBe('req_01');
     expect(b.messages[0]!.messageId).toBeUndefined();
     expect(b.messages[0]!.requestId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M9: framing ordering (lifetime buckets include framing)
+// ---------------------------------------------------------------------------
+
+describe('M9: framing ordering', () => {
+  test('lifetime buckets and contentSumTokens include framing overhead', () => {
+    // Consecutive assistants grow by 141 effective-input tokens per pair
+    // while the classified content between them is 101 tokens (100 output
+    // + a 1-token prompt), so framing derives 20 tokens/msg from 3 samples.
+    const msgs: SessionMessage[] = [
+      userText('q0'), assistant(1_000),
+      userText('q1'), assistant(1_141),
+      userText('q2'), assistant(1_282),
+      userText('q3'), assistant(1_423),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const framing = b.derivedOverhead!.messageFraming;
+    expect(framing).not.toBeNull();
+    expect(framing!.tokensPerMessage).toBe(20);
+    expect(framing!.totalTokens).toBe(160);
+
+    // The M9 invariant: lifetime buckets are computed AFTER the framing
+    // distribution, so their sum equals contentSumTokens (before the fix
+    // the mutation happened after buildBuckets and never reached them).
+    const bucketSum = b.buckets.reduce((sum, x) => sum + x.tokens, 0);
+    expect(bucketSum).toBe(b.contentSumTokens);
+    // Raw content: 4 x 100 output + 4 x 1-token prompts = 404; framing 160.
+    expect(b.contentSumTokens).toBe(564);
+    // Each category carries its per-message framing share.
+    expect(b.buckets.find((x) => x.category === 'conversation')!.tokens).toBe(543);
+    expect(b.buckets.find((x) => x.category === 'user')!.tokens).toBe(21);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M10: derived fixed context replaces the 1K-15K cap
+// ---------------------------------------------------------------------------
+
+describe('M10: derived fixed context', () => {
+  /** Config matching the audited real-session knowns (CC 2.1.92-era legacy schema). */
+  const LEGACY_CONFIG: ConfigData = {
+    systemPrompt: { files: [], totalEstimatedTokens: 1_294 },
+    mcpServers: [],
+    memoryFiles: { files: [], totalEstimatedTokens: 0 },
+    builtInTools: { tools: [], totalEstimatedTokens: 9_055 },
+    skills: { items: [], totalEstimatedTokens: 0 },
+  };
+
+  test('fixed context of 43,352 (above the old 15K cap) is accepted and lands in System', () => {
+    // First assistant effective input 2 + 18,938 + 35,299 = 54,239; known =
+    // CLAUDE.md 1,294 + tools 9,055 + memory 0 + skills 476 (fallback) +
+    // first user 62 = 10,887. The old absolute 15K ceiling rejected this.
+    const b = classifySession([
+      userText('w'.repeat(248)),
+      currentShapeAssistant({}, { version: '2.1.92' }),
+    ], LEGACY_CONFIG);
+    const derived = b.derivedOverhead!.internalSystemPrompt;
+    expect(derived).not.toBeNull();
+    expect(derived!.tokens).toBe(43_352);
+    expect(derived!.derivation.firstAssistantInputTokens).toBe(54_239);
+    expect(derived!.derivation.totalKnown).toBe(10_887);
+    expect(derived!.derivation.knownAttachments).toBe(0);
+    const system = b.buckets.find((x) => x.category === 'system')!;
+    expect(system.tokens).toBe(1_294 + 43_352);
+  });
+
+  test('fixed context is rejected when known components leave less than 1K residual', () => {
+    // totalInput 502 < known 10,826, so derived is negative. The guard is
+    // `derived < 1000 || derived > totalInput`; the upper bound is relative
+    // to the turn's own input, never an absolute cap.
+    const b = classifySession([
+      userText('hi'),
+      currentShapeAssistant({
+        input_tokens: 2,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 0,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 500 },
+      }, { version: '2.1.92' }),
+    ], LEGACY_CONFIG);
+    expect(b.derivedOverhead!.internalSystemPrompt).toBeNull();
+  });
+
+  test('fixed context uses the skill_listing attachment over the discovery fallback', () => {
+    const skillListing = {
+      type: 'attachment',
+      attachment: { type: 'skill_listing', content: 's'.repeat(2_000) },
+    } as SessionMessage;
+    const b = classifySession([
+      skillListing,
+      userText('w'.repeat(248)),
+      currentShapeAssistant({}, { version: '2.1.92' }),
+    ], LEGACY_CONFIG);
+    const derived = b.derivedOverhead!.internalSystemPrompt;
+    expect(derived).not.toBeNull();
+    expect(derived!.derivation.knownSkills).toBe(500);
+    // The listing is counted as the skills component, not again as a
+    // generic attachment.
+    expect(derived!.derivation.knownAttachments).toBe(0);
+    expect(derived!.tokens).toBe(54_239 - (10_887 - 476 + 500));
+  });
+
+  test('fixed context subtracts only attachments that precede the first assistant', () => {
+    /** Attachment fixture carrying `chars` characters of hook output. */
+    const hook = (chars: number): SessionMessage => ({
+      type: 'attachment',
+      attachment: { type: 'hook_success', content: 'h'.repeat(chars) },
+    } as SessionMessage);
+    const b = classifySession([
+      hook(400),
+      userText('w'.repeat(248)),
+      currentShapeAssistant({}, { version: '2.1.92' }),
+      hook(8_000),
+    ], LEGACY_CONFIG);
+    const derived = b.derivedOverhead!.internalSystemPrompt;
+    expect(derived).not.toBeNull();
+    expect(derived!.derivation.knownAttachments).toBe(100);
+    expect(derived!.tokens).toBe(43_352 - 100);
+  });
+
+  test('estimateAttachmentTokens reads every known payload field shape', () => {
+    /** Build an attachment record around the given payload. */
+    const att = (payload: Record<string, unknown>): SessionMessage =>
+      ({ type: 'attachment', attachment: payload } as SessionMessage);
+    expect(estimateAttachmentTokens(att({ type: 'x', content: 'a'.repeat(40) }))).toBe(10);
+    expect(estimateAttachmentTokens(att({ type: 'hook_additional_context', content: ['b'.repeat(40)] }))).toBe(10);
+    expect(estimateAttachmentTokens(att({ type: 'deferred_tools_delta', addedLines: ['l'.repeat(20), 'l'.repeat(20)] }))).toBe(10);
+    expect(estimateAttachmentTokens(att({ type: 'nested_memory', content: { content: 'm'.repeat(40) } }))).toBe(10);
+    expect(estimateAttachmentTokens(att({ type: 'file', content: { file: { content: 'f'.repeat(40) } } }))).toBe(10);
+    expect(estimateAttachmentTokens(att({ type: 'skill_listing', skills: [{ content: 's'.repeat(20) }, { content: 's'.repeat(20) }] }))).toBe(10);
+    expect(estimateAttachmentTokens(att({ type: 'queued_command', prompt: 'p'.repeat(40) }))).toBe(10);
+    expect(estimateAttachmentTokens({ type: 'user', message: { role: 'user', content: 'hi' } } as SessionMessage)).toBe(0);
   });
 });

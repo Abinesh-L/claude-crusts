@@ -419,7 +419,11 @@ export interface CompactionEvent {
  * system prompt version, and tool configuration at the time.
  */
 export interface DerivedOverhead {
-  /** Internal system prompt tokens derived from first assistant input_tokens */
+  /**
+   * Claude Code fixed context not present in the JSONL (internal system
+   * prompt + injected instructions), derived as the first assistant
+   * turn's effective input minus every known component.
+   */
   internalSystemPrompt: {
     tokens: number;
     /** Breakdown of the derivation for transparency */
@@ -430,6 +434,8 @@ export interface DerivedOverhead {
       knownMemory: number;
       knownSkills: number;
       knownFirstUserMessage: number;
+      /** Attachment records injected before the first assistant turn */
+      knownAttachments: number;
       totalKnown: number;
     };
   } | null;

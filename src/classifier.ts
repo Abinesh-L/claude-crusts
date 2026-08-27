@@ -293,6 +293,68 @@ function estimateContentTokens(msg: SessionMessage): number {
   return tokens;
 }
 
+/**
+ * Estimate the window cost of an `attachment` record's payload at the
+ * plain-text divisor (chars / 4).
+ *
+ * Attachment payloads carry their injected text under a handful of field
+ * names depending on `attachment.type`: `content` (a string, an array of
+ * strings, or a nested object exposing `content` / `file.content`),
+ * `text`, `snippet`, `banner`, `prompt`, `addedLines` (string[]), and
+ * `skills[].content`. Every string found under those fields is summed.
+ *
+ * Returns 0 for non-attachment records or payloads with none of the known
+ * fields, so callers can apply it unconditionally.
+ *
+ * @param msg - The session message (any record type)
+ * @returns Estimated token count of the attachment's injected text
+ */
+export function estimateAttachmentTokens(msg: SessionMessage): number {
+  const att = msg.attachment;
+  if (!att) return 0;
+
+  let chars = 0;
+  /** Accumulate one candidate value's length when it is a string. */
+  const add = (value: unknown): void => {
+    if (typeof value === 'string') chars += value.length;
+  };
+
+  add(att['text']);
+  add(att['snippet']);
+  add(att['banner']);
+  add(att['prompt']);
+
+  const addedLines = att['addedLines'];
+  if (Array.isArray(addedLines)) {
+    for (const line of addedLines) add(line);
+  }
+
+  const content = att['content'];
+  if (typeof content === 'string') {
+    chars += content.length;
+  } else if (Array.isArray(content)) {
+    for (const item of content) add(item);
+  } else if (content && typeof content === 'object') {
+    const nested = content as Record<string, unknown>;
+    add(nested['content']);
+    const file = nested['file'];
+    if (file && typeof file === 'object') {
+      add((file as Record<string, unknown>)['content']);
+    }
+  }
+
+  const skills = att['skills'];
+  if (Array.isArray(skills)) {
+    for (const skill of skills) {
+      if (skill && typeof skill === 'object') {
+        add((skill as Record<string, unknown>)['content']);
+      }
+    }
+  }
+
+  return Math.round(chars / CHARS_PER_TOKEN_TEXT);
+}
+
 // ---------------------------------------------------------------------------
 // Assistant split-line grouping (one API message = N JSONL lines)
 // ---------------------------------------------------------------------------
@@ -1574,10 +1636,6 @@ export function classifySession(
 
   // Derive overhead values from THIS SESSION's API usage data
   const derivedSystemPrompt = deriveInternalSystemPrompt(effectiveMessages, configData, coreSchema.tokens);
-  // Framing derivation is deferred until after compaction detection (below)
-  // so it can sample from the post-compaction window for cleaner data
-  let derivedFraming: DerivedOverhead['messageFraming'] = null;
-
   // Add config overhead to session lifetime totals
   addConfigOverhead(categoryTokens, categoryAccuracy, configOverhead);
 
@@ -1585,6 +1643,33 @@ export function classifySession(
   if (derivedSystemPrompt) {
     categoryTokens.system += derivedSystemPrompt.tokens;
     categoryAccuracy.system = 'estimated';
+  }
+
+  // Derive framing overhead from the post-compaction window for cleaner
+  // data (pre-compaction pairs span compaction boundaries and produce
+  // negative deltas). Distributed BEFORE the content sum and lifetime
+  // buckets are computed (M9) so the lifetime view includes framing on
+  // the same basis as currentContext does.
+  const framingStartIndex = compactionEvents.length > 0
+    ? compactionEvents[compactionEvents.length - 1]!.afterIndex
+    : 0;
+  const derivedFraming = deriveMessageFraming(effectiveMessages, classifiedMessages, framingStartIndex);
+
+  // Add derived framing overhead — distribute proportionally across categories
+  if (derivedFraming && derivedFraming.totalTokens > 0) {
+    const msgCountByCategory: Record<CrustsCategory, number> = {
+      conversation: 0, retrieved: 0, user: 0, system: 0, tools: 0, state: 0,
+    };
+    for (const cm of classifiedMessages) {
+      msgCountByCategory[cm.category]++;
+    }
+    for (const cat of Object.keys(msgCountByCategory) as CrustsCategory[]) {
+      const framingForCat = msgCountByCategory[cat] * derivedFraming.tokensPerMessage;
+      if (framingForCat > 0) {
+        categoryTokens[cat] += framingForCat;
+        categoryAccuracy[cat] = 'estimated';
+      }
+    }
   }
 
   // Classifier's per-category content sum — the internal accounting number,
@@ -1658,30 +1743,6 @@ export function classifySession(
       unusedServers: servers.filter((s) => s.unused).map((s) => s.name),
       totalMcpTokens: servers.reduce((sum, s) => sum + s.tokensSpent, 0),
     };
-  }
-
-  // Derive framing overhead from post-compaction window for cleaner data
-  // (pre-compaction pairs span compaction boundaries and produce negative deltas)
-  const framingStartIndex = compactionEvents.length > 0
-    ? compactionEvents[compactionEvents.length - 1]!.afterIndex
-    : 0;
-  derivedFraming = deriveMessageFraming(effectiveMessages, classifiedMessages, framingStartIndex);
-
-  // Add derived framing overhead — distribute proportionally across categories
-  if (derivedFraming && derivedFraming.totalTokens > 0) {
-    const msgCountByCategory: Record<CrustsCategory, number> = {
-      conversation: 0, retrieved: 0, user: 0, system: 0, tools: 0, state: 0,
-    };
-    for (const cm of classifiedMessages) {
-      msgCountByCategory[cm.category]++;
-    }
-    for (const cat of Object.keys(msgCountByCategory) as CrustsCategory[]) {
-      const framingForCat = msgCountByCategory[cat] * derivedFraming.tokensPerMessage;
-      if (framingForCat > 0) {
-        categoryTokens[cat] += framingForCat;
-        categoryAccuracy[cat] = 'estimated';
-      }
-    }
   }
 
   // Resolve the model ID and full session model history.
@@ -1826,18 +1887,27 @@ export function classifySession(
 // ---------------------------------------------------------------------------
 
 /**
- * Derive the internal system prompt size from the first assistant message.
+ * Derive Claude Code's fixed context (the part not present in the JSONL)
+ * from the first assistant message.
  *
- * The first assistant message's input_tokens represents the TOTAL context
- * sent to the API before any conversation happened. By subtracting all
- * known components (CLAUDE.md, tool schemas, memory, skills, first user
- * message), the residual is Claude Code's built-in system prompt.
+ * The first assistant message's effective input represents the TOTAL
+ * context sent to the API before any conversation happened. Subtracting
+ * every known component (CLAUDE.md, core tool schemas, memory, skills,
+ * the first user message, and attachment records injected before the first
+ * assistant turn) leaves the residual: the internal system prompt plus the
+ * injected instructions that never appear in the session file.
+ *
+ * The residual is accepted when `1,000 <= derived <= totalInput`. There is
+ * no absolute ceiling any more: the fixed context grew well past the old
+ * 15K cap on current Claude Code versions (observed ~43K on 2.1.239), and
+ * an absolute cap silently discarded the whole System component.
  *
  * Different sessions will produce different values depending on model,
  * system prompt version, and tool configuration at the time.
  *
  * @param messages - Parsed session messages
  * @param configData - Config data from scanner
+ * @param coreSchemaTokens - Resolved core tool schema cost for this session
  * @returns Derivation result or null if insufficient data
  */
 function deriveInternalSystemPrompt(
@@ -1845,13 +1915,16 @@ function deriveInternalSystemPrompt(
   configData: ConfigData,
   coreSchemaTokens: number,
 ): DerivedOverhead['internalSystemPrompt'] {
-  // Find first assistant message with non-zero effective input. On current
-  // Claude Code the first turn's input_tokens is typically 2 with the real
-  // context in cache_creation / cache_read, so the sum is what matters.
-  const firstAssistant = messages.find(
+  // Find the first assistant message with non-zero effective input. On
+  // current Claude Code the first turn's input_tokens is typically 2 with
+  // the real context in cache_creation / cache_read, so the sum is what
+  // matters.
+  const firstAssistantIndex = messages.findIndex(
     (m) => m.type === 'assistant' && effectiveInput(m.message?.usage) > 0,
   );
-  if (!firstAssistant?.message?.usage) return null;
+  if (firstAssistantIndex === -1) return null;
+  const firstAssistant = messages[firstAssistantIndex]!;
+  if (!firstAssistant.message?.usage) return null;
 
   const totalInput = effectiveInput(firstAssistant.message.usage);
 
@@ -1860,11 +1933,37 @@ function deriveInternalSystemPrompt(
   // Core schema cost resolved per session (calibration > version > legacy)
   const knownToolSchemas = coreSchemaTokens;
   const knownMemory = configData.memoryFiles.totalEstimatedTokens;
-  // Sum discovered skills' estimated cost. Falls back to 476 (the historical
-  // /context ground-truth observation) when no skills are discovered, so
-  // sessions on machines without skills configured keep their prior derivation.
+
+  // Attachment records injected before the first assistant turn are part
+  // of its input but are classified (and counted) in their own right, so
+  // they are subtracted here to keep them out of the residual. A
+  // `skill_listing` attachment is the session's own record of the skills
+  // block and is preferred over the scanner's discovery estimate; it is
+  // counted as the skills component below, not again as a generic
+  // attachment. Sessions parsed without attachment records simply
+  // contribute 0 here.
+  let skillListingTokens = 0;
+  let knownAttachments = 0;
+  for (let i = 0; i < firstAssistantIndex; i++) {
+    const msg = messages[i]!;
+    if (msg.type !== 'attachment' || !msg.attachment) continue;
+    const tokens = estimateAttachmentTokens(msg);
+    if (msg.attachment.type === 'skill_listing' && skillListingTokens === 0) {
+      skillListingTokens = tokens;
+    } else {
+      knownAttachments += tokens;
+    }
+  }
+
+  // Skills: the session's skill_listing attachment when present, else the
+  // sum of discovered skills' estimated cost. Falls back to 476 (the
+  // historical /context ground-truth observation) when no skills are
+  // discovered, so sessions on machines without skills configured keep
+  // their prior derivation.
   const discoveredSkillTokens = configData.skills.totalEstimatedTokens;
-  const knownSkills = discoveredSkillTokens > 0 ? discoveredSkillTokens : 476;
+  const knownSkills = skillListingTokens > 0
+    ? skillListingTokens
+    : discoveredSkillTokens > 0 ? discoveredSkillTokens : 476;
 
   // Estimate first user message tokens
   let knownFirstUserMessage = 0;
@@ -1876,14 +1975,16 @@ function deriveInternalSystemPrompt(
     knownFirstUserMessage = tokens;
   }
 
-  const totalKnown = knownClaudeMd + knownToolSchemas + knownMemory + knownSkills + knownFirstUserMessage;
+  const totalKnown = knownClaudeMd + knownToolSchemas + knownMemory + knownSkills
+    + knownFirstUserMessage + knownAttachments;
   const derived = totalInput - totalKnown;
 
-  // Sanity check: should be in plausible range for a system prompt (1K-15K)
-  if (derived < 1000 || derived > 15000) {
+  // Sanity check: the fixed context must be at least 1K (anything smaller
+  // is estimation noise) and can never exceed the first turn's own input.
+  if (derived < 1000 || derived > totalInput) {
     if (verbose) {
       console.error(
-        `[CRUSTS debug] Internal system prompt derivation out of range: ${derived}`
+        `[CRUSTS debug] Fixed-context derivation out of range: ${derived}`
         + ` (total_input=${totalInput}, known=${totalKnown}). Skipping.`,
       );
     }
@@ -1892,13 +1993,14 @@ function deriveInternalSystemPrompt(
 
   if (verbose) {
     console.error(
-      `[CRUSTS derived] Internal system prompt: ${derived} tokens`
+      `[CRUSTS derived] Claude Code fixed context: ${derived} tokens`
       + ` (first_assistant_input=${totalInput}`
       + `, claude_md=${knownClaudeMd}`
       + `, tool_schemas=${knownToolSchemas}`
       + `, memory=${knownMemory}`
       + `, skills=${knownSkills}`
       + `, first_user_msg=${knownFirstUserMessage}`
+      + `, attachments=${knownAttachments}`
       + `, total_known=${totalKnown})`,
     );
   }
@@ -1912,6 +2014,7 @@ function deriveInternalSystemPrompt(
       knownMemory,
       knownSkills,
       knownFirstUserMessage,
+      knownAttachments,
       totalKnown,
     },
   };
