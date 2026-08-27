@@ -703,7 +703,9 @@ describe('M6 core schema cost: calibration override > version table > legacy bas
     expect(b.toolBreakdown.coreSchemaSource).toBe('version');
     expect(b.toolBreakdown.schemaTokens).toBe(20_500);
     const tools = b.buckets.find((x) => x.category === 'tools')!;
-    expect(tools.tokens).toBe(20_500);
+    // Raw content accounting: `tokens` is window-reconciled since M18, the
+    // unscaled component cost lives in `contentTokens`.
+    expect(tools.contentTokens).toBe(20_500);
     expect(tools.accuracy).toBe('estimated');
   });
 
@@ -737,7 +739,8 @@ describe('M6 core schema cost: calibration override > version table > legacy bas
     ], config);
     expect(b.toolBreakdown.coreSchemaTokens).toBe(21_100);
     expect(b.toolBreakdown.coreSchemaSource).toBe('calibration');
-    expect(b.buckets.find((x) => x.category === 'tools')!.tokens).toBe(21_100);
+    // Raw content accounting (see M18): the reconciled `tokens` is scaled.
+    expect(b.buckets.find((x) => x.category === 'tools')!.contentTokens).toBe(21_100);
     expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownToolSchemas).toBe(21_100);
   });
 
@@ -1202,7 +1205,10 @@ describe('M10: derived fixed context', () => {
     expect(derived!.derivation.totalKnown).toBe(10_887);
     expect(derived!.derivation.knownAttachments).toBe(0);
     const system = b.buckets.find((x) => x.category === 'system')!;
-    expect(system.tokens).toBe(1_294 + 43_352);
+    // Raw content accounting (see M18): the reconciled `tokens` is scaled
+    // to the API window total; the derived component sum stays visible in
+    // `contentTokens`.
+    expect(system.contentTokens).toBe(1_294 + 43_352);
   });
 
   test('fixed context is rejected when known components leave less than 1K residual', () => {
@@ -1659,5 +1665,162 @@ describe('M17 compaction event fidelity', () => {
     const b = classifySession(msgs, EMPTY_CONFIG);
     expect(b.context_limit).toBe(1_000_000);
     expect(b.compactionEvents[0]!.contextLimit).toBe(1_000_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.0 M18 — window reconciliation
+// ---------------------------------------------------------------------------
+
+import { reconcileBuckets, RECONCILE_SCALE_MIN, RECONCILE_SCALE_MAX } from '../src/classifier.ts';
+import type { CrustsBucket } from '../src/types.ts';
+
+/** Raw (content-basis) bucket for direct reconcileBuckets tests. */
+function rawBucket(category: CrustsCategory, tokens: number): CrustsBucket {
+  return { category, tokens, percentage: 0, accuracy: 'estimated', contentTokens: tokens };
+}
+
+/** Sum of the window-basis token values across a bucket array. */
+function bucketSum(buckets: CrustsBucket[]): number {
+  return buckets.reduce((s, b) => s + b.tokens, 0);
+}
+
+/** Sum of the reported percentages across a bucket array. */
+function percentageSum(buckets: CrustsBucket[]): number {
+  return buckets.reduce((s, b) => s + b.percentage, 0);
+}
+
+describe('M18 reconcileBuckets (unit)', () => {
+  test('floor plus remainder lands the sum EXACTLY on the API total, remainder on the largest bucket', () => {
+    const raw = [
+      rawBucket('conversation', 100),
+      rawBucket('tools', 200),
+      rawBucket('retrieved', 300),
+    ];
+    const { buckets, reconciliation } = reconcileBuckets(raw, 700);
+    expect(reconciliation.basis).toBe('api');
+    expect(reconciliation.scale).toBeCloseTo(700 / 600, 5);
+    expect(bucketSum(buckets)).toBe(700);
+    // floors: 116 + 233 + 350 = 699; the 1-token remainder goes to the
+    // largest bucket (retrieved, contentTokens 300)
+    expect(buckets.find((b) => b.category === 'conversation')!.tokens).toBe(116);
+    expect(buckets.find((b) => b.category === 'tools')!.tokens).toBe(233);
+    expect(buckets.find((b) => b.category === 'retrieved')!.tokens).toBe(351);
+    // contentTokens stay raw
+    expect(buckets.map((b) => b.contentTokens)).toEqual([100, 200, 300]);
+    expect(percentageSum(buckets)).toBeCloseTo(100, 1);
+  });
+
+  test('scale below the guard band leaves the buckets on the content basis and records the scale', () => {
+    const raw = [rawBucket('conversation', 400), rawBucket('tools', 200)];
+    const { buckets, reconciliation } = reconcileBuckets(raw, 200); // scale 0.333
+    expect(reconciliation.basis).toBe('content');
+    expect(reconciliation.scale).toBeCloseTo(200 / 600, 5);
+    expect(reconciliation.scale).toBeLessThan(RECONCILE_SCALE_MIN);
+    expect(buckets.find((b) => b.category === 'conversation')!.tokens).toBe(400);
+    expect(bucketSum(buckets)).toBe(600);
+  });
+
+  test('scale above the guard band is also refused', () => {
+    const raw = [rawBucket('conversation', 100)];
+    const { reconciliation } = reconcileBuckets(raw, 1_000); // scale 10
+    expect(reconciliation.basis).toBe('content');
+    expect(reconciliation.scale).toBeGreaterThan(RECONCILE_SCALE_MAX);
+  });
+
+  test('no API total means scale 1 on the content basis', () => {
+    const raw = [rawBucket('conversation', 100), rawBucket('tools', 50)];
+    const { buckets, reconciliation } = reconcileBuckets(raw, null);
+    expect(reconciliation).toEqual({ scale: 1, basis: 'content' });
+    expect(bucketSum(buckets)).toBe(150);
+  });
+});
+
+describe('M18 window reconciliation through classifySession', () => {
+  /** In-band fixture: content sum lands close to the API window total. */
+  function inBandMessages(): SessionMessage[] {
+    return [
+      userText('crust '.repeat(800)), // ~4,800 chars of plain English
+      assistantWithCache(100, 1_000), // effective input 1,100 + output 100
+    ];
+  }
+
+  test('T3: no-compaction buckets sum EXACTLY to total_tokens and percentages sum to 100', () => {
+    const b = classifySession(inBandMessages(), EMPTY_CONFIG);
+    expect(b.compactionEvents.length).toBe(0);
+    expect(b.reconciliation).toBeDefined();
+    expect(b.reconciliation!.basis).toBe('api');
+    expect(b.reconciliation!.scale).toBeGreaterThanOrEqual(RECONCILE_SCALE_MIN);
+    expect(b.reconciliation!.scale).toBeLessThanOrEqual(RECONCILE_SCALE_MAX);
+    expect(b.buckets.reduce((s, x) => s + x.tokens, 0)).toBe(b.total_tokens);
+    const pctSum = b.buckets.reduce((s, x) => s + x.percentage, 0);
+    expect(Math.abs(pctSum - 100)).toBeLessThanOrEqual(0.1);
+    // Raw accounting preserved alongside
+    expect(b.buckets.reduce((s, x) => s + x.contentTokens, 0)).toBeCloseTo(b.contentSumTokens!, 5);
+  });
+
+  test('T4: compacted sessions keep lifetime buckets raw but reconcile currentContext', () => {
+    // First assistant effective input 40,100: the M10 derivation accepts
+    // ~39.6K of fixed context into System (re-injected after compaction,
+    // so it counts in the current slice too). The post-compact assistant
+    // then reports a comparable window (40,100 + 100 output), landing the
+    // slice's scale in band, like a real compacted session.
+    const msgs: SessionMessage[] = [
+      userText('q1'),
+      assistantWithCache(100, 40_000),
+      compactBoundary(150_000),
+      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'summary '.repeat(500) }] }, isCompactSummary: true } as SessionMessage,
+      userText('q2'),
+      assistantWithCache(100, 40_000),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.compactionEvents.length).toBe(1);
+    // Lifetime stays on the content basis — the API total describes only
+    // the last window, so scaling lifetime would fabricate a composition.
+    expect(b.reconciliation!.basis).toBe('content');
+    expect(b.reconciliation!.scale).toBe(1);
+    expect(b.buckets.reduce((s, x) => s + x.tokens, 0)).toBeCloseTo(b.contentSumTokens!, 5);
+    // currentContext IS the live window: always reconciled when in band.
+    const cc = b.currentContext!;
+    expect(cc.reconciliation).toBeDefined();
+    expect(cc.reconciliation!.basis).toBe('api');
+    expect(cc.buckets.reduce((s, x) => s + x.tokens, 0)).toBe(cc.total_tokens);
+    const pctSum = cc.buckets.reduce((s, x) => s + x.percentage, 0);
+    expect(Math.abs(pctSum - 100)).toBeLessThanOrEqual(0.1);
+  });
+
+  test('T5: no-usage session reconciles with scale 1 and tokens === contentTokens', () => {
+    const msgs: SessionMessage[] = [
+      userText('q'),
+      { type: 'assistant', message: { role: 'assistant', model: 'claude-opus-4-7', content: [{ type: 'text', text: 'response' }] } } as SessionMessage,
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.reconciliation!.scale).toBe(1);
+    for (const bucket of b.buckets) {
+      expect(bucket.tokens).toBe(bucket.contentTokens);
+    }
+    // total falls back to content sum, so the sum invariant still holds
+    expect(b.buckets.reduce((s, x) => s + x.tokens, 0)).toBeCloseTo(b.total_tokens, 5);
+  });
+
+  test('T6: an out-of-band scale is exposed but NOT applied (basis stays content)', () => {
+    // First assistant input is tiny, so the M10 derivation is rejected
+    // (residual < 1K) and nothing absorbs the gap; the LAST assistant then
+    // reports a 350K window against a few tokens of classified content.
+    // The drift is a classification-defect tripwire, not estimation noise.
+    const msgs: SessionMessage[] = [
+      userText('q'),
+      assistantWithCache(100, 300),
+      userText('q2'),
+      assistantWithCache(100, 350_000),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.reconciliation!.basis).toBe('content');
+    expect(b.reconciliation!.scale).toBeGreaterThan(RECONCILE_SCALE_MAX);
+    for (const bucket of b.buckets) {
+      expect(bucket.tokens).toBe(bucket.contentTokens);
+    }
+    // The defect stays visible: bucket sum does NOT match the API total.
+    expect(b.buckets.reduce((s, x) => s + x.tokens, 0)).not.toBe(b.total_tokens);
   });
 });

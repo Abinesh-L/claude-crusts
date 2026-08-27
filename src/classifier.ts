@@ -28,6 +28,7 @@ import type {
   CrustsCategory,
   CrustsBreakdown,
   CrustsBucket,
+  BucketReconciliation,
   ClassifiedMessage,
   ConfigData,
   ToolBreakdown,
@@ -1695,6 +1696,10 @@ function computeEffectiveInputTokens(
 /**
  * Build a CRUSTS bucket array from category token and accuracy maps.
  *
+ * The buckets come back on the raw content basis (`tokens ===
+ * contentTokens`); `reconcileBuckets` scales them to the API window total
+ * where that is sound.
+ *
  * @param categoryTokens - Token counts per category
  * @param categoryAccuracy - Accuracy per category
  * @returns Array of CrustsBucket objects with percentages
@@ -1712,7 +1717,89 @@ function buildBuckets(
     tokens: categoryTokens[cat],
     percentage: totalTokens > 0 ? (categoryTokens[cat] / totalTokens) * 100 : 0,
     accuracy: categoryAccuracy[cat],
+    contentTokens: categoryTokens[cat],
   }));
+}
+
+/**
+ * Guard band for bucket reconciliation. Content-sum estimation noise
+ * (tokenizer divisors, framing medians, attachment estimates) lands the
+ * scale near 1 on healthy classifications — measured 1.03-1.20 on real
+ * sessions after the v0.8.0 root fixes. A scale outside this band means the
+ * classifier is missing (or double-counting) whole components, and scaling
+ * would mask that defect instead of absorbing noise.
+ */
+export const RECONCILE_SCALE_MIN = 0.7;
+/** Upper bound of the reconciliation guard band — see RECONCILE_SCALE_MIN. */
+export const RECONCILE_SCALE_MAX = 1.4;
+
+/**
+ * Reconcile content-estimated buckets to the API-reported window total.
+ *
+ * The API's effective-input number is the truth about window size, but only
+ * the classifier knows the composition. This projects the composition onto
+ * the API total: each bucket becomes `floor(contentTokens * scale)` with
+ * `scale = apiTotal / contentSum`, and the sub-token remainder (0..5) is
+ * added to the largest bucket so the invariant `sum(tokens) === apiTotal`
+ * holds EXACTLY. Percentages are recomputed from the reconciled values.
+ *
+ * Guarded so it cannot hide defects: when the scale falls outside
+ * [`RECONCILE_SCALE_MIN`, `RECONCILE_SCALE_MAX`] the buckets are returned
+ * unscaled (basis 'content') with the offending scale recorded, keeping the
+ * audit tripwire visible. No API total (or an empty content sum) also
+ * returns the raw buckets with scale 1.
+ *
+ * @param buckets - Raw buckets from `buildBuckets` (tokens === contentTokens)
+ * @param apiTotal - API-derived window total for the view, or null when no
+ *   assistant turn with usage data exists
+ * @returns The (possibly scaled) buckets plus the reconciliation descriptor
+ */
+export function reconcileBuckets(
+  buckets: CrustsBucket[],
+  apiTotal: number | null,
+): { buckets: CrustsBucket[]; reconciliation: BucketReconciliation } {
+  const contentSum = buckets.reduce((sum, b) => sum + b.contentTokens, 0);
+  if (apiTotal === null || apiTotal <= 0 || contentSum <= 0) {
+    return { buckets, reconciliation: { scale: 1, basis: 'content' } };
+  }
+  const scale = apiTotal / contentSum;
+  if (scale < RECONCILE_SCALE_MIN || scale > RECONCILE_SCALE_MAX) {
+    return { buckets, reconciliation: { scale, basis: 'content' } };
+  }
+  const scaled = buckets.map((b) => ({ ...b, tokens: Math.floor(b.contentTokens * scale) }));
+  const remainder = apiTotal - scaled.reduce((sum, b) => sum + b.tokens, 0);
+  let largest = scaled[0]!;
+  for (const b of scaled) {
+    if (b.contentTokens > largest.contentTokens) largest = b;
+  }
+  largest.tokens += remainder;
+  for (const b of scaled) {
+    b.percentage = (b.tokens / apiTotal) * 100;
+  }
+  return { buckets: scaled, reconciliation: { scale, basis: 'api' } };
+}
+
+/**
+ * Print the outcome of a bucket reconciliation under --verbose.
+ *
+ * An out-of-band scale is the accuracy tripwire the guard exists for, so it
+ * is called out explicitly rather than silently leaving the buckets raw.
+ *
+ * @param label - Which view was reconciled ('lifetime' or 'current context')
+ * @param reconciliation - Result descriptor from `reconcileBuckets`
+ * @param apiTotal - API total the reconciliation targeted (null when absent)
+ */
+function reportReconciliation(
+  label: string,
+  reconciliation: BucketReconciliation,
+  apiTotal: number | null,
+): void {
+  if (!verbose || apiTotal === null) return;
+  if (reconciliation.basis === 'api') {
+    console.error(`[verbose] ${label} buckets reconciled to the API window total (scale ${reconciliation.scale.toFixed(3)})`);
+  } else if (reconciliation.scale < RECONCILE_SCALE_MIN || reconciliation.scale > RECONCILE_SCALE_MAX) {
+    console.error(`[verbose] ${label} bucket scale ${reconciliation.scale.toFixed(3)} is outside [${RECONCILE_SCALE_MIN}, ${RECONCILE_SCALE_MAX}]; buckets left on the content basis. A drift this large usually means a classification defect, not estimation noise.`);
+  }
 }
 
 /**
@@ -1960,7 +2047,21 @@ export function classifySession(
   // sessions, synthetic-only sessions, or fixtures without `usage` fields).
   const effectiveInputTokens = computeEffectiveInputTokens(effectiveMessages);
   const totalTokens = effectiveInputTokens ?? contentSumTokens;
-  const buckets = buildBuckets(categoryTokens, categoryAccuracy);
+
+  // Reconcile lifetime buckets to the API window total ONLY when the session
+  // never compacted (lifetime === current window). In compacted sessions the
+  // API number describes just the LAST window while the lifetime buckets
+  // span every window, so scaling them by it would fabricate a composition;
+  // they stay on the raw content basis (currentContext carries the
+  // reconciled live-window view instead).
+  let buckets = buildBuckets(categoryTokens, categoryAccuracy);
+  let reconciliation: BucketReconciliation = { scale: 1, basis: 'content' };
+  if (compactionEvents.length === 0) {
+    const reconciled = reconcileBuckets(buckets, effectiveInputTokens);
+    buckets = reconciled.buckets;
+    reconciliation = reconciled.reconciliation;
+    reportReconciliation('Lifetime', reconciliation, effectiveInputTokens);
+  }
 
   // Build loaded vs used tool lists.
   //
@@ -2191,10 +2292,18 @@ export function classifySession(
     // multi-compact sessions display content-sum > context_limit (Bug #9).
     const currentEffective = computeEffectiveInputTokens(effectiveMessages, startIndex);
     const currentTotal = currentEffective ?? currentContentSum;
+    // The current-context slice IS the live window, so reconciliation to the
+    // API total is always attempted here (the guard band still applies).
+    const currentReconciled = reconcileBuckets(
+      buildBuckets(currentCategoryTokens, currentCategoryAccuracy),
+      currentEffective,
+    );
+    reportReconciliation('Current-context', currentReconciled.reconciliation, currentEffective);
     currentContext = {
-      buckets: buildBuckets(currentCategoryTokens, currentCategoryAccuracy),
+      buckets: currentReconciled.buckets,
       total_tokens: currentTotal,
       contentSumTokens: currentContentSum,
+      reconciliation: currentReconciled.reconciliation,
       free_tokens: Math.max(0, contextLimit - currentTotal),
       usage_percentage: (currentTotal / contextLimit) * 100,
       startIndex,
@@ -2214,6 +2323,7 @@ export function classifySession(
     buckets,
     total_tokens: totalTokens,
     contentSumTokens,
+    reconciliation,
     context_limit: contextLimit,
     free_tokens: Math.max(0, contextLimit - totalTokens),
     usage_percentage: (totalTokens / contextLimit) * 100,

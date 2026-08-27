@@ -44,46 +44,69 @@ function classifyHealth(percent: number): ContextHealth {
 }
 
 /**
- * Append a single record describing the supplied analysis to history.jsonl.
+ * Build the TrendRecord describing one completed analysis.
  *
  * Uses the post-compaction `currentContext` view when available so the
  * recorded percent-used reflects what the user is actually working with,
- * not the cumulative session size. Silently swallows I/O errors — trend
- * recording must never break a normal analyze run.
+ * not the cumulative session size. Pure (no I/O) so tests can assert the
+ * record shape without touching the history file.
+ *
+ * `bucketBasis` records which basis the bucket-derived numbers
+ * (`topCategory` / `topCategoryTokens`) are on: 'window' when the view was
+ * reconciled to the API window total, 'content' when the reconciliation
+ * guard left the raw content sums in place. Pre-v0.8.0 history rows lack
+ * the field and their `topCategoryTokens` are on the old inflated content
+ * basis, so consumers must not compare them numerically against
+ * reconciled records.
+ *
+ * @param result - The completed AnalysisResult
+ * @returns The record that recordTrend appends to history.jsonl
+ */
+export function buildTrendRecord(result: AnalysisResult): TrendRecord {
+  const breakdown = result.breakdown;
+  const view = breakdown.currentContext ?? {
+    buckets: breakdown.buckets,
+    total_tokens: breakdown.total_tokens,
+    usage_percentage: breakdown.usage_percentage,
+    reconciliation: breakdown.reconciliation,
+  };
+
+  let topCategory: CrustsCategory = 'conversation';
+  let topCategoryTokens = 0;
+  for (const bucket of view.buckets) {
+    if (bucket.tokens > topCategoryTokens) {
+      topCategory = bucket.category;
+      topCategoryTokens = bucket.tokens;
+    }
+  }
+
+  return {
+    sessionId: result.sessionId,
+    projectName: result.project,
+    timestamp: new Date().toISOString(),
+    totalTokens: view.total_tokens,
+    percentUsed: view.usage_percentage,
+    messageCount: result.messageCount,
+    compactionCount: breakdown.compactionEvents.length,
+    health: classifyHealth(view.usage_percentage),
+    topCategory,
+    topCategoryTokens,
+    contextLimit: breakdown.context_limit,
+    bucketBasis: view.reconciliation?.basis === 'api' ? 'window' : 'content',
+  };
+}
+
+/**
+ * Append a single record describing the supplied analysis to history.jsonl.
+ *
+ * Silently swallows I/O errors — trend recording must never break a normal
+ * analyze run. Record shape comes from `buildTrendRecord`.
  *
  * @param result - The completed AnalysisResult
  */
 export function recordTrend(result: AnalysisResult): void {
   try {
-    const breakdown = result.breakdown;
-    const view = breakdown.currentContext ?? {
-      buckets: breakdown.buckets,
-      total_tokens: breakdown.total_tokens,
-      usage_percentage: breakdown.usage_percentage,
-    };
-
-    let topCategory: CrustsCategory = 'conversation';
-    let topCategoryTokens = 0;
-    for (const bucket of view.buckets) {
-      if (bucket.tokens > topCategoryTokens) {
-        topCategory = bucket.category;
-        topCategoryTokens = bucket.tokens;
-      }
-    }
-
-    const record: TrendRecord = {
-      sessionId: result.sessionId,
-      projectName: result.project,
-      timestamp: new Date().toISOString(),
-      totalTokens: view.total_tokens,
-      percentUsed: view.usage_percentage,
-      messageCount: result.messageCount,
-      compactionCount: breakdown.compactionEvents.length,
-      health: classifyHealth(view.usage_percentage),
-      topCategory,
-      topCategoryTokens,
-      contextLimit: breakdown.context_limit,
-    };
+    const record = buildTrendRecord(result);
 
     if (!existsSync(CRUSTS_DIR)) {
       mkdirSync(CRUSTS_DIR, { recursive: true });
@@ -148,6 +171,12 @@ export function loadTrendHistory(limit = 50, projectFilter?: string): TrendRecor
  * Direction is computed by comparing the first third's average percent-used
  * against the last third's average. A delta of more than 5 percentage points
  * is considered a meaningful direction; smaller deltas are reported as flat.
+ *
+ * `topCategoryTokens` is deliberately NOT aggregated here: records written
+ * before v0.8.0 (no `bucketBasis` field) carry content-basis numbers that
+ * were up to ~3x the window-reconciled values, so averaging them across a
+ * mixed history would be meaningless. `topCategory` (a label, basis-free)
+ * is the only bucket-derived field the summary uses.
  *
  * @param records - Chronologically-sorted records (oldest first)
  * @returns TrendSummary, or a zeroed summary when records is empty
@@ -226,8 +255,10 @@ function csvEscape(value: string | number | undefined): string {
  *
  * Columns follow the TrendRecord schema verbatim, including the
  * optional `contextLimit` column (empty for pre-v0.6.0 records that
- * predate that field). Timestamps are kept as ISO strings so they sort
- * lexically in spreadsheets. The header is always emitted.
+ * predate that field) and the optional `bucketBasis` column (empty for
+ * pre-v0.8.0 records, whose bucket numbers are on the old content basis).
+ * Timestamps are kept as ISO strings so they sort lexically in
+ * spreadsheets. The header is always emitted.
  *
  * @param records - Trend records (any order; caller decides)
  * @returns CSV text including a trailing newline
@@ -245,6 +276,7 @@ export function formatTrendAsCsv(records: TrendRecord[]): string {
     'topCategory',
     'topCategoryTokens',
     'contextLimit',
+    'bucketBasis',
   ].join(',');
 
   const lines = records.map((r) => [
@@ -259,6 +291,7 @@ export function formatTrendAsCsv(records: TrendRecord[]): string {
     csvEscape(r.topCategory),
     csvEscape(r.topCategoryTokens),
     csvEscape(r.contextLimit),
+    csvEscape(r.bucketBasis),
   ].join(','));
 
   return [header, ...lines].join('\n') + '\n';

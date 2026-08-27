@@ -51,3 +51,19 @@ describe('formatTrendAsCsv', () => {
     expect(row).toContain(',60.57,');
   });
 });
+
+// v0.8.0 M18 — bucketBasis column
+describe('formatTrendAsCsv bucketBasis column (M18 reconciliation)', () => {
+  test('emits the bucketBasis header and serialises the value', () => {
+    const csv = formatTrendAsCsv([record({ bucketBasis: 'window' })]);
+    const [header, row] = csv.split('\n');
+    expect(header!.split(',').pop()).toBe('bucketBasis');
+    expect(row!.split(',').pop()).toBe('window');
+  });
+
+  test('pre-v0.8.0 records without bucketBasis serialise an empty cell', () => {
+    const csv = formatTrendAsCsv([record()]);
+    const row = csv.split('\n')[1]!;
+    expect(row.endsWith(',')).toBe(true);
+  });
+});

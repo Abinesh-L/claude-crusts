@@ -419,9 +419,44 @@ export interface MCPBreakdown {
 /** Per-category token count and percentage */
 export interface CrustsBucket {
   category: CrustsCategory;
+  /**
+   * Token count for this category on the view's reporting basis. When the
+   * view was reconciled to the API window total (`reconciliation.basis ===
+   * 'api'`), this is the window-scaled value and the buckets sum exactly to
+   * the view's `total_tokens`. Otherwise it equals `contentTokens`.
+   */
   tokens: number;
   percentage: number;
   accuracy: 'exact' | 'estimated';
+  /**
+   * Raw classifier content estimate for this category, before window
+   * reconciliation. Always populated; equals `tokens` when no scaling was
+   * applied. Diagnostic — lets --verbose output and tests compare the
+   * classifier's internal accounting against the API-reconciled view.
+   */
+  contentTokens: number;
+}
+
+/**
+ * How a view's buckets relate to its `total_tokens`.
+ *
+ * `basis: 'api'` — buckets were proportionally scaled (floor + remainder to
+ * the largest bucket) so their sum equals the API-reported window total
+ * exactly. `basis: 'content'` — buckets are the raw per-category content
+ * sums, because no API total exists, the view is a compacted session's
+ * lifetime accounting (where the API total describes only the last window),
+ * or the scale fell outside the guard band and scaling would have masked a
+ * classification defect rather than absorbing estimation noise.
+ */
+export interface BucketReconciliation {
+  /**
+   * apiTotal / contentSum ratio. Recorded even when scaling was NOT applied
+   * (out-of-band guard) so audits can see the drift; 1 when no API total or
+   * no content exists.
+   */
+  scale: number;
+  /** Reporting basis the bucket `tokens` values are on */
+  basis: 'api' | 'content';
 }
 
 /** A detected compaction event in the session */
@@ -588,6 +623,13 @@ export interface CrustsBreakdown {
    * see them only via cache). The API number is the truth.
    */
   contentSumTokens?: number;
+  /**
+   * How `buckets` relate to `total_tokens`. Basis 'api' only when the
+   * session has no compaction (lifetime === current window) and the scale
+   * landed inside the guard band; compacted sessions keep lifetime raw
+   * (basis 'content') because the API total describes only the last window.
+   */
+  reconciliation?: BucketReconciliation;
   context_limit: number;
   free_tokens: number;
   usage_percentage: number;
@@ -626,6 +668,13 @@ export interface CrustsBreakdown {
     /** Classifier's content-sum across the slice. Same rationale as
      * `CrustsBreakdown.contentSumTokens` — diagnostic, not authoritative. */
     contentSumTokens?: number;
+    /**
+     * How the slice's buckets relate to its `total_tokens`. Reconciliation
+     * is always ATTEMPTED for the current-context view (it IS the live
+     * window); basis 'content' here means no API total was available or the
+     * scale fell outside the guard band.
+     */
+    reconciliation?: BucketReconciliation;
     free_tokens: number;
     usage_percentage: number;
     startIndex: number;
@@ -813,6 +862,14 @@ export interface TrendRecord {
   topCategoryTokens: number;
   /** Model-dependent context window used for this record. Optional for backward compatibility with pre-v0.6.0 history. */
   contextLimit?: number;
+  /**
+   * Basis the recorded bucket numbers are on. 'window' = buckets were
+   * reconciled to the API window total (v0.8.0+ default); 'content' = raw
+   * classifier content sums (reconciliation guard fired). Absent on pre-v0.8.0
+   * records, whose `topCategoryTokens` are on the old inflated content basis
+   * and must not be compared numerically against reconciled records.
+   */
+  bucketBasis?: 'window' | 'content';
 }
 
 /** Aggregate summary computed across a list of TrendRecords */
