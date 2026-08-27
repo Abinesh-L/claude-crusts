@@ -308,6 +308,14 @@ export interface ConfigData {
     items: SkillInfo[];
     totalEstimatedTokens: number;
   };
+  /**
+   * Configured `model` values from Claude Code settings files, highest
+   * precedence first (project .claude/settings.local.json, project
+   * .claude/settings.json, ~/.claude/settings.json). Feeds the
+   * context-limit resolver's `settings` signal: the JSONL strips the
+   * `[1m]` variant but settings.json keeps it. See `readSettingsModels`.
+   */
+  settingsModels?: string[];
 }
 
 /** Classification result for a single message */

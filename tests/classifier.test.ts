@@ -321,9 +321,11 @@ describe('M4 usage drift: nested cache_creation and current usage shape', () => 
 
   test('cache-overhead waste rule sees nested cache_read ratio through the same helper', () => {
     // Sanity: nested-only usage must not produce NaN ratios downstream.
+    // The fixture model is a bare claude-fable-5, which the M13 native-1M
+    // table resolves to a 1,000,000-token window (50K used, 950K free).
     const b = classifySession([userText('hi'), nestedOnlyAssistant(50_000)], EMPTY_CONFIG);
     expect(Number.isFinite(b.free_tokens)).toBe(true);
-    expect(b.free_tokens).toBe(150_000);
+    expect(b.free_tokens).toBe(950_000);
   });
 });
 
@@ -1453,5 +1455,43 @@ describe('M11 attachments and per-message statistics', () => {
     expect(b.buckets.find((x) => x.category === 'system')!.tokens).toBe(75);
     const bucketSum = b.buckets.reduce((sum, x) => sum + x.tokens, 0);
     expect(bucketSum).toBe(b.contentSumTokens);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.0 M13 — context-limit threading: payload override, recorded /context
+// output, settings signal, native-1M table
+// ---------------------------------------------------------------------------
+
+describe('M13 context-limit resolution threading', () => {
+  test('limitOverride (statusline payload context_window_size) wins outright', () => {
+    const b = classifySession([userText('hi'), assistantWithCache(100, 50_000)], EMPTY_CONFIG, undefined, undefined, 500_000);
+    expect(b.context_limit).toBe(500_000);
+  });
+
+  test('a recorded /context output sets the window (observed 500K shape)', () => {
+    const contextRecord = {
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content: '## Context Usage\n\n**Model:** claude-opus-4-7  \n**Tokens:** 119.2k / 500k (24%)' },
+    } as SessionMessage;
+    const b = classifySession([userText('hi'), assistantWithCache(100, 50_000), contextRecord], EMPTY_CONFIG);
+    expect(b.context_limit).toBe(500_000);
+  });
+
+  test('configData.settingsModels promotes a family-matching bare model to 1M', () => {
+    const cfg: ConfigData = { ...EMPTY_CONFIG, settingsModels: ['claude-opus-4-7[1m]'] };
+    const b = classifySession([userText('hi'), assistantWithCache(100, 50_000)], cfg);
+    expect(b.context_limit).toBe(1_000_000);
+  });
+
+  test('a bare fable-5 session resolves to the native 1M window', () => {
+    const b = classifySession([userText('hi'), currentShapeAssistant()], EMPTY_CONFIG);
+    expect(b.context_limit).toBe(1_000_000);
+  });
+
+  test('a bare 4.x session with no signal stays at 200K', () => {
+    const b = classifySession([userText('hi'), assistantWithCache(100, 50_000)], EMPTY_CONFIG);
+    expect(b.context_limit).toBe(200_000);
   });
 });

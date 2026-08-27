@@ -1637,6 +1637,7 @@ function buildBuckets(
  * @param configData - Config data from scanner (system prompt, MCP, memory, tools)
  * @param untilIndex - Optional message cutoff (exclusive). If set, disables auto-trim.
  * @param modelOverride - Optional live model ID (e.g. `claude-opus-4-7[1m]`) that takes precedence over the stripped ID in the JSONL. Used by the statusline path where Claude Code preserves the variant in its stdin payload.
+ * @param limitOverride - Optional live context-window size in tokens (the statusline payload's `context_window.context_window_size`). Wins over every recorded signal.
  * @returns Complete CRUSTS breakdown with per-message detail
  */
 export function classifySession(
@@ -1644,6 +1645,7 @@ export function classifySession(
   configData: ConfigData,
   untilIndex?: number,
   modelOverride?: string,
+  limitOverride?: number,
 ): CrustsBreakdown {
   // Determine effective endpoint: explicit --until, or auto-trim CRUSTS invocation
   const effectiveEnd = untilIndex ?? findAnalysisCutoff(messages);
@@ -1959,16 +1961,24 @@ export function classifySession(
   // `[1m]` variant JSONL strips) takes precedence when supplied.
   const modelHistory = computeModelHistory(effectiveMessages, lineGroups);
   const model = modelOverride ?? modelHistory.current;
-  // Claude Code strips the `[1m]` variant from the recorded model ID, so we
-  // combine model-ID lookup with a usage-based heuristic: if any assistant
-  // message observed an effective input > 200K, the window must be 1M.
-  const contextResolution = resolveContextLimitWithSignal(model, effectiveMessages);
+  // Claude Code strips the `[1m]` variant from the recorded model ID, so
+  // every signal is combined in priority order: live payload override,
+  // recorded /context output, model-ID variant, settings.json model,
+  // usage above 200K (conclusive 1M), and the native-1M model table.
+  const contextResolution = resolveContextLimitWithSignal(model, effectiveMessages, {
+    limitOverride,
+    settingsModels: configData.settingsModels,
+  });
   const contextLimit = contextResolution.limit;
   if (verbose) {
     const signalExplanation =
+      contextResolution.signal === 'payload' ? 'live payload supplied context_window.context_window_size' :
+      contextResolution.signal === 'context-command' ? 'latest /context output recorded in the transcript reported this window' :
       contextResolution.signal === 'model-id' ? `model-ID "${model}" matched a 1M-variant pattern` :
+      contextResolution.signal === 'settings' ? 'settings.json pins a [1m] model matching this session model family' :
       contextResolution.signal === 'usage' ? 'an observed message exceeded 200K effective input (conclusive 1M)' :
-      'neither model-ID nor usage signal fired — defaulting to 200K. If this is a 1M session below that usage, pass --path or run the statusline to detect via the live model override.';
+      contextResolution.signal === 'native' ? `model "${model}" ships a native 1M window` :
+      'no signal fired (payload, /context output, model-id, settings, usage, native); defaulting to 200K. A fresh 1M session below that usage resolves via settings.json or the statusline payload.';
     console.error(`[verbose] Context limit: ${contextLimit.toLocaleString()} (signal: ${contextResolution.signal}) \u2014 ${signalExplanation}`);
     const coreExplanation =
       coreSchema.source === 'calibration' ? 'pinned by `claude-crusts calibrate` (/context "System tools" row)' :

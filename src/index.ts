@@ -622,7 +622,13 @@ const statuslineCmd = program
       if (messages.length === 0) return;
 
       const configData = gatherConfigData();
-      const breakdown = classifySession(messages, configData, undefined, payload?.model?.id);
+      const breakdown = classifySession(
+        messages,
+        configData,
+        undefined,
+        payload?.model?.id,
+        payload?.context_window?.context_window_size,
+      );
       process.stdout.write(renderStatusline(breakdown));
     } catch {
       // Statusline must never break Claude Code — swallow all errors.

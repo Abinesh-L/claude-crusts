@@ -231,4 +231,11 @@ export interface StatuslinePayload {
   cwd?: string;
   workspace?: { current_dir?: string };
   model?: { id?: string; display_name?: string };
+  /**
+   * Live context-window info. `context_window_size` is the session's
+   * authoritative window in tokens; the statusline command threads it into
+   * `classifySession` as `limitOverride`, where it outranks every
+   * recorded signal (the JSONL strips the `[1m]` model variant).
+   */
+  context_window?: { context_window_size?: number };
 }

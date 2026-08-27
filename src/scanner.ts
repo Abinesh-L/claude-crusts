@@ -575,6 +575,35 @@ export function readMCPConfig(projectPath?: string, observedServers?: string[]):
 }
 
 /**
+ * Read the configured `model` from Claude Code settings files.
+ *
+ * Claude Code strips the `[1m]` variant from the model IDs it records in
+ * the JSONL, but settings.json keeps it, so the configured model is a
+ * context-window signal (see `detectSettingsContextLimit` in
+ * model-context.ts). Returned highest precedence first: project
+ * .claude/settings.local.json, project .claude/settings.json, then
+ * ~/.claude/settings.json. Missing files, corrupt JSON, and non-string
+ * `model` fields are skipped.
+ *
+ * @param projectPath - Optional project directory for project-level settings
+ * @returns Configured model IDs, highest precedence first (may be empty)
+ */
+export function readSettingsModels(projectPath?: string): string[] {
+  const models: string[] = [];
+  const push = (record: Record<string, unknown> | null): void => {
+    if (record && typeof record.model === 'string' && record.model.trim() !== '') {
+      models.push(record.model.trim());
+    }
+  };
+  if (projectPath) {
+    push(readJsonRecord(join(projectPath, '.claude', 'settings.local.json')));
+    push(readJsonRecord(join(projectPath, '.claude', 'settings.json')));
+  }
+  push(readJsonRecord(join(homedir(), '.claude', 'settings.json')));
+  return models;
+}
+
+/**
  * Collect the MCP server names a session's JSONL proves were connected.
  *
  * Scans assistant `tool_use` block names and `deferred_tools_delta`

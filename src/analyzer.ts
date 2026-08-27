@@ -14,6 +14,7 @@ import {
   readMCPConfig,
   readMemoryFiles,
   readSkillsConfig,
+  readSettingsModels,
   getBuiltInToolList,
   collectObservedMcpServers,
 } from './scanner.ts';
@@ -56,6 +57,7 @@ export function gatherConfigData(
       items: skillItems,
       totalEstimatedTokens: skillItems.reduce((sum, s) => sum + s.estimatedTokens, 0),
     },
+    settingsModels: readSettingsModels(projectPath),
   };
 }
 

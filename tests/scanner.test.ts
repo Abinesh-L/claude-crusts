@@ -26,6 +26,7 @@ import {
   readMemoryFiles,
   readMCPConfig,
   readSkillsConfig,
+  readSettingsModels,
   collectObservedMcpServers,
 } from '../src/scanner.ts';
 import { classifySession, detectCompactionEvents } from '../src/classifier.ts';
@@ -768,5 +769,46 @@ describe('observed MCP servers build mcpBreakdown (M12)', () => {
     const mcpRec = report.recommendations.find((r) => r.action.startsWith('MCP tools invoked'))!;
     expect(mcpRec).toBeDefined();
     expect(mcpRec.action).toContain('mcp__playwright__browser_click');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M13 — settings.json model discovery for the context-limit settings signal
+// ---------------------------------------------------------------------------
+
+describe('readSettingsModels (M13)', () => {
+  test('reads the user settings model', () => {
+    withTempHome((home) => {
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ model: 'claude-fable-5[1m]' }), 'utf-8');
+      expect(readSettingsModels()).toEqual(['claude-fable-5[1m]']);
+    });
+  });
+
+  test('project settings precede user settings, local first', () => {
+    withTempHome((home) => {
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ model: 'claude-fable-5[1m]' }), 'utf-8');
+      const project = join(home, 'proj');
+      mkdirSync(join(project, '.claude'), { recursive: true });
+      writeFileSync(join(project, '.claude', 'settings.json'), JSON.stringify({ model: 'claude-opus-4-8[1m]' }), 'utf-8');
+      writeFileSync(join(project, '.claude', 'settings.local.json'), JSON.stringify({ model: 'claude-sonnet-4-6' }), 'utf-8');
+      expect(readSettingsModels(project)).toEqual([
+        'claude-sonnet-4-6', 'claude-opus-4-8[1m]', 'claude-fable-5[1m]',
+      ]);
+    });
+  });
+
+  test('missing files, corrupt JSON, and non-string model fields are skipped', () => {
+    withTempHome((home) => {
+      expect(readSettingsModels()).toEqual([]);
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'settings.json'), '{ not json', 'utf-8');
+      expect(readSettingsModels()).toEqual([]);
+      writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ model: 42 }), 'utf-8');
+      expect(readSettingsModels()).toEqual([]);
+      writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ model: '  ' }), 'utf-8');
+      expect(readSettingsModels()).toEqual([]);
+    });
   });
 });
