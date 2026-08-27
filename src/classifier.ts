@@ -5,11 +5,15 @@
  * based on message role, content type, tool usage, and context.
  *
  * Classification precedence:
- *   1. S (System) — system messages, first message, CLAUDE.md markers
- *   2. U (User Input) — the last human text message only
- *   3. T (Tools) — tool_use and tool_result blocks (non-retrieval)
+ *   1. S (System) — system messages, first message, CLAUDE.md markers,
+ *      local-command wrappers (`<command-name>`, `<local-command-stdout>`)
+ *   2. U (User Input) — the last human text message only (see
+ *      `isHumanUserText`: machine-written user records never qualify)
+ *   3. T (Tools) — tool_use and tool_result blocks (non-retrieval),
+ *      background task notifications
  *   4. R (Retrieved) — tool results from read/search tools
- *   5. S (State/Memory) — memdir content, plans, skills, subagent summaries
+ *   5. S (State/Memory) — memdir content, plans, skill bodies (Skill
+ *      follow-ups via `sourceToolUseID`), subagent / workflow results
  *   6. C (Conversation) — all remaining human/assistant text messages
  */
 
@@ -72,6 +76,51 @@ const RETRIEVAL_TOOLS = new Set([
   'WebSearchTool',
   'NotebookEditTool',
 ]);
+
+/**
+ * Tools whose RESULTS are classified as State/Memory (S).
+ *
+ * These return another agent's summary of work rather than a file or a
+ * shell output: `Agent` (subagent run), `TaskOutput` (a background task's
+ * collected output), `Workflow` (a multi-step workflow's result). The header
+ * comment lists "subagent summaries" under State, and this is where they
+ * enter the JSONL. The calls themselves stay in Tools; only the results
+ * move. `Task` is the pre-rename subagent tool (legacy sessions).
+ */
+const STATE_TOOLS = new Set([
+  'Agent',
+  'TaskOutput',
+  'Workflow',
+  // Legacy name of the subagent tool before it became `Agent`
+  'Task',
+]);
+
+/**
+ * Leading markers that identify a user-role record Claude Code wrote
+ * itself. None of these were typed by the person at the keyboard:
+ *
+ * - `<task-notification>`: a background task / Workflow / ScheduleWakeup
+ *   completion that starts a new turn (classified as Tools)
+ * - `<local-command-stdout>`, `<local-command-caveat>`, `<command-name>`,
+ *   `<command-message>`: slash-command wrappers and their local output
+ *   (classified as System)
+ * - `[Request interrupted`: the stub written when the user hits Escape
+ *   (stays Conversation, but is never the U bucket and never a
+ *   "resolved exchange" confirmation)
+ *
+ * Matched against the start of the record's text after leading whitespace.
+ */
+const NON_HUMAN_USER_PREFIXES: ReadonlyArray<{ prefix: string; kind: NonHumanUserKind }> = [
+  { prefix: '<task-notification>', kind: 'task-notification' },
+  { prefix: '<local-command-stdout>', kind: 'local-command' },
+  { prefix: '<local-command-caveat>', kind: 'local-command' },
+  { prefix: '<command-name>', kind: 'local-command' },
+  { prefix: '<command-message>', kind: 'local-command' },
+  { prefix: '[Request interrupted', kind: 'interrupt' },
+];
+
+/** Kinds of machine-written user records recognised by their leading marker */
+type NonHumanUserKind = 'task-notification' | 'local-command' | 'interrupt';
 
 /** Keywords that indicate state/memory content */
 const STATE_MARKERS = [
@@ -327,10 +376,93 @@ function getToolNameForResult(
 }
 
 /**
+ * Concatenated text of a user-role record (string content, or the text
+ * blocks of an array). Tool results and media contribute nothing.
+ *
+ * @param msg - The session message
+ * @returns The record's text, empty when it carries none
+ */
+function userRecordText(msg: SessionMessage): string {
+  const content = msg.message?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const block of content) {
+    if (block.type === 'text' && block.text) text += block.text;
+  }
+  return text;
+}
+
+/**
+ * Identify a machine-written user record by its leading marker.
+ *
+ * @param msg - The session message
+ * @returns The record kind, or null when no marker matches
+ */
+function nonHumanUserKind(msg: SessionMessage): NonHumanUserKind | null {
+  const text = userRecordText(msg).trimStart();
+  if (!text) return null;
+  for (const entry of NON_HUMAN_USER_PREFIXES) {
+    if (text.startsWith(entry.prefix)) return entry.kind;
+  }
+  return null;
+}
+
+/**
+ * Whether a record is a prompt the person actually typed.
+ *
+ * Claude Code writes many `type: 'user'` records that are not human input:
+ * tool_result carriers, `isMeta` injections (skill bodies, scheduled
+ * re-prompts, `/context` dumps, image notes), Skill follow-up content
+ * (`sourceToolUseID`), compaction summaries, background task notifications,
+ * slash-command wrappers with their local stdout, and interrupt stubs. In
+ * the real corpus only ~70% of non-tool_result user records are typed
+ * prompts. Everything that picks "the user's message" (the U bucket, the
+ * analysis-cutoff trim, the resolved-exchange waste rule) goes through
+ * this one predicate so they agree.
+ *
+ * @param msg - The session message
+ * @returns True only for human-typed user text
+ */
+export function isHumanUserText(msg: SessionMessage): boolean {
+  if (msg.type !== 'user' || msg.message?.role !== 'user') return false;
+  if (hasToolResultBlocks(msg.message.content)) return false;
+  if (msg.isMeta === true) return false;
+  if (msg.isCompactSummary === true) return false;
+  if (typeof msg.sourceToolUseID === 'string' && msg.sourceToolUseID.length > 0) return false;
+  return nonHumanUserKind(msg) === null;
+}
+
+/**
+ * Classify a record that carries a tool's output by the tool's name.
+ *
+ * Shared by tool_result blocks and `sourceToolUseID` follow-ups so both
+ * paths apply the same RETRIEVAL_TOOLS / STATE_TOOLS rules.
+ *
+ * @param toolName - Originating tool name, undefined when unresolved
+ * @returns Category for the result plus the resolved tool name
+ */
+function classifyToolOutput(toolName: string | undefined): { category: CrustsCategory; toolName?: string } {
+  if (toolName && RETRIEVAL_TOOLS.has(toolName)) {
+    return { category: 'retrieved', toolName };
+  }
+  if (toolName && STATE_TOOLS.has(toolName)) {
+    return { category: 'state', toolName };
+  }
+  return { category: 'tools', toolName };
+}
+
+/**
  * Classify a single message into a CRUSTS category.
  *
  * Applies the classification rules in order of precedence:
  * System > User > Tools/Retrieved > State > Conversation.
+ *
+ * Machine-written user records are routed before the human-text rules:
+ * `sourceToolUseID` follow-ups go where their originating tool's output
+ * goes (Skill bodies to State), `<task-notification>` to Tools, and
+ * local-command wrappers to System. They can never become the U bucket
+ * because `isHumanUserText` rejects them.
  *
  * @param msg - The session message to classify
  * @param isLastHuman - Whether this is the last human text message in the session
@@ -359,14 +491,32 @@ export function classifyMessage(
 
   const content = msg.message?.content;
 
-  // Check if this is a real human text message or a tool_result carrier
-  const isHumanText = msg.type === 'user'
-    && msg.message?.role === 'user'
-    && !hasToolResultBlocks(content);
-
   // 2. User Input — only the last human TEXT message
-  if (isHumanText && isLastHuman) {
+  if (isLastHuman && isHumanUserText(msg)) {
     return { category: 'user' };
+  }
+
+  // 2b. Machine-written user records (no tool_result blocks)
+  if (msg.type === 'user' && msg.message?.role === 'user' && !hasToolResultBlocks(content)) {
+    // Follow-up content a tool injected as a user record. For `Skill` this
+    // is the skill body itself (hundreds of KB per record in real sessions)
+    // and belongs to State; any other tool follows the result rules.
+    if (typeof msg.sourceToolUseID === 'string' && msg.sourceToolUseID.length > 0) {
+      const toolName = toolUseIdMap.get(msg.sourceToolUseID);
+      if (toolName === 'Skill') {
+        return { category: 'state', toolName };
+      }
+      return classifyToolOutput(toolName);
+    }
+    const kind = nonHumanUserKind(msg);
+    if (kind === 'task-notification') {
+      return { category: 'tools' };
+    }
+    if (kind === 'local-command') {
+      return { category: 'system' };
+    }
+    // Interrupt stubs and unprefixed isMeta records fall through to the
+    // State / Conversation rules below.
   }
 
   // 3 & 4. Tool / Retrieved classification
@@ -387,13 +537,11 @@ export function classifyMessage(
   if (msg.type === 'user' && Array.isArray(content)) {
     const toolResultBlocks = content.filter((b) => b.type === 'tool_result');
     if (toolResultBlocks.length > 0) {
-      // Look up the originating tool name
+      // Look up the originating tool name; retrieval results are Retrieved,
+      // subagent / workflow results are State, the rest are Tools.
       const firstResult = toolResultBlocks[0];
       const toolName = firstResult ? getToolNameForResult(firstResult, toolUseIdMap) : undefined;
-      if (toolName && RETRIEVAL_TOOLS.has(toolName)) {
-        return { category: 'retrieved', toolName };
-      }
-      return { category: 'tools', toolName };
+      return classifyToolOutput(toolName);
     }
   }
 
@@ -544,20 +692,16 @@ function collectDeferredToolNames(messages: SessionMessage[]): string[] {
 /**
  * Find the index of the last real human text message.
  *
- * Identifies the last message with type "user" whose content is
- * actual user text (not a tool_result carrier).
+ * Identifies the last record that `isHumanUserText` accepts, so a trailing
+ * task notification, slash-command wrapper, skill body or interrupt stub
+ * never displaces the prompt the person actually typed.
  *
  * @param messages - All session messages
  * @returns Index of last human text message, or -1 if none found
  */
 function findLastHumanTextIndex(messages: SessionMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]!;
-    if (
-      msg.type === 'user'
-      && msg.message?.role === 'user'
-      && !hasToolResultBlocks(msg.message?.content)
-    ) {
+    if (isHumanUserText(messages[i]!)) {
       return i;
     }
   }
@@ -720,12 +864,11 @@ function findAnalysisCutoff(messages: SessionMessage[]): number {
     break;
   }
 
-  // Phase 3: Trim the preceding user text message that triggered this turn
-  if (end > 0) {
-    const prev = messages[end - 1]!;
-    if (prev.type === 'user' && !hasToolResultBlocks(prev.message?.content)) {
-      end = end - 1;
-    }
+  // Phase 3: Trim the preceding user text message that triggered this turn.
+  // Only a human-typed prompt is "about the analysis"; a task notification
+  // or command wrapper that happened to precede the call is session content.
+  if (end > 0 && isHumanUserText(messages[end - 1]!)) {
+    end = end - 1;
   }
 
   return end;

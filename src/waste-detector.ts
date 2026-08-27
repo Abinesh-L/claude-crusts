@@ -16,6 +16,7 @@ import type {
 } from './types.ts';
 import { loadWasteThresholds, describeThresholdOverrides } from './config.ts';
 import { effectiveInput } from './model-context.ts';
+import { isHumanUserText } from './classifier.ts';
 
 // Thresholds are bound at the top of `detectWaste` from user config (with
 // defaults from `config.ts`). Kept as module-level `let`s so the internal
@@ -359,6 +360,12 @@ function detectOversizedSystem(configData: ConfigData): WasteItem[] {
  * Detect resolved debug exchanges — conversation patterns where the
  * user confirmed resolution, making the preceding exchange compactable.
  *
+ * Only human-typed prompts (`isHumanUserText`) count as confirmations:
+ * interrupt stubs, slash-command stdout, task notifications and other
+ * records Claude Code writes under the user role are skipped, so machine
+ * text that happens to contain "looks good" or "nice" cannot flag the
+ * preceding exchange.
+ *
  * @param messages - All session messages
  * @param classified - Classified message data
  * @returns Array of waste items for resolved exchanges
@@ -372,15 +379,9 @@ function detectResolvedExchanges(
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
 
-    // Only check real user text messages
-    if (msg.type !== 'user') continue;
+    // Only check prompts the person actually typed
+    if (!isHumanUserText(msg)) continue;
     const content = msg.message?.content;
-    if (!content || typeof content !== 'string') {
-      if (!Array.isArray(content)) continue;
-      // Check text blocks in array content
-      const hasToolResult = content.some((b) => b.type === 'tool_result');
-      if (hasToolResult) continue;
-    }
 
     // Extract text from this message
     let text = '';
