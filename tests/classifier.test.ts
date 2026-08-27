@@ -108,11 +108,12 @@ const EMPTY_CONFIG: ConfigData = {
 };
 
 describe('Bug #9 — total_tokens uses API effective input', () => {
-  test('total_tokens reflects last assistant turn effective input, not content-sum', () => {
+  test('total_tokens reflects last assistant turn effective input plus its output, not content-sum', () => {
     // Content sum here is tiny (~25 tokens of "ok" text per turn). API says
-    // 350K (100 input + 350,000 cache_read + small cache_creation). Without
-    // the fix, displayed total_tokens was the content-sum; with the fix, it
-    // must be the API number.
+    // 350,100 effective input (100 input + 350,000 cache_read) plus the
+    // turn's own output (100): that response is in the window and gets
+    // re-sent on the next request (M14). Without the fix, displayed
+    // total_tokens was the content-sum; with the fix it is the API number.
     const msgs: SessionMessage[] = [
       userText('first user question'),
       assistantWithCache(100, 50_000),
@@ -120,10 +121,10 @@ describe('Bug #9 — total_tokens uses API effective input', () => {
       assistantWithCache(100, 350_000), // <- last turn, this is the authoritative window
     ];
     const b = classifySession(msgs, EMPTY_CONFIG);
-    expect(b.total_tokens).toBe(100 + 0 + 350_000);
+    expect(b.total_tokens).toBe(100 + 0 + 350_000 + 100);
     expect(b.contentSumTokens).toBeDefined();
     expect(b.contentSumTokens).toBeLessThan(b.total_tokens);
-    expect(b.usage_percentage).toBeCloseTo((350_100 / b.context_limit) * 100, 1);
+    expect(b.usage_percentage).toBeCloseTo((350_200 / b.context_limit) * 100, 1);
   });
 
   test('free_tokens is clamped at zero when effective input exceeds context_limit', () => {
@@ -136,7 +137,7 @@ describe('Bug #9 — total_tokens uses API effective input', () => {
       assistantWithCache(10, 1_500_000),
     ];
     const b = classifySession(msgs, EMPTY_CONFIG);
-    expect(b.total_tokens).toBe(1_500_010);
+    expect(b.total_tokens).toBe(1_500_010 + 100); // effective input + last output
     expect(b.total_tokens).toBeGreaterThan(b.context_limit);
     expect(b.free_tokens).toBe(0);
   });
@@ -163,13 +164,14 @@ describe('Bug #9 — total_tokens uses API effective input', () => {
       assistantWithCache(200, 120_000), // This is the last REAL one — must win
     ];
     const b = classifySession(msgs, EMPTY_CONFIG);
-    expect(b.total_tokens).toBe(120_200);
+    expect(b.total_tokens).toBe(120_200 + 100); // + the last turn's output (M14)
   });
 
   test('currentContext.total_tokens uses the last real assistant turn within the slice', () => {
     // Marker-based compaction at msg 2; post-compact slice starts at msg 3.
-    // The last assistant turn (index 5) carries 800K effective input — that's
-    // the slice's authoritative total, NOT the sum of per-message content.
+    // The last assistant turn (index 5) carries 800K effective input plus
+    // its 100-token output — that's the slice's authoritative total, NOT
+    // the sum of per-message content.
     const msgs: SessionMessage[] = [
       userText('q1'),
       assistantWithCache(100, 150_000),
@@ -180,7 +182,7 @@ describe('Bug #9 — total_tokens uses API effective input', () => {
     ];
     const b = classifySession(msgs, EMPTY_CONFIG);
     expect(b.currentContext).toBeDefined();
-    expect(b.currentContext!.total_tokens).toBe(800_000);
+    expect(b.currentContext!.total_tokens).toBe(800_000 + 100);
     expect(b.currentContext!.contentSumTokens).toBeDefined();
     expect(b.currentContext!.contentSumTokens).toBeLessThan(b.currentContext!.total_tokens);
   });
@@ -264,17 +266,19 @@ function nestedOnlyAssistant(tokens: number): SessionMessage {
 }
 
 describe('M4 usage drift: nested cache_creation and current usage shape', () => {
-  test('2.1.239 usage shape (iterations[], output_tokens_details, nested cache_creation) parses and total_tokens is the effective input', () => {
+  test('2.1.239 usage shape (iterations[], output_tokens_details, nested cache_creation) parses and total_tokens is effective input plus output', () => {
+    // 2 + 18,938 cc + 35,299 cr = 54,239 effective input, + 447 output (M14).
     const b = classifySession([userText('hi'), currentShapeAssistant()], EMPTY_CONFIG);
-    expect(b.total_tokens).toBe(54_239);
+    expect(b.total_tokens).toBe(54_686);
     expect(b.model).toBe('claude-fable-5');
     expect(b.modelHistory!.segments[0]!.cacheCreationTokens).toBe(18_938);
     expect(Number.isFinite(b.usage_percentage)).toBe(true);
   });
 
-  test('flat cache_creation 0 with ephemeral_1h 815,917 gives total_tokens 815,917 and a 1M window via the usage signal', () => {
+  test('flat cache_creation 0 with ephemeral_1h 815,917 counts the nested tokens and a 1M window via the usage signal', () => {
+    // 815,917 effective input (all nested) + the fixture's 447 output (M14).
     const b = classifySession([userText('hi'), nestedOnlyAssistant(815_917)], EMPTY_CONFIG);
-    expect(b.total_tokens).toBe(815_917);
+    expect(b.total_tokens).toBe(815_917 + 447);
     expect(b.context_limit).toBe(1_000_000);
     expect(b.usage_percentage).toBeLessThan(100);
     expect(b.modelHistory!.segments[0]!.cacheCreationTokens).toBe(815_917);
@@ -322,10 +326,11 @@ describe('M4 usage drift: nested cache_creation and current usage shape', () => 
   test('cache-overhead waste rule sees nested cache_read ratio through the same helper', () => {
     // Sanity: nested-only usage must not produce NaN ratios downstream.
     // The fixture model is a bare claude-fable-5, which the M13 native-1M
-    // table resolves to a 1,000,000-token window (50K used, 950K free).
+    // table resolves to a 1,000,000-token window. Window total = 50,000
+    // effective input + 447 output (M14), so free = 1,000,000 - 50,447.
     const b = classifySession([userText('hi'), nestedOnlyAssistant(50_000)], EMPTY_CONFIG);
     expect(Number.isFinite(b.free_tokens)).toBe(true);
-    expect(b.free_tokens).toBe(950_000);
+    expect(b.free_tokens).toBe(949_553);
   });
 });
 

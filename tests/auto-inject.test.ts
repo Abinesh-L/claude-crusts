@@ -37,18 +37,70 @@ describe('shouldInject', () => {
     if (!d.inject) expect(d.reason).toContain('disabled');
   });
 
-  test('refuses when usage is below threshold', () => {
-    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 70 };
+  test('explicit threshold: refuses when usage is below it', () => {
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 70, thresholdExplicit: true };
     const d = shouldInject(breakdownAt(65), cfg, 'sid');
     expect(d.inject).toBe(false);
     if (!d.inject) expect(d.reason).toContain('threshold');
   });
 
-  test('injects when usage crosses threshold and min-gap elapsed', () => {
-    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 70, minGapMs: 1000 };
+  test('explicit threshold: injects when usage crosses it and min-gap elapsed', () => {
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 70, thresholdExplicit: true, minGapMs: 1000 };
     const d = shouldInject(breakdownAt(85), cfg, 'sid');
     expect(d.inject).toBe(true);
     if (d.inject) expect(d.usagePercent).toBe(85);
+  });
+
+  test('explicit threshold 47 still injects at modest usage (fixed-percentage gate honoured)', () => {
+    // A user who pinned a low threshold keeps that behaviour; the headroom
+    // default must not silently replace an explicit config.json choice.
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 47, thresholdExplicit: true };
+    const d = shouldInject(breakdownAt(50), cfg, 'sid');
+    expect(d.inject).toBe(true);
+    if (d.inject) expect(d.usagePercent).toBe(50);
+  });
+
+  test('default gate: 200K window at 65% (130K) is short of the headroom gate', () => {
+    // Gate = autocompactTrigger(200K) - max(20K, 10% of 200K)
+    //      = 167,000 - 20,000 = 147,000 tokens.
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    const d = shouldInject(breakdownAt(65), cfg, 'sid');
+    expect(d.inject).toBe(false);
+    if (!d.inject) expect(d.reason).toContain('headroom gate');
+  });
+
+  test('default gate: 200K window at 75% (150K) is inside the headroom margin and injects', () => {
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    const d = shouldInject(breakdownAt(75), cfg, 'sid');
+    expect(d.inject).toBe(true);
+  });
+
+  test('default gate: 1M window at 70% does NOT inject (still 267K clear of the trigger)', () => {
+    // 700,000 tokens on 1M: trigger 967,000, margin max(20K, 100K) = 100K,
+    // gate 867,000. The old 70%-of-window default fired here pointlessly.
+    const bd = breakdownAt(70, { context_limit: 1_000_000, total_tokens: 700_000, usage_percentage: 70 });
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    const d = shouldInject(bd, cfg, 'sid');
+    expect(d.inject).toBe(false);
+    if (!d.inject) expect(d.reason).toContain('headroom gate');
+  });
+
+  test('default gate: 1M window at 90% (900K) is past the gate and injects', () => {
+    const bd = breakdownAt(90, { context_limit: 1_000_000, total_tokens: 900_000, usage_percentage: 90 });
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    const d = shouldInject(bd, cfg, 'sid');
+    expect(d.inject).toBe(true);
+    if (d.inject) expect(d.usagePercent).toBe(90);
+  });
+
+  test('default gate honours a custom autocompact buffer (bufferTokens param)', () => {
+    // Buffer 53K on 200K: trigger 147,000, gate 127,000; 130K now injects
+    // even though it refused under the default 33K buffer.
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    const refused = shouldInject(breakdownAt(65), cfg, 'sid');
+    expect(refused.inject).toBe(false);
+    const d = shouldInject(breakdownAt(65), cfg, 'sid', Date.now(), 53_000);
+    expect(d.inject).toBe(true);
   });
 
   test('refuses when min-gap has not elapsed (same session)', () => {
@@ -137,6 +189,39 @@ describe('buildInjectionText', () => {
     const text = buildInjectionText(breakdownAt(80), waste, 80);
     expect(text).toContain('2,300');
     expect(text).toContain('reclaimable');
+  });
+
+  test('advisory prefix is exactly [claude-crusts advisory] and stays on the first line', () => {
+    const text = buildInjectionText(breakdownAt(80), [], 80);
+    expect(text.startsWith('[claude-crusts advisory] ')).toBe(true);
+  });
+
+  test('explains the 33K headroom trigger instead of the old flat 80% claim', () => {
+    const text = buildInjectionText(breakdownAt(80), [], 80);
+    expect(text).toContain('33K');
+    expect(text).not.toContain('reaches 80%');
+  });
+
+  test('dominant-categories fallback reads currentContext buckets when present', () => {
+    // Lifetime buckets say conversation/tools; the live window is dominated
+    // by state. The advisory describes the CURRENT context, so the state
+    // bucket must be the one surfaced.
+    const bd = breakdownAt(50, {
+      currentContext: {
+        buckets: [
+          { category: 'state', tokens: 90_000, percentage: 60, accuracy: 'estimated' },
+          { category: 'retrieved', tokens: 45_000, percentage: 30, accuracy: 'estimated' },
+          { category: 'user', tokens: 15_000, percentage: 10, accuracy: 'estimated' },
+        ],
+        total_tokens: 150_000,
+        free_tokens: 50_000,
+        usage_percentage: 75,
+        startIndex: 0,
+      },
+    } as Partial<CrustsBreakdown>);
+    const text = buildInjectionText(bd, [], 75);
+    expect(text).toContain('state 60%');
+    expect(text).not.toContain('conversation 40%');
   });
 });
 

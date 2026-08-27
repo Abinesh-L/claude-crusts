@@ -2,13 +2,15 @@
  * Hook-triggered auto-injection — "your context self-heals when it gets hot."
  *
  * When installed, crusts runs on every Claude Code `UserPromptSubmit`
- * event. It classifies the live session; if usage has crossed the
- * configured threshold (default 70%) and the last injection was more
- * than `minGapMs` ago (default 5 min), it emits a `UserPromptSubmit`
- * hook response with an `additionalContext` field. Claude Code prepends
- * that text to the prompt Claude sees — so the model receives a
- * specific `/compact focus` recommendation tuned to THIS session's
- * actual waste, without the user having to paste anything.
+ * event. It classifies the live session; if the window is close enough to
+ * Claude Code's auto-compaction trigger (within `max(20K, 10% of limit)`
+ * tokens of `autocompactTrigger(limit)`; or, when the user explicitly set
+ * `autoInject.threshold` in config.json, past that usage percentage) and
+ * the last injection was more than `minGapMs` ago (default 5 min), it
+ * emits a `UserPromptSubmit` hook response with an `additionalContext`
+ * field. Claude Code prepends that text to the prompt Claude sees — so
+ * the model receives a specific `/compact focus` recommendation tuned to
+ * THIS session's actual waste, without the user having to paste anything.
  *
  * The hook is fire-and-forget: on any error, it exits silently with
  * code 0 so a bug in crusts never blocks the user's prompt.
@@ -20,7 +22,8 @@ import { parseSession } from './scanner.ts';
 import { gatherConfigData } from './analyzer.ts';
 import { classifySession } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
-import { loadAutoInjectConfig, recordInjection } from './config.ts';
+import { loadAutoInjectConfig, loadAutocompactBufferTokens, recordInjection } from './config.ts';
+import { autocompactTrigger, AUTOCOMPACT_BUFFER_TOKENS } from './model-context.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
 import type { CrustsBreakdown, WasteItem } from './types.ts';
 
@@ -139,20 +142,47 @@ export type InjectDecision =
  *
  * Checks (in order):
  *   1. config.enabled — opted in
- *   2. usage percent ≥ threshold
+ *   2. the hotness gate:
+ *      - explicit `autoInject.threshold` in config.json → usage percent
+ *        ≥ threshold (the user's choice is honoured verbatim);
+ *      - otherwise (default) → headroom-based: the live window is within
+ *        `max(20K, 10% of limit)` tokens of the auto-compaction trigger
+ *        (`limit - buffer`). A percentage default cannot serve both window
+ *        sizes: 70% of 1M is still 267K clear of the trigger, while 70% of
+ *        200K is genuinely close to it.
  *   3. min-gap elapsed since last injection (or last was a different session)
+ *
+ * @param breakdown - Live session breakdown (currentContext preferred)
+ * @param config - Auto-inject config from `loadAutoInjectConfig`
+ * @param sessionId - Session receiving the prompt
+ * @param now - Clock override for tests (ms since epoch)
+ * @param bufferTokens - Auto-compaction buffer; callers honouring the
+ *   user's config override pass `loadAutocompactBufferTokens()`
  */
 export function shouldInject(
   breakdown: CrustsBreakdown,
   config: ReturnType<typeof loadAutoInjectConfig>,
   sessionId: string,
   now: number = Date.now(),
+  bufferTokens: number = AUTOCOMPACT_BUFFER_TOKENS,
 ): InjectDecision {
   if (!config.enabled) return { inject: false, reason: 'disabled' };
 
-  const usage = breakdown.currentContext?.usage_percentage ?? breakdown.usage_percentage;
-  if (usage < config.threshold) {
-    return { inject: false, reason: `usage ${usage.toFixed(1)}% < threshold ${config.threshold}%` };
+  const ctx = breakdown.currentContext ?? breakdown;
+  const usage = ctx.usage_percentage;
+  if (config.thresholdExplicit) {
+    if (usage < config.threshold) {
+      return { inject: false, reason: `usage ${usage.toFixed(1)}% < threshold ${config.threshold}%` };
+    }
+  } else {
+    const limit = breakdown.context_limit;
+    const gate = autocompactTrigger(limit, bufferTokens) - Math.max(20_000, 0.10 * limit);
+    if (ctx.total_tokens < gate) {
+      return {
+        inject: false,
+        reason: `window ${ctx.total_tokens.toLocaleString()} tokens < headroom gate ${Math.round(gate).toLocaleString()} (auto-compact trigger minus margin)`,
+      };
+    }
   }
 
   if (config.lastInjectionAt && config.lastInjectionSessionId === sessionId) {
@@ -199,9 +229,13 @@ export function buildInjectionText(
 
   const saveable = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
+  // Read the live window's buckets: post-compaction sessions keep lifetime
+  // buckets on the top-level breakdown, but the advisory describes the
+  // CURRENT context, so prefer currentContext when it exists.
+  const bucketSource = (breakdown.currentContext ?? breakdown).buckets;
   const headerTail = saveable > 0
     ? ` ~${saveable.toLocaleString()} tokens of reclaimable waste identified.`
-    : ` Dominant categories: ${breakdown.buckets.slice(0, 3).map((b) => `${b.category} ${b.percentage.toFixed(0)}%`).join(', ')}.`;
+    : ` Dominant categories: ${bucketSource.slice(0, 3).map((b) => `${b.category} ${b.percentage.toFixed(0)}%`).join(', ')}.`;
 
   const lines = [
     `[claude-crusts advisory] Context is at ${usagePercent.toFixed(1)}%.${headerTail}`,
@@ -210,7 +244,7 @@ export function buildInjectionText(
     ``,
     `    ${compactLine}`,
     ``,
-    `Why now: if the session reaches 80%, Claude Code's auto-compaction fires mid-turn and summarises aggressively — dropping more than this targeted command would. Running this compact first lets the user keep control of what stays and what gets cleared.`,
+    `Why now: Claude Code auto-compacts when about 33K tokens of headroom remain (about 83.5% of a 200K window, 96.7% of 1M); it summarises aggressively and drops more than this targeted command would. Running this compact first lets the user keep control of what stays and what gets cleared.`,
     ``,
     `Files dropped by /compact remain on disk. Re-read any that become relevant later. \`claude-crusts lost\` inspects what the compaction dropped.`,
   ];
@@ -261,7 +295,7 @@ export async function runAutoInject(): Promise<void> {
     const breakdown = classifySession(messages, configData, undefined, payload.model?.id);
 
     const sessionId = payload.session_id ?? basename(transcriptPath).replace(/\.jsonl$/, '');
-    const decision = shouldInject(breakdown, config, sessionId);
+    const decision = shouldInject(breakdown, config, sessionId, Date.now(), loadAutocompactBufferTokens());
     if (!decision.inject) return;
 
     const waste = detectWaste(messages, breakdown, configData);

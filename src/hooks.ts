@@ -257,7 +257,9 @@ export function enableAutoInject(): void {
   console.log(chalk.dim('  When this session\'s context crosses the threshold, CRUSTS adds a /compact focus'));
   console.log(chalk.dim('  advisory to Claude\'s next turn. Claude decides whether to act on it — CRUSTS'));
   console.log(chalk.dim('  never runs /compact directly, so your work is never auto-compacted.'));
-  console.log(chalk.dim('  Defaults: threshold 70%, min-gap 5min. Override in ~/.claude-crusts/config.json under "autoInject".'));
+  console.log(chalk.dim('  Defaults: fires when the window nears the auto-compaction trigger (within max(20K, 10% of limit)'));
+  console.log(chalk.dim('  tokens of it), min-gap 5min. Set an explicit "threshold" (usage %) in ~/.claude-crusts/config.json'));
+  console.log(chalk.dim('  under "autoInject" to use a fixed percentage gate instead.'));
   console.log(chalk.dim('  Disable anytime: `claude-crusts hooks auto-inject disable`.'));
 }
 

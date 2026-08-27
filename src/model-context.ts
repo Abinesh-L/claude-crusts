@@ -32,6 +32,36 @@ import { parseContextWindowSize } from './calibrator.ts';
 export const DEFAULT_CONTEXT_LIMIT = 200_000;
 
 /**
+ * Headroom Claude Code reserves before firing auto-compaction, in tokens.
+ *
+ * Auto-compaction is a fixed token buffer below the window size, not a
+ * percentage: observed auto-compaction preTokens sit just under
+ * `limit - 33,000` on both 200K and 1M windows (triggers at ~167,000 and
+ * ~967,000 respectively, i.e. ~83.5% of 200K but ~96.7% of 1M). The old
+ * flat-80% model was only coincidentally close on 200K windows and far off
+ * on 1M. Users can override the buffer per-install with the
+ * `autocompactBufferTokens` key in `~/.claude-crusts/config.json`
+ * (see `loadAutocompactBufferTokens` in config.ts).
+ */
+export const AUTOCOMPACT_BUFFER_TOKENS = 33_000;
+
+/**
+ * Token level at which Claude Code's auto-compaction fires for a window.
+ *
+ * @param limit - Context-window size in tokens (e.g. 200,000 or 1,000,000)
+ * @param bufferTokens - Reserved headroom in tokens; defaults to
+ *   `AUTOCOMPACT_BUFFER_TOKENS`. Callers honouring the user's config
+ *   override pass `loadAutocompactBufferTokens()` here.
+ * @returns The trigger level in tokens (clamped at zero for tiny windows)
+ */
+export function autocompactTrigger(
+  limit: number,
+  bufferTokens: number = AUTOCOMPACT_BUFFER_TOKENS,
+): number {
+  return Math.max(0, limit - bufferTokens);
+}
+
+/**
  * Pattern table mapping model-ID substrings to their context-window size.
  *
  * Evaluated in order; the first match wins. The `[1m]` pattern covers

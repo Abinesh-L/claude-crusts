@@ -1561,8 +1561,14 @@ function detectViaHeuristic(messages: SessionMessage[]): CompactionEvent[] {
  * assistant turn's API-reported usage.
  *
  * `effectiveInput(usage)` (input + reconciled cache_creation + cache_read)
- * is what Claude Code sent to the API on that turn — the bounded, correct
- * number. The classifier's per-message content-sum diverges from this: it
+ * is what Claude Code sent to the API on that turn. The turn's own
+ * `output_tokens` is added on top: that response is already part of the
+ * window and is re-sent on the next request. Observed auto-compaction
+ * `preTokens` decompose exactly as input + cache_creation + cache_read +
+ * output (+ the pending turn), so leaving the last output out consistently
+ * under-reports the live window by one response.
+ *
+ * The classifier's per-message content-sum diverges from this: it
  * under-reports short sessions (cached prior conversation re-sent each turn
  * is a single API hit but isn't classified per message) and over-reports
  * long multi-compact sessions (every per-turn output accumulates even though
@@ -1570,13 +1576,15 @@ function detectViaHeuristic(messages: SessionMessage[]): CompactionEvent[] {
  *
  * Walks backward from the end of the slice so we always pick the latest
  * state. Skips synthetic assistants (which are compaction-summary markers,
- * not real API turns with usage).
+ * not real API turns with usage). Split lines of one API response share
+ * identical usage, so whichever line of the last group is hit first yields
+ * the same total.
  *
  * @param messages - Session messages to scan (typically `effectiveMessages`)
  * @param fromIndex - Don't look earlier than this index. 0 for whole-session,
  *   `currentContext.startIndex` for the post-last-compaction slice.
- * @returns Effective input in tokens, or null if no usable assistant turn
- *   exists in the range.
+ * @returns Window total in tokens (effective input plus the turn's output),
+ *   or null if no usable assistant turn exists in the range.
  */
 function computeEffectiveInputTokens(
   messages: SessionMessage[],
@@ -1589,7 +1597,7 @@ function computeEffectiveInputTokens(
     const usage = msg.message?.usage;
     if (!usage) continue;
     const effective = effectiveInput(usage);
-    if (effective > 0) return effective;
+    if (effective > 0) return effective + (usage.output_tokens ?? 0);
   }
   return null;
 }

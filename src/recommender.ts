@@ -18,13 +18,25 @@ import type {
 } from './types.ts';
 import { buildCompactFocus } from './optimizer.ts';
 import { countAnalyzedMessages } from './classifier.ts';
+import { autocompactTrigger } from './model-context.ts';
+import { loadAutocompactBufferTokens } from './config.ts';
 
 /**
- * Auto-compaction triggers at ~80% of context window.
- * Approximate — actual trigger is at turn boundaries, so heavy turns
- * (e.g. multiple file reads) can overshoot to ~85-90% before compaction fires.
+ * Resolve the auto-compaction trigger level for this breakdown's window.
+ *
+ * Auto-compaction fires when the reserved headroom buffer is exhausted:
+ * `limit - buffer` tokens (167,000 on a 200K window, 967,000 on 1M), not at
+ * a flat 80%. The buffer honours the user's `autocompactBufferTokens`
+ * config override. Approximate at the edges: the actual trigger lands on
+ * turn boundaries, so a heavy turn can overshoot before compaction fires.
+ *
+ * @param breakdown - The CRUSTS breakdown (supplies `context_limit`)
+ * @returns The trigger level in tokens plus the buffer used to compute it
  */
-const COMPACTION_THRESHOLD = 0.80;
+function resolveAutocompactTrigger(breakdown: CrustsBreakdown): { trigger: number; bufferTokens: number } {
+  const bufferTokens = loadAutocompactBufferTokens();
+  return { trigger: autocompactTrigger(breakdown.context_limit, bufferTokens), bufferTokens };
+}
 
 /** Context health thresholds */
 const HEALTH_THRESHOLDS = {
@@ -65,13 +77,13 @@ function estimateMessagesUntilCompaction(breakdown: CrustsBreakdown): number | n
   const msgCount = countAnalyzedMessages(rows);
   if (msgCount === 0) return null;
 
-  const compactionLimit = breakdown.context_limit * COMPACTION_THRESHOLD;
-  if (ctx.total_tokens >= compactionLimit) return 0;
+  const { trigger } = resolveAutocompactTrigger(breakdown);
+  if (ctx.total_tokens >= trigger) return 0;
 
   const avgTokensPerMessage = ctx.total_tokens / msgCount;
   if (avgTokensPerMessage <= 0) return null;
 
-  return Math.floor((compactionLimit - ctx.total_tokens) / avgTokensPerMessage);
+  return Math.floor((trigger - ctx.total_tokens) / avgTokensPerMessage);
 }
 
 // ---------------------------------------------------------------------------
@@ -226,28 +238,29 @@ function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendati
     : breakdown.messages.length;
   if (msgCount === 0) return [];
 
-  const threshold = breakdown.context_limit * COMPACTION_THRESHOLD;
+  const { trigger, bufferTokens } = resolveAutocompactTrigger(breakdown);
+  const bufferK = `${Math.round(bufferTokens / 1000)}K`;
   const avgPerMsg = ctx.total_tokens / msgCount;
   const remaining = avgPerMsg > 0
-    ? Math.floor((threshold - ctx.total_tokens) / avgPerMsg)
+    ? Math.floor((trigger - ctx.total_tokens) / avgPerMsg)
     : null;
 
   if (remaining === null) return [];
   if (remaining <= 0) {
     return [{
       priority: 1,
-      action: 'Context PAST compaction threshold — act now',
+      action: 'Context PAST the auto-compaction trigger, act now',
       impact: 0,
-      reason: `At ${ctx.total_tokens.toLocaleString()}/${threshold.toLocaleString()} (${(ctx.total_tokens / threshold * 100).toFixed(0)}% of 80% limit). Options: (A) /compact now, (B) /clear to start fresh, (C) let auto-compact handle it (loses context quality).`,
+      reason: `At ${ctx.total_tokens.toLocaleString()}/${trigger.toLocaleString()} tokens; auto-compact fires when about ${bufferK} tokens of headroom remain. Options: (A) /compact now, (B) /clear to start fresh, (C) let auto-compact handle it (loses context quality).`,
     }];
   }
 
   if (remaining < 20) {
     return [{
       priority: 2,
-      action: `~${remaining} messages until auto-compaction — act soon`,
+      action: `~${remaining} messages until auto-compaction, act soon`,
       impact: 0,
-      reason: `${ctx.total_tokens.toLocaleString()} tokens, ~${Math.round(avgPerMsg)} per message, threshold at ${threshold.toLocaleString()}. Options: (A) /compact to stay ahead, (B) /clear between tasks, (C) continue — auto-compact will trigger at ~80%.`,
+      reason: `${ctx.total_tokens.toLocaleString()} tokens, ~${Math.round(avgPerMsg)} per message, auto-compact trigger at ${trigger.toLocaleString()} (window minus the ${bufferK}-token headroom buffer). Options: (A) /compact to stay ahead, (B) /clear between tasks, (C) continue and let auto-compact fire.`,
     }];
   }
 

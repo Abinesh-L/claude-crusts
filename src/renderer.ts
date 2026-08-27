@@ -27,6 +27,8 @@ import type {
   TrendSummary,
 } from './types.ts';
 import type { LostAnalysis, CompactionLoss, LostItem } from './lost-detector.ts';
+import { autocompactTrigger } from './model-context.ts';
+import { loadAutocompactBufferTokens } from './config.ts';
 
 // ---------------------------------------------------------------------------
 // Color scheme
@@ -420,18 +422,19 @@ export function renderTimeline(
 
   console.log(table.toString());
 
-  // Compaction prediction
-  const compactionTokens = contextLimit * 0.80;
+  // Compaction prediction: auto-compaction fires when the reserved headroom
+  // buffer is exhausted (limit minus ~33K, config-overridable), not at 80%.
+  const compactionTokens = autocompactTrigger(contextLimit, loadAutocompactBufferTokens());
   if (classified.length > 0) {
     const last = classified[classified.length - 1]!;
     if (last.cumulativeTokens < compactionTokens) {
       const avgPerMsg = last.cumulativeTokens / classified.length;
       if (avgPerMsg > 0) {
         const remaining = Math.floor((compactionTokens - last.cumulativeTokens) / avgPerMsg);
-        console.log(chalk.dim(`\n  Compaction predicted at message ~${classified.length + remaining} (80% = ${compactionTokens.toLocaleString()} tokens)`));
+        console.log(chalk.dim(`\n  Compaction predicted at message ~${classified.length + remaining} (auto-compact trigger = ${compactionTokens.toLocaleString()} tokens)`));
       }
     } else {
-      console.log(chalk.red(`\n  Context already past compaction threshold (80% = ${compactionTokens.toLocaleString()} tokens)`));
+      console.log(chalk.red(`\n  Context already past the auto-compact trigger (${compactionTokens.toLocaleString()} tokens)`));
     }
   }
   console.log();

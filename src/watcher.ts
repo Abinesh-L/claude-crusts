@@ -46,9 +46,6 @@ const CAT_COLOR: Record<CrustsCategory, (s: string) => string> = {
   state: chalk.white,
 };
 
-/** Compaction threshold */
-const COMPACTION_THRESHOLD = 0.80;
-
 /** Health thresholds */
 const HEALTH_THRESHOLDS = { healthy: 50, warming: 70, hot: 85 };
 
