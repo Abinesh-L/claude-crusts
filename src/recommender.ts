@@ -17,6 +17,7 @@ import type {
   FixPrompts,
 } from './types.ts';
 import { buildCompactFocus } from './optimizer.ts';
+import { countAnalyzedMessages } from './classifier.ts';
 
 /**
  * Auto-compaction triggers at ~80% of context window.
@@ -49,16 +50,19 @@ function getContextHealth(usagePercent: number): ContextHealth {
  * Estimate how many more messages can be sent before auto-compaction.
  *
  * Uses the average tokens per message from the current context window
- * (post-compaction if applicable) for more accurate projection.
+ * (post-compaction if applicable) for more accurate projection. Attachment
+ * rows are excluded from the message count so injected context does not
+ * dilute the per-message average.
  *
  * @param breakdown - The CRUSTS breakdown
  * @returns Estimated messages remaining, or null if can't calculate
  */
 function estimateMessagesUntilCompaction(breakdown: CrustsBreakdown): number | null {
   const ctx = breakdown.currentContext ?? breakdown;
-  const msgCount = breakdown.currentContext
-    ? breakdown.messages.length - breakdown.currentContext.startIndex
-    : breakdown.messages.length;
+  const rows = breakdown.currentContext
+    ? breakdown.messages.slice(breakdown.currentContext.startIndex)
+    : breakdown.messages;
+  const msgCount = countAnalyzedMessages(rows);
   if (msgCount === 0) return null;
 
   const compactionLimit = breakdown.context_limit * COMPACTION_THRESHOLD;

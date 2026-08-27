@@ -16,7 +16,7 @@ import {
   readSkillsConfig,
   getBuiltInToolList,
 } from './scanner.ts';
-import { classifySession } from './classifier.ts';
+import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
 import { generateRecommendations } from './recommender.ts';
 import { loadCalibration, compareWithEstimates } from './calibrator.ts';
@@ -131,7 +131,8 @@ export async function analyzeSession(
   const result: AnalysisResult = {
     sessionId,
     project,
-    messageCount: breakdown.messages.length,
+    // Attachment rows are injected content, not messages
+    messageCount: countAnalyzedMessages(breakdown.messages),
     breakdown,
     waste,
     recommendations,

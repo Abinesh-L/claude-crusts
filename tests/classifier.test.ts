@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { classifySession, detectCompactionEvents, estimateAttachmentTokens, isHumanUserText, IMAGE_BLOCK_TOKENS } from '../src/classifier.ts';
+import { classifySession, countAnalyzedMessages, detectCompactionEvents, estimateAttachmentTokens, isHumanUserText, IMAGE_BLOCK_TOKENS } from '../src/classifier.ts';
 import { detectWaste } from '../src/waste-detector.ts';
 import type { SessionMessage, ConfigData, TokenUsage, ContentBlock, CrustsCategory } from '../src/types.ts';
 
@@ -1263,5 +1263,195 @@ describe('M10: derived fixed context', () => {
     expect(estimateAttachmentTokens(att({ type: 'skill_listing', skills: [{ content: 's'.repeat(20) }, { content: 's'.repeat(20) }] }))).toBe(10);
     expect(estimateAttachmentTokens(att({ type: 'queued_command', prompt: 'p'.repeat(40) }))).toBe(10);
     expect(estimateAttachmentTokens({ type: 'user', message: { role: 'user', content: 'hi' } } as SessionMessage)).toBe(0);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// M11: attachment records are kept and classified
+// ---------------------------------------------------------------------------
+
+/** Attachment record fixture: `chars` characters of payload text under `content`. */
+function attachment(type: string, chars = 40, payload: Record<string, unknown> = {}): SessionMessage {
+  return {
+    type: 'attachment',
+    attachment: { type, content: 'x'.repeat(chars), ...payload },
+  } as SessionMessage;
+}
+
+/** CRUSTS auto-inject advisory as Claude Code records it (content is a string array). */
+function advisoryAttachment(): SessionMessage {
+  return {
+    type: 'attachment',
+    attachment: {
+      type: 'hook_additional_context',
+      hookName: 'UserPromptSubmit',
+      content: ['[claude-crusts advisory] Context is at 71.2%. ~12,000 tokens of reclaimable waste identified.'],
+    },
+  } as SessionMessage;
+}
+
+describe('M11 attachment classification: attachment.type maps to a category', () => {
+  const msgs: SessionMessage[] = [
+    userText('start'),                      // 0  user (last human)
+    attachment('task_reminder'),            // 1  state
+    attachment('plan_mode_exit'),           // 2  state  (plan_mode* prefix)
+    attachment('plan_file_reference'),      // 3  state
+    attachment('skill_listing'),            // 4  system
+    attachment('hook_additional_context'),  // 5  system (no advisory marker)
+    attachment('date_change'),              // 6  system
+    attachment('ultra_effort_enter'),       // 7  system (ultra_effort_* prefix)
+    attachment('file'),                     // 8  retrieved
+    attachment('edited_text_file'),         // 9  retrieved
+    attachment('read_truncation_notice'),   // 10 retrieved
+    attachment('queued_command'),           // 11 conversation
+    attachment('context_tip'),              // 12 system (unknown type default)
+    assistant(1_000),                       // 13 conversation
+  ];
+
+  test('categories follow the M11 table including prefix families and the unknown default', () => {
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const expected: Array<[number, CrustsCategory]> = [
+      [1, 'state'], [2, 'state'], [3, 'state'],
+      [4, 'system'], [5, 'system'], [6, 'system'], [7, 'system'],
+      [8, 'retrieved'], [9, 'retrieved'], [10, 'retrieved'],
+      [11, 'conversation'],
+      [12, 'system'],
+    ];
+    for (const [index, category] of expected) {
+      expect(b.messages[index]!.category).toBe(category);
+    }
+  });
+
+  test('attachment rows carry estimated payload tokens, the isAttachment flag, and a type preview', () => {
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const row = b.messages[1]!;
+    expect(row.tokens).toBe(10); // 40 chars / 4
+    expect(row.accuracy).toBe('estimated');
+    expect(row.isAttachment).toBe(true);
+    expect(row.contentPreview).toBe('[attachment: task_reminder]');
+    expect(b.messages[13]!.isAttachment).toBeUndefined();
+  });
+
+  test('attachment tokens land in their buckets', () => {
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.buckets.find((x) => x.category === 'state')!.tokens).toBe(30);
+    expect(b.buckets.find((x) => x.category === 'retrieved')!.tokens).toBe(30);
+    expect(b.buckets.find((x) => x.category === 'system')!.tokens).toBe(50);
+  });
+
+  test('countAnalyzedMessages excludes attachment rows (messageCount basis)', () => {
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages.length).toBe(14);
+    expect(countAnalyzedMessages(b.messages)).toBe(2);
+  });
+
+  test('a leading attachment does not steal the first-message system rule', () => {
+    const b = classifySession([
+      attachment('hook_success'),
+      userText('Contents of CLAUDE.md (project instructions)'),
+      assistant(1_000),
+    ], EMPTY_CONFIG);
+    expect(b.messages[0]!.category).toBe('system'); // hook_success attachment
+    expect(b.messages[1]!.category).toBe('system'); // first API record, CLAUDE.md marker
+  });
+
+  test('a real-shaped task_reminder (object item array) estimates tokens and lands in State', () => {
+    // Claude Code writes task_reminder content as an array of task objects
+    // ({id, subject, description}), not strings; their string fields are
+    // the injected text. 1 + 39 + 80 = 120 chars -> 30 tokens.
+    const reminder = {
+      type: 'attachment',
+      attachment: {
+        type: 'task_reminder',
+        content: [{ id: '1', subject: 's'.repeat(39), description: 'd'.repeat(80) }],
+        itemCount: 1,
+      },
+    } as SessionMessage;
+    const b = classifySession([userText('go'), reminder, assistant(1_000)], EMPTY_CONFIG);
+    const row = b.messages[1]!;
+    expect(row.category).toBe('state');
+    expect(row.tokens).toBe(30);
+  });
+
+  test('a trailing attachment never becomes the U bucket', () => {
+    const b = classifySession([
+      userText('please fix the parser'),
+      assistant(1_000),
+      attachment('queued_command', 40, { prompt: 'next prompt' }),
+    ], EMPTY_CONFIG);
+    expect(b.messages[0]!.category).toBe('user');
+    expect(b.messages[2]!.category).toBe('conversation');
+  });
+});
+
+describe('M11 findAnalysisCutoff strips the CRUSTS auto-inject advisory', () => {
+  const base = [userText('hello'), assistant(1_000)];
+
+  test('advisory between the triggering prompt and the CRUSTS call is trimmed with the invocation', () => {
+    const b = classifySession([
+      ...base,
+      userText('run crusts'),
+      advisoryAttachment(),
+      assistantText('running the analysis now', 10),
+      toolUse('Bash', 'adv1', { command: 'npx claude-crusts analyze' }),
+      toolResult('adv1', CRUSTS_OUTPUT),
+    ], EMPTY_CONFIG);
+    expect(b.messages.length).toBe(base.length);
+  });
+
+  test('a trailing advisory alone is trimmed but the real prompt keeps the U bucket', () => {
+    const b = classifySession([
+      userText('q1'),
+      assistant(1_000),
+      userText('q2'),
+      advisoryAttachment(),
+    ], EMPTY_CONFIG);
+    expect(b.messages.length).toBe(3);
+    expect(b.messages[2]!.category).toBe('user');
+  });
+
+  test('a mid-session advisory is kept and classified as System', () => {
+    const msgs = [userText('q1'), advisoryAttachment(), assistant(1_000), userText('q2'), assistant(1_100)];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages.length).toBe(msgs.length);
+    const row = b.messages[1]!;
+    expect(row.category).toBe('system');
+    expect(row.isAttachment).toBe(true);
+    expect(row.tokens).toBeGreaterThan(0);
+  });
+
+  test('a hook_additional_context attachment without the marker is never trimmed', () => {
+    const msgs = [...base, userText('q2'), attachment('hook_additional_context')];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages.length).toBe(msgs.length);
+  });
+});
+
+describe('M11 attachments and per-message statistics', () => {
+  test('framing: attachment tokens count in the expected delta but not the per-message divisor', () => {
+    // Between each assistant pair: 100 output + 25 attachment tokens +
+    // 1 prompt token = 126 expected, actual delta 146 -> 20 framing tokens
+    // over TWO framed messages (assistant + prompt; the attachment is not
+    // a message), so 10 tokens/msg.
+    const msgs: SessionMessage[] = [
+      userText('q0'), assistant(1_000),
+      attachment('hook_success', 100), userText('q1'), assistant(1_146),
+      attachment('hook_success', 100), userText('q2'), assistant(1_292),
+      attachment('hook_success', 100), userText('q3'), assistant(1_438),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const framing = b.derivedOverhead!.messageFraming;
+    expect(framing).not.toBeNull();
+    expect(framing!.tokensPerMessage).toBe(10);
+    // Distributed over the 8 real messages only, never the 3 attachments.
+    expect(framing!.totalTokens).toBe(80);
+    expect(countAnalyzedMessages(b.messages)).toBe(8);
+
+    // Attachment rows receive no framing share: System is exactly the
+    // three payloads (3 x 25); the sum invariant still holds.
+    expect(b.buckets.find((x) => x.category === 'system')!.tokens).toBe(75);
+    const bucketSum = b.buckets.reduce((sum, x) => sum + x.tokens, 0);
+    expect(bucketSum).toBe(b.contentSumTokens);
   });
 });

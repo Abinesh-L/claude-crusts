@@ -312,6 +312,14 @@ export interface ClassifiedMessage {
    * the response's `output_tokens` exactly once.
    */
   messageId?: string;
+  /**
+   * True when the source record is an `attachment` (per-turn context Claude
+   * Code injects: hook output, listings, reminders, auto-loaded files).
+   * Attachment rows carry real window tokens but are NOT messages: they are
+   * excluded from message counts, per-message averages, and framing
+   * per-message accounting.
+   */
+  isAttachment?: boolean;
 }
 
 /** Breakdown of tool token usage */

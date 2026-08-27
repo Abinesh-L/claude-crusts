@@ -360,6 +360,36 @@ describe('parseSession system records (M3)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// v0.8.0 M11 — attachment records are kept
+// ---------------------------------------------------------------------------
+
+describe('parseSession attachment records (M11)', () => {
+  test('attachment records are kept with their payload', async () => {
+    const messages = await parseSession(writeFixture([
+      { type: 'attachment', uuid: 'att-1', attachment: { type: 'skill_listing', content: 's'.repeat(400) } },
+      userRecord('u1', 'hello'),
+      { type: 'attachment', uuid: 'att-2', attachment: { type: 'task_reminder', content: 't'.repeat(80) } },
+      assistantRecord('a1', 100, 10),
+    ]));
+    expect(messages.length).toBe(4);
+    expect(messages[0]!.type).toBe('attachment');
+    expect(messages[0]!.attachment!.type).toBe('skill_listing');
+    expect(messages[2]!.attachment!.type).toBe('task_reminder');
+  });
+
+  test('isAnalyzedRecord accepts attachment records', () => {
+    expect(isAnalyzedRecord({ type: 'attachment', attachment: { type: 'hook_success', content: 'ok' } })).toBe(true);
+  });
+
+  test('attachment replays are deduplicated by uuid like any other record', async () => {
+    const att = { type: 'attachment', uuid: 'att-dup', attachment: { type: 'task_reminder', content: 'r'.repeat(40) } };
+    const messages = await parseSession(writeFixture([userRecord('u1', 'hi'), att, att]));
+    expect(messages.length).toBe(2);
+    expect(messages.filter((m) => m.type === 'attachment').length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // isAnalyzedRecord unit coverage
 // ---------------------------------------------------------------------------
 
@@ -501,7 +531,8 @@ describe('claudeCodeVersion (M4)', () => {
       { ...userRecord('u0', 'first'), version: '' },
       ...versionedRecords(),
     ]));
-    // attachment records are not yet analysed (M11), so the first surviving versioned record is the user turn
+    // The unversioned u0 turn survives first; detectClaudeCodeVersion skips
+    // its empty version and picks the SessionStart attachment's (kept per M11)
     expect(messages[0]!.version).toBe('');
     expect(detectClaudeCodeVersion(messages)).toBe('2.1.239');
     expect(detectClaudeCodeVersion([])).toBeUndefined();

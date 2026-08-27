@@ -211,7 +211,7 @@ export function readClaudeCodeVersion(filePath: string): string | undefined {
 }
 
 /** Record types that carry conversation the model actually receives */
-const ANALYZED_RECORD_TYPES: ReadonlySet<string> = new Set(['user', 'assistant', 'system']);
+const ANALYZED_RECORD_TYPES: ReadonlySet<string> = new Set(['user', 'assistant', 'system', 'attachment']);
 
 /** Model marker Claude Code writes on placeholder assistant records */
 const SYNTHETIC_MODEL = '<synthetic>';
@@ -221,6 +221,11 @@ const SYNTHETIC_MODEL = '<synthetic>';
  *
  * Keeps exactly the records that are part of the API conversation:
  *   - `user` and `assistant` turns
+ *   - `attachment` records — per-turn context Claude Code injects into the
+ *     request (hook output, skill/tool/agent listings, task reminders,
+ *     nested CLAUDE.md, auto-loaded files, IDE context). They are real
+ *     window content; the classifier maps `attachment.type` to a category
+ *     and estimates their tokens from the payload text.
  *   - `system` records ONLY when `subtype === 'compact_boundary'`. Every
  *     other system subtype (turn_duration, api_error, away_summary,
  *     local_command, scheduled_task_fire, model_refusal_fallback, ...) is

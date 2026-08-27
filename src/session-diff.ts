@@ -10,7 +10,7 @@
 
 import chalk from 'chalk';
 import Table from 'cli-table3';
-import { classifySession } from './classifier.ts';
+import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import type { CrustsCategory, SessionMessage, ConfigData, CrustsBreakdown } from './types.ts';
 
 /** Per-category delta between two slices of the same session. */
@@ -81,8 +81,8 @@ export function computeSessionDiff(
     totalTo: breakdownTo.total_tokens,
     totalDelta: breakdownTo.total_tokens - breakdownFrom.total_tokens,
     categoryDeltas: buildCategoryDeltas(breakdownFrom, breakdownTo),
-    messageCountFrom: breakdownFrom.messages.length,
-    messageCountTo: breakdownTo.messages.length,
+    messageCountFrom: countAnalyzedMessages(breakdownFrom.messages),
+    messageCountTo: countAnalyzedMessages(breakdownTo.messages),
   };
 }
 

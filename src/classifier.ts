@@ -15,6 +15,11 @@
  *   5. S (State/Memory) — memdir content, plans, skill bodies (Skill
  *      follow-ups via `sourceToolUseID`), subagent / workflow results
  *   6. C (Conversation) — all remaining human/assistant text messages
+ *
+ * `attachment` records bypass this precedence entirely: `attachment.type`
+ * maps straight to a category (task reminders / plan references to State;
+ * hook output, listings, reminders to System; auto-loaded files and IDE
+ * context to Retrieved; queued commands to Conversation).
  */
 
 import type {
@@ -259,6 +264,12 @@ function estimateMessageTokens(msg: SessionMessage): { tokens: number; accuracy:
     return { tokens: usage.output_tokens, accuracy: 'exact' };
   }
 
+  // Attachment records carry their injected text in the attachment
+  // payload, not under message.content.
+  if (msg.type === 'attachment') {
+    return { tokens: estimateAttachmentTokens(msg), accuracy: 'estimated' };
+  }
+
   // For everything else: estimate from content
   return { tokens: estimateContentTokens(msg), accuracy: 'estimated' };
 }
@@ -299,7 +310,8 @@ function estimateContentTokens(msg: SessionMessage): number {
  *
  * Attachment payloads carry their injected text under a handful of field
  * names depending on `attachment.type`: `content` (a string, an array of
- * strings, or a nested object exposing `content` / `file.content`),
+ * strings or item objects such as task_reminder's `{subject, description}`
+ * entries, or a nested object exposing `content` / `file.content`),
  * `text`, `snippet`, `banner`, `prompt`, `addedLines` (string[]), and
  * `skills[].content`. Every string found under those fields is summed.
  *
@@ -310,13 +322,27 @@ function estimateContentTokens(msg: SessionMessage): number {
  * @returns Estimated token count of the attachment's injected text
  */
 export function estimateAttachmentTokens(msg: SessionMessage): number {
-  const att = msg.attachment;
-  if (!att) return 0;
+  return Math.round(attachmentText(msg).length / CHARS_PER_TOKEN_TEXT);
+}
 
-  let chars = 0;
-  /** Accumulate one candidate value's length when it is a string. */
+/**
+ * Collect the injected text of an `attachment` record's payload.
+ *
+ * Walks the known payload fields (see `estimateAttachmentTokens`) and
+ * concatenates every string found, in field order, with no separators —
+ * so the result's length equals the summed character count.
+ *
+ * @param msg - The session message (any record type)
+ * @returns Concatenated payload text, empty for non-attachment records
+ */
+function attachmentText(msg: SessionMessage): string {
+  const att = msg.attachment;
+  if (!att) return '';
+
+  const parts: string[] = [];
+  /** Accumulate one candidate value when it is a string. */
   const add = (value: unknown): void => {
-    if (typeof value === 'string') chars += value.length;
+    if (typeof value === 'string') parts.push(value);
   };
 
   add(att['text']);
@@ -331,9 +357,18 @@ export function estimateAttachmentTokens(msg: SessionMessage): number {
 
   const content = att['content'];
   if (typeof content === 'string') {
-    chars += content.length;
+    parts.push(content);
   } else if (Array.isArray(content)) {
-    for (const item of content) add(item);
+    // Item arrays hold either strings (hook output lines) or objects
+    // (task_reminder items with `subject` / `description` fields): every
+    // string value of an item object is injected text.
+    for (const item of content) {
+      if (typeof item === 'string') {
+        parts.push(item);
+      } else if (item && typeof item === 'object') {
+        for (const value of Object.values(item)) add(value);
+      }
+    }
   } else if (content && typeof content === 'object') {
     const nested = content as Record<string, unknown>;
     add(nested['content']);
@@ -352,7 +387,86 @@ export function estimateAttachmentTokens(msg: SessionMessage): number {
     }
   }
 
-  return Math.round(chars / CHARS_PER_TOKEN_TEXT);
+  return parts.join('');
+}
+
+// ---------------------------------------------------------------------------
+// Attachment classification
+// ---------------------------------------------------------------------------
+
+/**
+ * Exact `attachment.type` to CRUSTS category table.
+ *
+ * State: per-turn agent state the harness re-injects (task reminders, plan
+ * references). System: harness bookkeeping and listings (hook output,
+ * skill/tool/agent listings, nested CLAUDE.md, reminders). Retrieved: file
+ * content pushed into the window (auto-loaded files, IDE context, edits).
+ * Conversation: the user's own queued prompt text.
+ */
+const ATTACHMENT_CATEGORY_BY_TYPE: ReadonlyMap<string, CrustsCategory> = new Map<string, CrustsCategory>([
+  // State
+  ['task_reminder', 'state'],
+  ['plan_file_reference', 'state'],
+  // System
+  ['skill_listing', 'system'],
+  ['deferred_tools_delta', 'system'],
+  ['agent_listing_delta', 'system'],
+  ['hook_success', 'system'],
+  ['hook_additional_context', 'system'],
+  ['hook_system_message', 'system'],
+  ['nested_memory', 'system'],
+  ['invoked_skills', 'system'],
+  ['total_tokens_reminder', 'system'],
+  ['date_change', 'system'],
+  // Retrieved
+  ['file', 'retrieved'],
+  ['edited_text_file', 'retrieved'],
+  ['selected_lines_in_ide', 'retrieved'],
+  ['opened_file_in_ide', 'retrieved'],
+  ['compact_file_reference', 'retrieved'],
+  ['read_truncation_notice', 'retrieved'],
+  // Conversation
+  ['queued_command', 'conversation'],
+]);
+
+/**
+ * Map an `attachment.type` string to its CRUSTS category.
+ *
+ * Exact names first (see `ATTACHMENT_CATEGORY_BY_TYPE`), then the prefix
+ * families `plan_mode*` (State) and `ultra_effort_*` (System). Unknown
+ * types default to System: attachments are harness-injected context, so
+ * an unrecognised kind is bookkeeping until proven otherwise.
+ *
+ * @param attachmentType - The record's `attachment.type`, if any
+ * @returns CRUSTS category for the attachment
+ */
+function classifyAttachmentType(attachmentType: string | undefined): CrustsCategory {
+  if (!attachmentType) return 'system';
+  const exact = ATTACHMENT_CATEGORY_BY_TYPE.get(attachmentType);
+  if (exact) return exact;
+  if (attachmentType.startsWith('plan_mode')) return 'state';
+  if (attachmentType.startsWith('ultra_effort_')) return 'system';
+  return 'system';
+}
+
+/** Marker CRUSTS auto-inject prepends to every injected advisory */
+const CRUSTS_ADVISORY_MARKER = '[claude-crusts advisory]';
+
+/**
+ * Whether a record is CRUSTS's own auto-inject advisory.
+ *
+ * The `UserPromptSubmit` hook injects its advisory as a
+ * `hook_additional_context` attachment whose content carries the
+ * `[claude-crusts advisory]` marker. Like the CRUSTS shell call itself,
+ * the advisory is about the analysis, not the session being analysed, so
+ * `findAnalysisCutoff` trims it from the tail.
+ *
+ * @param msg - The session message (any record type)
+ * @returns True for a hook_additional_context attachment carrying the marker
+ */
+function isCrustsAdvisoryAttachment(msg: SessionMessage): boolean {
+  if (msg.type !== 'attachment' || msg.attachment?.type !== 'hook_additional_context') return false;
+  return attachmentText(msg).includes(CRUSTS_ADVISORY_MARKER);
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +674,9 @@ function buildApportionedTokens(
 function getContentPreview(msg: SessionMessage, maxLen = 60): string {
   const content = msg.message?.content;
   if (!content) {
+    if (msg.type === 'attachment' && msg.attachment) {
+      return `[attachment: ${msg.attachment.type}]`;
+    }
     if (msg.subtype) return `[system: ${msg.subtype}]`;
     return `[${msg.type}]`;
   }
@@ -751,7 +868,14 @@ export function classifyMessage(
   isFirstMessage: boolean,
   toolUseIdMap: Map<string, string>,
 ): { category: CrustsCategory; toolName?: string } {
-  // 0. Compaction summaries — the system's compressed representation of prior context
+  // 0a. Attachment records — per-turn context Claude Code injects into the
+  // request. `attachment.type` names the kind and fully determines the
+  // category; none of the message-shaped rules below apply.
+  if (msg.type === 'attachment') {
+    return { category: classifyAttachmentType(msg.attachment?.type) };
+  }
+
+  // 0b. Compaction summaries — the system's compressed representation of prior context
   if (msg.isCompactSummary) {
     return { category: 'system' };
   }
@@ -983,6 +1107,25 @@ function findLastHumanTextIndex(messages: SessionMessage[]): number {
   return -1;
 }
 
+/**
+ * Count the classified rows that are actual messages.
+ *
+ * Attachment rows carry real window tokens but are injected content, not
+ * messages — every messageCount-style statistic (analyze/report message
+ * counts, tokens-per-message averages, framing distribution) counts
+ * through this helper so they all agree.
+ *
+ * @param rows - Classified message rows (a full breakdown or a slice)
+ * @returns Number of non-attachment rows
+ */
+export function countAnalyzedMessages(rows: ClassifiedMessage[]): number {
+  let count = 0;
+  for (const row of rows) {
+    if (!row.isAttachment) count++;
+  }
+  return count;
+}
+
 // ---------------------------------------------------------------------------
 // CRUSTS invocation trimming
 // ---------------------------------------------------------------------------
@@ -1080,26 +1223,42 @@ function hasCrustsToolResult(msg: SessionMessage): boolean {
  * analysis itself, not the work being analyzed — so they're trimmed.
  *
  * Three-phase trim:
- * 1. Strip trailing CRUSTS shell calls (Bash or PowerShell) and their tool_results
- * 2. Strip preceding assistant text/thinking messages (same turn)
+ * 1. Strip trailing CRUSTS shell calls (Bash or PowerShell), their
+ *    tool_results, and CRUSTS's own auto-inject advisory attachments
+ * 2. Strip preceding assistant text/thinking messages (same turn),
+ *    stepping over an interleaved advisory attachment
  * 3. Strip the user text message that triggered the analysis turn
+ *
+ * A trailing advisory alone (the hook fired on a prompt submit but no
+ * CRUSTS invocation followed yet) is trimmed by phase 1, but phases 2-3
+ * only run when an actual invocation was trimmed — otherwise the person's
+ * real latest prompt would be misattributed to the analysis turn.
  *
  * @param messages - All session messages
  * @returns The effective end index (exclusive) — analyze messages[0..end)
  */
 function findAnalysisCutoff(messages: SessionMessage[]): number {
   let end = messages.length;
+  let sawInvocation = false;
 
-  // Phase 1: Walk backward, trim CRUSTS shell calls and tool_results from tail
+  // Phase 1: Walk backward, trim CRUSTS shell calls, tool_results, and
+  // auto-inject advisories from the tail
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]!;
 
     if (msg.type === 'assistant' && isCrustsShellCall(msg)) {
       end = i;
+      sawInvocation = true;
       continue;
     }
 
     if (msg.type === 'user' && hasCrustsToolResult(msg)) {
+      end = i;
+      sawInvocation = true;
+      continue;
+    }
+
+    if (isCrustsAdvisoryAttachment(msg)) {
       end = i;
       continue;
     }
@@ -1107,15 +1266,22 @@ function findAnalysisCutoff(messages: SessionMessage[]): number {
     break;
   }
 
-  // If nothing was trimmed, return early
-  if (end === messages.length) return end;
+  // If nothing was trimmed — or only advisories were (no invocation to
+  // attribute a triggering turn to) — stop here.
+  if (end === messages.length || !sawInvocation) return end;
 
   // Phase 2: Continue backward through assistant text/thinking messages
   // that are part of the same turn as the CRUSTS shell call.
   // In Claude Code JSONL, a single assistant response can span multiple
   // messages: thinking, then text, then tool_use (each a separate line).
+  // The auto-inject advisory lands between the triggering prompt and the
+  // assistant turn it triggered, so step over it here too.
   for (let i = end - 1; i >= 0; i--) {
     const msg = messages[i]!;
+    if (isCrustsAdvisoryAttachment(msg)) {
+      end = i;
+      continue;
+    }
     if (msg.type !== 'assistant') break;
 
     const content = msg.message?.content;
@@ -1545,10 +1711,15 @@ export function classifySession(
   const classifiedMessages: ClassifiedMessage[] = [];
   let cumulative = 0;
 
+  // The "first message" system-marker rule targets the first API
+  // conversation record; a SessionStart attachment ahead of it must not
+  // steal that position.
+  const firstNonAttachmentIdx = effectiveMessages.findIndex((m) => m.type !== 'attachment');
+
   for (let i = 0; i < effectiveMessages.length; i++) {
     const msg = effectiveMessages[i]!;
     const isLastHuman = i === lastHumanIdx;
-    const isFirst = i === 0;
+    const isFirst = i === firstNonAttachmentIdx;
 
     const { category, toolName } = classifyMessage(msg, isLastHuman, isFirst, toolUseIdMap);
     const apportioned = apportionedOutput.get(i);
@@ -1628,6 +1799,7 @@ export function classifySession(
       toolName,
       ...(msg.requestId ? { requestId: msg.requestId } : {}),
       ...(msg.message?.id ? { messageId: msg.message.id } : {}),
+      ...(msg.type === 'attachment' ? { isAttachment: true } : {}),
     });
   }
 
@@ -1655,12 +1827,15 @@ export function classifySession(
     : 0;
   const derivedFraming = deriveMessageFraming(effectiveMessages, classifiedMessages, framingStartIndex);
 
-  // Add derived framing overhead — distribute proportionally across categories
+  // Add derived framing overhead — distribute proportionally across
+  // categories. Attachment rows are injected content, not messages, so
+  // they carry no per-message framing.
   if (derivedFraming && derivedFraming.totalTokens > 0) {
     const msgCountByCategory: Record<CrustsCategory, number> = {
       conversation: 0, retrieved: 0, user: 0, system: 0, tools: 0, state: 0,
     };
     for (const cm of classifiedMessages) {
+      if (cm.isAttachment) continue;
       msgCountByCategory[cm.category]++;
     }
     for (const cat of Object.keys(msgCountByCategory) as CrustsCategory[]) {
@@ -1824,6 +1999,7 @@ export function classifySession(
         conversation: 0, retrieved: 0, user: 0, system: 0, tools: 0, state: 0,
       };
       for (const cm of currentMessages) {
+        if (cm.isAttachment) continue;
         currentMsgCount[cm.category]++;
       }
       for (const cat of Object.keys(currentMsgCount) as CrustsCategory[]) {
@@ -2072,14 +2248,17 @@ function deriveMessageFraming(
     // Skip pairs where input dropped (compaction or cache shift)
     if (actualDelta <= 0) continue;
 
-    // Sum classified tokens for messages between curr and next (exclusive of both)
+    // Sum classified tokens for messages between curr and next (exclusive of
+    // both). Attachment rows contribute their tokens to the expected delta
+    // (their text IS part of the input growth) but not to the per-message
+    // divisor — they are injected into a turn, not framed as messages.
     let expectedDelta = 0;
     let msgCountBetween = 0;
     for (let i = curr.index; i < next.index; i++) {
       const cm = classifiedMessages[i];
       if (cm) {
         expectedDelta += cm.tokens;
-        msgCountBetween++;
+        if (!cm.isAttachment) msgCountBetween++;
       }
     }
 
@@ -2101,12 +2280,14 @@ function deriveMessageFraming(
   const median = sorted[Math.floor(sorted.length / 2)]!;
   const tokensPerMessage = Math.round(median);
 
-  const totalTokens = tokensPerMessage * classifiedMessages.length;
+  // Only real messages carry framing; attachment rows are injected content.
+  const framedMessageCount = countAnalyzedMessages(classifiedMessages);
+  const totalTokens = tokensPerMessage * framedMessageCount;
 
   if (verbose) console.error(
     `[CRUSTS derived] Message framing: ${tokensPerMessage} tokens/msg`
     + ` (median of ${samples.length} samples, range ${sorted[0]!.toFixed(1)}-${sorted[sorted.length - 1]!.toFixed(1)})`
-    + `, total overhead: ${totalTokens} tokens across ${classifiedMessages.length} messages`,
+    + `, total overhead: ${totalTokens} tokens across ${framedMessageCount} messages`,
   );
 
   return {
