@@ -179,7 +179,8 @@ describe('parseSession uuid dedupe (M1)', () => {
     const events = detectCompactionEvents(messages);
     expect(events.length).toBe(1);
     expect(events[0]!.tokensBefore).toBe(150_000);
-    expect(events[0]!.tokensAfter).toBe(30_000);
+    // M17: the boundary's recorded postTokens wins over the scanned assistant.
+    expect(events[0]!.tokensAfter).toBe(8_000);
 
     const b = classifySession(messages, EMPTY_CONFIG);
     expect(b.compactionEvents.length).toBe(1);
@@ -236,10 +237,14 @@ describe('parseSession uuid dedupe (M1)', () => {
 
 describe('parseSession synthetic and API-error filter (M2)', () => {
   test('message.model "<synthetic>" directly after a boundary is dropped and tokensAfter comes from the next real assistant', async () => {
+    // The boundary carries NO postTokens here (pre-2.1.119 shape) so the
+    // forward scan is load-bearing; M17 makes a recorded postTokens win.
+    const bareBoundary = boundaryRecord('b1', 150_000);
+    bareBoundary.compactMetadata = { trigger: 'manual', preTokens: 150_000 };
     const path = writeFixture([
       userRecord('u1', 'q1'),
       assistantRecord('a1', 140_000, 100),
-      boundaryRecord('b1', 150_000),
+      bareBoundary,
       // Real shape: zero usage, message.model '<synthetic>', NO top-level model key.
       assistantRecord('syn', 0, 0, { model: '<synthetic>', text: 'No response requested.', isApiErrorMessage: false }),
       summaryRecord('s1'),
@@ -350,7 +355,8 @@ describe('parseSession system records (M3)', () => {
     const systemCount = b.messages.filter((m) => m.category === 'system').length;
     expect(systemCount).toBe(1);
     expect(b.compactionEvents.length).toBe(1);
-    expect(b.compactionEvents[0]!.tokensAfter).toBe(5_000);
+    // M17: the boundary's recorded postTokens (8,000) wins over the scan.
+    expect(b.compactionEvents[0]!.tokensAfter).toBe(8_000);
   });
 
   test('framing totalTokens is tokensPerMessage times the REAL message count', async () => {

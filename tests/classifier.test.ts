@@ -1500,3 +1500,164 @@ describe('M13 context-limit resolution threading', () => {
     expect(b.context_limit).toBe(200_000);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.8.0 M17 — compaction event fidelity: postTokens, trigger,
+// cumulativeDroppedTokens, preserved messages, per-event context limits
+// ---------------------------------------------------------------------------
+
+describe('M17 compaction event fidelity', () => {
+  /** Assistant line carrying an explicit model id, for model-span tests. */
+  function modelAssistant(model: string, inputTokens: number): SessionMessage {
+    return {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model,
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: inputTokens, output_tokens: 100 },
+      },
+    };
+  }
+
+  /** compact_boundary with full compactMetadata control. */
+  function boundaryWithMeta(
+    meta: NonNullable<SessionMessage['compactMetadata']>,
+    uuid?: string,
+  ): SessionMessage {
+    return { type: 'system', subtype: 'compact_boundary', compactMetadata: meta, isMeta: true, uuid };
+  }
+
+  test('tokensAfter prefers compactMetadata.postTokens over the scanned assistant', () => {
+    // Observed shape: the first assistant after the boundary belongs to an
+    // in-flight PRE-compaction turn (676,916 effective input), while Claude
+    // Code recorded the real post-compaction size as postTokens 12,867.
+    const msgs: SessionMessage[] = [
+      assistant(120_000),
+      boundaryWithMeta({ trigger: 'auto', preTokens: 843_784, postTokens: 12_867 }, 'b1'),
+      userText('u1'), userText('u2'), userText('u3'), userText('u4'),
+      assistant(676_916),
+    ];
+    const events = detectCompactionEvents(msgs);
+    expect(events.length).toBe(1);
+    expect(events[0]!.tokensAfter).toBe(12_867);
+    expect(events[0]!.tokensDropped).toBe(843_784 - 12_867);
+    // afterIndex (the start of the new window slice) still comes from the scan.
+    expect(events[0]!.afterIndex).toBe(6);
+    expect(events[0]!.trigger).toBe('auto');
+  });
+
+  test('the forward scan for tokensAfter has no 10-record cap', () => {
+    // Without postTokens, a boundary followed by a long run of user records
+    // previously fell off the 10-record window and reported tokensAfter 0
+    // (i.e. tokensDropped = preTokens).
+    const msgs: SessionMessage[] = [
+      assistant(120_000),
+      boundaryWithMeta({ trigger: 'manual', preTokens: 150_000 }, 'b1'),
+      ...Array.from({ length: 12 }, (_, k) => userText(`filler ${k}`)),
+      assistant(30_000),
+    ];
+    const events = detectCompactionEvents(msgs);
+    expect(events.length).toBe(1);
+    expect(events[0]!.afterIndex).toBe(14);
+    expect(events[0]!.tokensAfter).toBe(30_000);
+    expect(events[0]!.tokensDropped).toBe(120_000);
+    expect(events[0]!.trigger).toBe('manual');
+  });
+
+  test('trigger and cumulativeDroppedTokens are copied from compactMetadata', () => {
+    const msgs: SessionMessage[] = [
+      assistant(100_000),
+      boundaryWithMeta({
+        trigger: 'manual',
+        preTokens: 100_000,
+        postTokens: 6_000,
+        cumulativeDroppedTokens: 835_855,
+      }, 'b1'),
+      assistant(40_000),
+    ];
+    const events = detectCompactionEvents(msgs);
+    expect(events[0]!.trigger).toBe('manual');
+    expect(events[0]!.cumulativeDroppedTokens).toBe(835_855);
+  });
+
+  test('heuristic events carry no trigger', () => {
+    const msgs: SessionMessage[] = [
+      assistant(150_000),
+      assistant(160_000),
+      assistant(20_000),
+    ];
+    const events = detectCompactionEvents(msgs);
+    expect(events[0]!.detection).toBe('heuristic');
+    expect(events[0]!.trigger).toBeUndefined();
+  });
+
+  test('preservedMessages uuids resolve to pre-boundary indices and join the current-context slice', () => {
+    const pinned: SessionMessage = {
+      type: 'user',
+      uuid: 'u-keep',
+      message: { role: 'user', content: 'pinned instructions that Claude Code carried across the boundary' },
+    };
+    const msgs: SessionMessage[] = [
+      pinned,                                                    // index 0 — preserved
+      assistant(50_000),                                         // index 1
+      boundaryWithMeta({
+        trigger: 'auto',
+        preTokens: 150_000,
+        postTokens: 9_000,
+        preservedMessages: { anchorUuid: 'u-keep', uuids: ['u-keep', 'missing-uuid'] },
+      }, 'b1'),                                                  // index 2
+      assistant(30_000),                                         // index 3
+    ];
+
+    const events = detectCompactionEvents(msgs);
+    // Unknown uuids are dropped; the known one resolves to its index.
+    expect(events[0]!.preservedMessageIndices).toEqual([0]);
+
+    // The preserved user prompt is re-sent in the new window: its tokens
+    // appear in currentContext even though it sits before startIndex.
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.currentContext).toBeDefined();
+    expect(b.currentContext!.startIndex).toBe(3);
+    const userTokens = b.currentContext!.buckets.find((x) => x.category === 'user')!.tokens;
+    expect(userTokens).toBeGreaterThan(0);
+    expect(userTokens).toBe(b.messages[0]!.tokens);
+
+    // Same session without preservedMessages: nothing before startIndex counts.
+    const bare = msgs.map((m) => m === msgs[2] ? boundaryWithMeta({
+      trigger: 'auto', preTokens: 150_000, postTokens: 9_000,
+    }, 'b1') : m);
+    const b2 = classifySession(bare, EMPTY_CONFIG);
+    expect(b2.currentContext!.buckets.find((x) => x.category === 'user')!.tokens).toBe(0);
+  });
+
+  test('pre-switch 200K events keep their own limit while the breakdown reports the current window', () => {
+    // Window ran on opus-4-6 (200K, auto-compaction at ~167K), then the
+    // user switched to fable-5 (native 1M). The event's limit must stay
+    // 200K; breakdown.context_limit reports the CURRENT window's 1M.
+    const msgs: SessionMessage[] = [
+      userText('start'),
+      modelAssistant('claude-opus-4-6', 120_000),
+      modelAssistant('claude-opus-4-6', 166_000),
+      boundaryWithMeta({ trigger: 'auto', preTokens: 167_235, postTokens: 10_000 }, 'b1'),
+      modelAssistant('claude-fable-5', 40_000),
+      modelAssistant('claude-fable-5', 60_000),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.compactionEvents.length).toBe(1);
+    expect(b.compactionEvents[0]!.contextLimit).toBe(200_000);
+    expect(b.context_limit).toBe(1_000_000);
+  });
+
+  test('single-model sessions resolve the same limit for events and breakdown', () => {
+    const msgs: SessionMessage[] = [
+      userText('start'),
+      modelAssistant('claude-fable-5', 120_000),
+      boundaryWithMeta({ trigger: 'auto', preTokens: 967_000, postTokens: 12_000 }, 'b1'),
+      modelAssistant('claude-fable-5', 40_000),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.context_limit).toBe(1_000_000);
+    expect(b.compactionEvents[0]!.contextLimit).toBe(1_000_000);
+  });
+});

@@ -314,6 +314,11 @@ function recommendClaudeMdSplit(configData: ConfigData): Recommendation[] {
 /**
  * Generate a single session habit recommendation based on the dominant pattern.
  *
+ * The "start fresh sessions" habit counts only AUTO compactions
+ * (`trigger === 'auto'`): a manual /compact is a deliberate, targeted
+ * choice, not a habit problem (observed sessions run to ~79% manual).
+ * Heuristic-detected events carry no trigger and are not counted either.
+ *
  * @param breakdown - CRUSTS breakdown
  * @param waste - Detected waste items
  * @returns At most one recommendation for the most impactful habit change
@@ -322,18 +327,19 @@ function recommendSessionHabit(
   breakdown: CrustsBreakdown,
   waste: WasteItem[],
 ): Recommendation[] {
-  const compactionCount = breakdown.compactionEvents.length;
+  const autoCompactionCount = breakdown.compactionEvents
+    .filter((e) => e.trigger === 'auto').length;
   const dupeCount = waste.filter((w) => w.type === 'duplicate_read').length;
   const toolBucket = breakdown.buckets.find((b) => b.category === 'tools');
   const toolPct = toolBucket?.percentage ?? 0;
 
   // Pick the most relevant habit — only ONE
-  if (compactionCount >= 3) {
+  if (autoCompactionCount >= 3) {
     return [{
       priority: 5,
       action: 'Habit: use /clear between distinct tasks',
       impact: 0,
-      reason: `${compactionCount} compactions this session. Each compaction loses context quality. Starting fresh sessions per task avoids degradation.`,
+      reason: `${autoCompactionCount} auto-compactions this session. Each auto-compaction summarises aggressively and loses context quality. Starting fresh sessions per task avoids degradation (deliberate /compact runs are not counted here).`,
     }];
   }
 

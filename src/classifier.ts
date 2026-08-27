@@ -1443,6 +1443,49 @@ function computeModelHistory(
   };
 }
 
+/** A contiguous same-model run of message indices (inclusive bounds). */
+interface ModelSpan {
+  model: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * Partition the full message range into contiguous same-model spans.
+ *
+ * Span k runs from just after the previous model segment's last assistant
+ * to segment k's last assistant; the first span starts at index 0 and the
+ * last span extends to the end of the session, so every message index
+ * (user records, boundaries, attachments included) belongs to exactly one
+ * span. Sessions without any model-carrying assistant collapse to a single
+ * span on the history's `current` model.
+ *
+ * Used for per-window context-limit resolution: the window size can only
+ * change at a model switch, so signals (usage, /context output) are scoped
+ * to the span they were observed in.
+ *
+ * @param messages - Session messages the history was computed from
+ * @param history - Model history for the same message array
+ * @returns Ordered spans covering [0, messages.length - 1]
+ */
+function computeModelSpans(messages: SessionMessage[], history: ModelHistory): ModelSpan[] {
+  const segments = history.segments;
+  const lastIndex = Math.max(0, messages.length - 1);
+  if (segments.length === 0) {
+    return [{ model: history.current, start: 0, end: lastIndex }];
+  }
+  const spans: ModelSpan[] = [];
+  for (let k = 0; k < segments.length; k++) {
+    const seg = segments[k]!;
+    spans.push({
+      model: seg.model,
+      start: k === 0 ? 0 : segments[k - 1]!.lastMessageIndex + 1,
+      end: k === segments.length - 1 ? lastIndex : seg.lastMessageIndex,
+    });
+  }
+  return spans;
+}
+
 /**
  * Detect compaction events via compact_boundary system messages.
  *
@@ -1451,14 +1494,27 @@ function computeModelHistory(
  *   2. user (isCompactSummary: true) — the compressed summary
  *   3. assistant — first response in the new context window
  *
- * Two guards keep the event list faithful to the real window:
+ * Guards that keep the event list faithful to the real window:
  *   - Boundaries are deduplicated by `uuid`. The scanner already drops
  *     resume replays at parse time; this is the belt for callers that build
  *     message arrays themselves. Boundaries without a uuid are never merged.
- *   - `tokensAfter` comes from the first REAL assistant after the boundary:
- *     `<synthetic>` placeholders and zero-usage records are skipped, so a
- *     "No response requested." stub directly after the boundary no longer
- *     reports tokensAfter = 0 (and tokensDropped = preTokens).
+ *   - `tokensAfter` prefers Claude Code's own post-compaction measurement
+ *     (`compactMetadata.postTokens`, recorded since 2.1.119). The first
+ *     assistant after the boundary can belong to an in-flight
+ *     PRE-compaction turn (observed: effective input 676,916 against
+ *     postTokens 12,867), so the recorded number wins whenever present.
+ *   - Without `postTokens`, the fallback scan finds the first REAL
+ *     assistant after the boundary: `<synthetic>` placeholders and
+ *     zero-usage records are skipped, and the scan runs to the end of the
+ *     session rather than a 10-record window ("user > user > user > ..."
+ *     tails after a boundary previously fell off the window and reported
+ *     tokensAfter = 0, i.e. tokensDropped = preTokens).
+ *   - `trigger` and `cumulativeDroppedTokens` are copied from
+ *     `compactMetadata` so downstream rules can tell deliberate /compact
+ *     runs from auto-compactions.
+ *   - `preservedMessages.uuids` are resolved to pre-boundary message
+ *     indices; Claude Code re-sends those messages in the new window, so
+ *     the post-compaction slice must include them.
  *
  * @param messages - Parsed session messages
  * @returns Array of compaction events detected from markers
@@ -1466,6 +1522,8 @@ function computeModelHistory(
 function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
   const events: CompactionEvent[] = [];
   const seenBoundaryUuids = new Set<string>();
+  // Lazily built uuid -> first index map for preservedMessages resolution.
+  let uuidToIndex: Map<string, number> | null = null;
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
@@ -1475,7 +1533,8 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       seenBoundaryUuids.add(msg.uuid);
     }
 
-    const preTokens = msg.compactMetadata?.preTokens ?? 0;
+    const meta = msg.compactMetadata;
+    const preTokens = meta?.preTokens ?? 0;
 
     // Find the compaction summary (next user message with isCompactSummary)
     let summaryIndex: number | undefined;
@@ -1491,18 +1550,46 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       }
     }
 
-    // Find the first assistant message after the boundary
+    // Find the first REAL assistant message after the boundary. The scan
+    // is uncapped: long runs of user records or attachments after a
+    // boundary are stepped over until an assistant with usage appears.
     let afterIndex = i + 1;
-    let tokensAfter = 0;
-    for (let j = i + 1; j < Math.min(i + 10, messages.length); j++) {
+    let scannedTokensAfter = 0;
+    for (let j = i + 1; j < messages.length; j++) {
       const m = messages[j]!;
       if (m.type !== 'assistant' || !m.message?.usage) continue;
       if (m.message.model === '<synthetic>') continue;
       const effective = effectiveInput(m.message.usage);
       if (effective <= 0) continue;
       afterIndex = j;
-      tokensAfter = effective;
+      scannedTokensAfter = effective;
       break;
+    }
+
+    // Claude Code's own post-compaction measurement is authoritative when
+    // recorded; the scanned assistant is the fallback for older sessions.
+    const tokensAfter = meta?.postTokens ?? scannedTokensAfter;
+
+    // Resolve preserved-message uuids to pre-boundary indices (first
+    // occurrence wins, matching the scanner's resume-replay dedupe).
+    let preservedMessageIndices: number[] | undefined;
+    const preservedUuids = meta?.preservedMessages?.uuids;
+    if (preservedUuids && preservedUuids.length > 0) {
+      if (!uuidToIndex) {
+        uuidToIndex = new Map();
+        for (let k = 0; k < messages.length; k++) {
+          const u = messages[k]!.uuid;
+          if (u !== undefined && !uuidToIndex.has(u)) uuidToIndex.set(u, k);
+        }
+      }
+      const indices: number[] = [];
+      for (const u of preservedUuids) {
+        const k = uuidToIndex.get(u);
+        if (k !== undefined && k < i && !indices.includes(k)) indices.push(k);
+      }
+      if (indices.length > 0) {
+        preservedMessageIndices = indices.sort((a, b) => a - b);
+      }
     }
 
     events.push({
@@ -1514,6 +1601,9 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       detection: 'marker',
       summaryIndex,
       summaryTokens,
+      trigger: meta?.trigger,
+      cumulativeDroppedTokens: meta?.cumulativeDroppedTokens,
+      preservedMessageIndices,
     });
   }
 
@@ -1969,14 +2059,51 @@ export function classifySession(
   // `[1m]` variant JSONL strips) takes precedence when supplied.
   const modelHistory = computeModelHistory(effectiveMessages, lineGroups);
   const model = modelOverride ?? modelHistory.current;
+
+  // Window size is a property of the MODEL RUN, not the compaction window:
+  // compaction never resizes the window, but a mid-session model switch
+  // can. Partition the session into contiguous same-model spans and
+  // resolve each compaction event's limit from the signals inside the
+  // span its window ran on, so pre-switch 200K events keep their own
+  // limit instead of inheriting the current model's window.
+  const modelSpans = computeModelSpans(effectiveMessages, modelHistory);
+  const lastSpan = modelSpans[modelSpans.length - 1]!;
+  for (const event of compactionEvents) {
+    // The window that ENDED at this event ran on the model of the last
+    // real assistant at or before `beforeIndex` (the boundary record
+    // itself sits between spans when the user switched at the compaction).
+    let anchor = event.beforeIndex;
+    while (anchor > 0) {
+      const m = effectiveMessages[anchor];
+      if (m && m.type === 'assistant' && m.message?.model && m.message.model !== '<synthetic>') break;
+      anchor--;
+    }
+    const span = modelSpans.find((s) => anchor >= s.start && anchor <= s.end) ?? modelSpans[0]!;
+    // Historical windows use the recorded signals only (usage, /context
+    // output, model-id, native table) plus the settings family match; the
+    // live payload override describes the CURRENT window, never a past one.
+    event.contextLimit = resolveContextLimitWithSignal(
+      span.model,
+      effectiveMessages.slice(span.start, span.end + 1),
+      { settingsModels: configData.settingsModels },
+    ).limit;
+  }
+
   // Claude Code strips the `[1m]` variant from the recorded model ID, so
   // every signal is combined in priority order: live payload override,
   // recorded /context output, model-ID variant, settings.json model,
   // usage above 200K (conclusive 1M), and the native-1M model table.
-  const contextResolution = resolveContextLimitWithSignal(model, effectiveMessages, {
-    limitOverride,
-    settingsModels: configData.settingsModels,
-  });
+  // Scoped to the LAST model span (the whole session when the model never
+  // switched) so `context_limit` reports the window the session is ON,
+  // not one a pre-switch model ran with.
+  const contextResolution = resolveContextLimitWithSignal(
+    model,
+    lastSpan.start > 0 ? effectiveMessages.slice(lastSpan.start) : effectiveMessages,
+    {
+      limitOverride,
+      settingsModels: configData.settingsModels,
+    },
+  );
   const contextLimit = contextResolution.limit;
   if (verbose) {
     const signalExplanation =
@@ -2017,7 +2144,15 @@ export function classifySession(
       system: 'exact', tools: 'exact', state: 'exact',
     };
 
-    for (let i = startIndex; i < classifiedMessages.length; i++) {
+    // Pre-boundary messages Claude Code preserved verbatim across the
+    // boundary (compactMetadata.preservedMessages) are re-sent in the new
+    // window, so the post-compaction slice includes their indices too.
+    const preservedIndices = (lastCompaction.preservedMessageIndices ?? [])
+      .filter((idx) => idx >= 0 && idx < startIndex && idx < classifiedMessages.length);
+    const currentIndices: number[] = [...preservedIndices];
+    for (let i = startIndex; i < classifiedMessages.length; i++) currentIndices.push(i);
+
+    for (const i of currentIndices) {
       const cm = classifiedMessages[i]!;
       currentCategoryTokens[cm.category] += cm.tokens;
       if (cm.accuracy === 'estimated') {
@@ -2034,7 +2169,7 @@ export function classifySession(
       currentCategoryAccuracy.system = 'estimated';
     }
     if (derivedFraming && derivedFraming.tokensPerMessage > 0) {
-      const currentMessages = classifiedMessages.slice(startIndex);
+      const currentMessages = currentIndices.map((i) => classifiedMessages[i]!);
       const currentMsgCount: Record<CrustsCategory, number> = {
         conversation: 0, retrieved: 0, user: 0, system: 0, tools: 0, state: 0,
       };

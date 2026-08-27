@@ -432,7 +432,13 @@ export interface CompactionEvent {
   afterIndex: number;
   /** Cumulative input_tokens before compaction */
   tokensBefore: number;
-  /** Cumulative input_tokens after compaction */
+  /**
+   * Window size right after compaction. Claude Code's own measurement
+   * (`compactMetadata.postTokens`, recorded since 2.1.119) when present;
+   * otherwise the effective input of the first real assistant after the
+   * boundary (which additionally includes the re-injected fixed context,
+   * so the two quantities are NOT interchangeable).
+   */
   tokensAfter: number;
   /** Size of the drop */
   tokensDropped: number;
@@ -442,6 +448,29 @@ export interface CompactionEvent {
   summaryIndex?: number;
   /** Estimated tokens in the compaction summary */
   summaryTokens?: number;
+  /**
+   * What fired the compaction: 'auto' (the headroom buffer) or 'manual'
+   * (a deliberate /compact). Marker detection only; the heuristic cannot
+   * tell the two apart, so heuristic events leave this undefined.
+   */
+  trigger?: 'auto' | 'manual';
+  /** Running total of tokens dropped by every compaction so far, as
+   * recorded by Claude Code (compactMetadata.cumulativeDroppedTokens). */
+  cumulativeDroppedTokens?: number;
+  /**
+   * Indices (into the analysed message array) of pre-boundary messages
+   * Claude Code carried across the boundary verbatim, resolved from
+   * `compactMetadata.preservedMessages.uuids`. These messages are re-sent
+   * in the new window, so the post-compaction slice must include them.
+   */
+  preservedMessageIndices?: number[];
+  /**
+   * Window size in effect for the window that ENDED at this boundary,
+   * resolved from the signals inside that window's contiguous same-model
+   * span (compaction never resizes the window; a model switch can).
+   * Set by classifySession; undefined when events are detected standalone.
+   */
+  contextLimit?: number;
 }
 
 /**

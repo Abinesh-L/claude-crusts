@@ -17,7 +17,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { generateRecommendations } from '../src/recommender.ts';
 import { autocompactTrigger, AUTOCOMPACT_BUFFER_TOKENS } from '../src/model-context.ts';
-import type { ClassifiedMessage, ConfigData, CrustsBreakdown } from '../src/types.ts';
+import type { ClassifiedMessage, CompactionEvent, ConfigData, CrustsBreakdown } from '../src/types.ts';
 
 /** Minimal classified rows so per-message averages are computable. */
 function rows(n: number): ClassifiedMessage[] {
@@ -162,5 +162,73 @@ describe('compaction prediction uses the headroom buffer, not 80% (sandboxed)', 
         expect(rec.action).not.toContain('80%');
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M17: the "start fresh sessions" habit counts only AUTO compactions —
+// deliberate /compact runs (trigger 'manual') are not a habit problem
+// ---------------------------------------------------------------------------
+
+describe('M17 session habit counts only auto compactions (sandboxed)', () => {
+  let sandbox: string;
+  let savedOverride: string | undefined;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'crusts-recommender-'));
+    savedOverride = process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    process.env.CRUSTS_CONFIG_DIR_OVERRIDE = sandbox;
+  });
+
+  afterEach(() => {
+    if (savedOverride === undefined) {
+      delete process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    } else {
+      process.env.CRUSTS_CONFIG_DIR_OVERRIDE = savedOverride;
+    }
+    try { rmSync(sandbox, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  /** Marker compaction event with a given trigger (undefined = heuristic). */
+  function event(trigger?: 'auto' | 'manual'): CompactionEvent {
+    return {
+      beforeIndex: 0,
+      afterIndex: 1,
+      tokensBefore: 150_000,
+      tokensAfter: 9_000,
+      tokensDropped: 141_000,
+      detection: trigger === undefined ? 'heuristic' : 'marker',
+      trigger,
+    };
+  }
+
+  const HABIT = 'Habit: use /clear between distinct tasks';
+
+  function habitRec(events: CompactionEvent[]) {
+    const bd = breakdownTokens(100_000, 200_000, 20);
+    bd.compactionEvents = events;
+    const report = generateRecommendations(bd, [], emptyConfig(), []);
+    return report.recommendations.find((r) => r.action === HABIT);
+  }
+
+  test('a manual-only session does not emit the start-fresh habit', () => {
+    expect(habitRec([event('manual'), event('manual'), event('manual')])).toBeUndefined();
+  });
+
+  test('three auto compactions emit the habit and count only the auto ones', () => {
+    const rec = habitRec([event('manual'), event('auto'), event('auto'), event('auto')]);
+    expect(rec).toBeDefined();
+    expect(rec!.reason).toContain('3 auto-compactions');
+  });
+
+  test('two auto compactions among many manual ones stay below the bar', () => {
+    expect(habitRec([
+      event('auto'), event('auto'),
+      event('manual'), event('manual'), event('manual'), event('manual'),
+    ])).toBeUndefined();
+  });
+
+  test('heuristic events without a trigger are not counted', () => {
+    expect(habitRec([event(), event(), event()])).toBeUndefined();
   });
 });
