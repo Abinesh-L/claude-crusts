@@ -260,19 +260,232 @@ function estimateMessageTokens(msg: SessionMessage): { tokens: number; accuracy:
   }
 
   // For everything else: estimate from content
+  return { tokens: estimateContentTokens(msg), accuracy: 'estimated' };
+}
+
+/**
+ * Estimate a message's token count from its content alone, ignoring any
+ * API usage data.
+ *
+ * This is the "visible" size of the record: text, tool_use input JSON,
+ * block ids/names, nested result blocks — everything `estimateBlockTokens`
+ * counts. Thinking blocks contribute ~0 because Claude Code never persists
+ * thinking text (only the uncounted signature).
+ *
+ * Used directly for non-assistant records, and as the per-line share when
+ * apportioning one API response's `output_tokens` across its split lines.
+ *
+ * @param msg - The session message
+ * @returns Estimated token count from content size
+ */
+function estimateContentTokens(msg: SessionMessage): number {
   const content = msg.message?.content;
-  if (!content) return { tokens: 0, accuracy: 'estimated' };
+  if (!content) return 0;
 
   if (typeof content === 'string') {
-    const divisor = charsPerToken(content);
-    return { tokens: Math.ceil(content.length / divisor), accuracy: 'estimated' };
+    return Math.ceil(content.length / charsPerToken(content));
   }
 
   let tokens = 0;
   for (const block of content) {
     tokens += estimateBlockTokens(block);
   }
-  return { tokens, accuracy: 'estimated' };
+  return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// Assistant split-line grouping (one API message = N JSONL lines)
+// ---------------------------------------------------------------------------
+
+/** One API response's worth of assistant JSONL lines. */
+interface AssistantLineGroup {
+  /** Indices into the messages array, in encounter order */
+  indices: number[];
+  /**
+   * True when every line in the group repeats identical usage (input,
+   * output, cache creation, cache read) — the split-line shape Claude Code
+   * writes since v2.1.114, where each line carries the response's FINAL
+   * usage. Legacy groups (2.1.81-2.1.96) whose lines carry differing
+   * per-line usage stay false and keep per-line accounting.
+   */
+  identicalUsage: boolean;
+}
+
+/**
+ * Build the grouping key for an assistant line.
+ *
+ * `message.id` (`msg_...`) is authoritative; `requestId` (`req_...`) is the
+ * fallback for records that predate `message.id`. Lines with neither, or
+ * without usage, are ungrouped and keep per-line accounting. The two keys
+ * are namespaced so an id-keyed group can never collide with a
+ * requestId-keyed one.
+ *
+ * @param msg - The session message
+ * @returns Namespaced group key, or null when the line cannot be grouped
+ */
+function assistantGroupKey(msg: SessionMessage): string | null {
+  if (msg.type !== 'assistant' || !msg.message?.usage) return null;
+  if (msg.message.model === '<synthetic>') return null;
+  if (msg.message.id) return `id:${msg.message.id}`;
+  if (msg.requestId) return `req:${msg.requestId}`;
+  return null;
+}
+
+/**
+ * Group assistant lines by API message (`message.id`, fallback `requestId`).
+ *
+ * Since Claude Code v2.1.114 one API response is written as several
+ * assistant lines (thinking / text / tool_use each on its own line) that
+ * share `message.id` and repeat the same final `usage`. Counting
+ * `output_tokens` once per LINE inflated buckets ~2.9x on real sessions.
+ * `classifySession` and `computeModelHistory` use these groups to count
+ * each response's usage exactly once.
+ *
+ * @param messages - Parsed session messages (the classifier's array)
+ * @returns Map from message index to its group; ungroupable lines have no entry
+ */
+function groupAssistantLines(messages: SessionMessage[]): Map<number, AssistantLineGroup> {
+  const byKey = new Map<string, AssistantLineGroup>();
+  const byIndex = new Map<number, AssistantLineGroup>();
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    const key = assistantGroupKey(msg);
+    if (!key) continue;
+    let group = byKey.get(key);
+    if (!group) {
+      group = { indices: [], identicalUsage: true };
+      byKey.set(key, group);
+    }
+    group.indices.push(i);
+    byIndex.set(i, group);
+  }
+
+  for (const group of byKey.values()) {
+    const first = messages[group.indices[0]!]!.message!.usage!;
+    group.identicalUsage = group.indices.every((i) => {
+      const u = messages[i]!.message!.usage!;
+      return u.input_tokens === first.input_tokens
+        && u.output_tokens === first.output_tokens
+        && (u.cache_read_input_tokens ?? 0) === (first.cache_read_input_tokens ?? 0)
+        && cacheCreationTokens(u) === cacheCreationTokens(first);
+    });
+  }
+
+  return byIndex;
+}
+
+/**
+ * Check whether an assistant line contains a thinking block.
+ *
+ * @param msg - The session message
+ * @returns True when any content block has `type === 'thinking'`
+ */
+function hasThinkingBlock(msg: SessionMessage): boolean {
+  const content = msg.message?.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((b) => b.type === 'thinking');
+}
+
+/**
+ * Apportion one API response's `output_tokens` across its split lines.
+ *
+ * Each line's share starts from its visible content estimate (text chars,
+ * tool_use input JSON, block ids/names — see `estimateContentTokens`).
+ * Thinking cost is invisible in the JSONL (thinking text is never
+ * persisted), so the thinking line receives the API's exact
+ * `output_tokens_details.thinking_tokens` when recorded, else the
+ * remainder the visible content cannot account for. Visible shares are
+ * then floor-scaled to fill exactly what is left of `output_tokens`
+ * (rounding remainder to the largest line), so the group's tokens sum to
+ * `output_tokens` — the invariant callers rely on.
+ *
+ * Only called for identical-usage groups (`output_tokens` > 0); legacy
+ * differing-usage groups keep per-line accounting and never reach here.
+ *
+ * @param messages - Parsed session messages
+ * @param group - An identical-usage group from `groupAssistantLines`
+ * @returns Map from message index to that line's apportioned token count
+ */
+function apportionGroupOutput(
+  messages: SessionMessage[],
+  group: AssistantLineGroup,
+): Map<number, number> {
+  const indices = group.indices;
+  const usage = messages[indices[0]!]!.message!.usage!;
+  const output = usage.output_tokens;
+
+  const visible = indices.map((i) => estimateContentTokens(messages[i]!));
+  const visibleTotal = visible.reduce((a, b) => a + b, 0);
+  const thinkingPos = indices.findIndex((i) => hasThinkingBlock(messages[i]!));
+  const thinkingDetail = usage.output_tokens_details?.thinking_tokens;
+
+  let thinkingAlloc = 0;
+  if (thinkingPos >= 0) {
+    thinkingAlloc = thinkingDetail !== undefined
+      ? Math.min(Math.max(0, thinkingDetail), output)
+      : Math.max(0, output - visibleTotal);
+  }
+  const visibleBudget = output - thinkingAlloc;
+
+  const tokens: number[] = indices.map(() => 0);
+  if (visibleTotal > 0) {
+    const scale = visibleBudget / visibleTotal;
+    let assigned = 0;
+    let largest = 0;
+    for (let p = 0; p < indices.length; p++) {
+      const share = Math.floor(visible[p]! * scale);
+      tokens[p] = share;
+      assigned += share;
+      if (visible[p]! > visible[largest]!) largest = p;
+    }
+    tokens[largest] = (tokens[largest] ?? 0) + (visibleBudget - assigned);
+  } else if (indices.length > 0) {
+    // No visible content at all: everything rides on the thinking line
+    // (or the first line when no thinking block exists).
+    const sink = thinkingPos >= 0 ? thinkingPos : 0;
+    tokens[sink] = visibleBudget;
+  }
+  if (thinkingPos >= 0) {
+    tokens[thinkingPos] = (tokens[thinkingPos] ?? 0) + thinkingAlloc;
+  }
+
+  const result = new Map<number, number>();
+  for (let p = 0; p < indices.length; p++) {
+    result.set(indices[p]!, tokens[p]!);
+  }
+  return result;
+}
+
+/**
+ * Build the per-line apportioned token map for a message array.
+ *
+ * Covers every identical-usage multi-line group with a positive
+ * `output_tokens`. Single-line groups are omitted (the per-line path
+ * already returns `output_tokens` for them), as are legacy
+ * differing-usage groups and ungroupable lines.
+ *
+ * @param messages - Parsed session messages
+ * @param lineGroups - Index-to-group map from `groupAssistantLines`
+ * @returns Map from message index to apportioned token count
+ */
+function buildApportionedTokens(
+  messages: SessionMessage[],
+  lineGroups: Map<number, AssistantLineGroup>,
+): Map<number, number> {
+  const apportioned = new Map<number, number>();
+  const seen = new Set<AssistantLineGroup>();
+  for (const group of lineGroups.values()) {
+    if (seen.has(group)) continue;
+    seen.add(group);
+    if (!group.identicalUsage || group.indices.length < 2) continue;
+    const usage = messages[group.indices[0]!]!.message!.usage!;
+    if (usage.output_tokens <= 0) continue;
+    for (const [idx, tok] of apportionGroupOutput(messages, group)) {
+      apportioned.set(idx, tok);
+    }
+  }
+  return apportioned;
 }
 
 /**
@@ -917,15 +1130,26 @@ export function detectCompactionEvents(messages: SessionMessage[]): CompactionEv
  * start, extend, or close a segment.
  *
  * Per-segment token counts are summed from `usage.*` fields rather than
- * estimated, so they're exact when Claude Code recorded usage.
+ * estimated, so they're exact when Claude Code recorded usage. Split
+ * assistant lines that repeat one API response's usage (same `message.id`
+ * or `requestId`, identical usage on every line — the 2.1.114+ shape) are
+ * counted ONCE per group, on the group's last line; legacy groups whose
+ * lines carry differing per-line usage keep per-line sums.
+ * `assistantMessageCount` still counts JSONL lines, not API messages.
  *
  * @param messages - All session messages (classifier's `effectiveMessages`)
+ * @param lineGroups - Optional precomputed split-line groups for `messages`
+ *   (from `groupAssistantLines`); computed on demand when omitted
  * @returns History snapshot with at least one segment for any session that
  *   has at least one non-synthetic assistant turn
  */
-function computeModelHistory(messages: SessionMessage[]): ModelHistory {
+function computeModelHistory(
+  messages: SessionMessage[],
+  lineGroups?: Map<number, AssistantLineGroup>,
+): ModelHistory {
   const segments: ModelSegment[] = [];
   let current: ModelSegment | null = null;
+  const groups = lineGroups ?? groupAssistantLines(messages);
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
@@ -936,15 +1160,24 @@ function computeModelHistory(messages: SessionMessage[]): ModelHistory {
     const usage = msg.message?.usage;
     const timestamp = msg.timestamp ?? null;
 
+    // Identical-usage split groups: count the shared usage once, on the
+    // group's last line. Differing-usage (legacy) groups count every line.
+    const group = groups.get(i);
+    const countUsage = !group
+      || !group.identicalUsage
+      || group.indices[group.indices.length - 1] === i;
+
     if (current && current.model === model) {
       // Extend the open segment.
       current.lastMessageIndex = i;
       current.assistantMessageCount++;
-      current.totalInputTokens += usage?.input_tokens ?? 0;
-      current.totalOutputTokens += usage?.output_tokens ?? 0;
-      // Flat vs nested cache_creation reconciled the same way effectiveInput does
-      current.cacheCreationTokens += cacheCreationTokens(usage);
-      current.cacheReadTokens += usage?.cache_read_input_tokens ?? 0;
+      if (countUsage) {
+        current.totalInputTokens += usage?.input_tokens ?? 0;
+        current.totalOutputTokens += usage?.output_tokens ?? 0;
+        // Flat vs nested cache_creation reconciled the same way effectiveInput does
+        current.cacheCreationTokens += cacheCreationTokens(usage);
+        current.cacheReadTokens += usage?.cache_read_input_tokens ?? 0;
+      }
       current.lastSeenAt = timestamp;
       continue;
     }
@@ -955,10 +1188,10 @@ function computeModelHistory(messages: SessionMessage[]): ModelHistory {
       firstMessageIndex: i,
       lastMessageIndex: i,
       assistantMessageCount: 1,
-      totalInputTokens: usage?.input_tokens ?? 0,
-      totalOutputTokens: usage?.output_tokens ?? 0,
-      cacheCreationTokens: cacheCreationTokens(usage),
-      cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
+      totalInputTokens: countUsage ? usage?.input_tokens ?? 0 : 0,
+      totalOutputTokens: countUsage ? usage?.output_tokens ?? 0 : 0,
+      cacheCreationTokens: countUsage ? cacheCreationTokens(usage) : 0,
+      cacheReadTokens: countUsage ? usage?.cache_read_input_tokens ?? 0 : 0,
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
     };
@@ -1239,6 +1472,13 @@ export function classifySession(
   const mcpServerTokens = new Map<string, number>();
   const mcpServerInvocations = new Map<string, number>();
 
+  // Assistant split-line groups (by message.id, fallback requestId): one
+  // API response's output_tokens is counted once per group, apportioned
+  // across the lines by content share. Legacy differing-usage groups keep
+  // per-line accounting.
+  const lineGroups = groupAssistantLines(effectiveMessages);
+  const apportionedOutput = buildApportionedTokens(effectiveMessages, lineGroups);
+
   // Classify each message
   const classifiedMessages: ClassifiedMessage[] = [];
   let cumulative = 0;
@@ -1249,7 +1489,12 @@ export function classifySession(
     const isFirst = i === 0;
 
     const { category, toolName } = classifyMessage(msg, isLastHuman, isFirst, toolUseIdMap);
-    const estimate = estimateMessageTokens(msg);
+    const apportioned = apportionedOutput.get(i);
+    // Apportioned lines: the group sum is API-exact but the per-line split
+    // is content-estimated, so each line reports 'estimated'.
+    const estimate = apportioned !== undefined
+      ? { tokens: apportioned, accuracy: 'estimated' as const }
+      : estimateMessageTokens(msg);
     let tokens = estimate.tokens;
     let accuracy = estimate.accuracy;
 
@@ -1319,6 +1564,8 @@ export function classifySession(
       accuracy,
       contentPreview: getContentPreview(msg),
       toolName,
+      ...(msg.requestId ? { requestId: msg.requestId } : {}),
+      ...(msg.message?.id ? { messageId: msg.message.id } : {}),
     });
   }
 
@@ -1452,7 +1699,7 @@ export function classifySession(
   //
   // A live override (Claude Code's statusline payload — which preserves the
   // `[1m]` variant JSONL strips) takes precedence when supplied.
-  const modelHistory = computeModelHistory(effectiveMessages);
+  const modelHistory = computeModelHistory(effectiveMessages, lineGroups);
   const model = modelOverride ?? modelHistory.current;
   // Claude Code strips the `[1m]` variant from the recorded model ID, so we
   // combine model-ID lookup with a usage-based heuristic: if any assistant

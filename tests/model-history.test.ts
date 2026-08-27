@@ -277,3 +277,72 @@ describe('context_health regression', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// M8 — split assistant lines: usage counted once per message.id group
+// ---------------------------------------------------------------------------
+
+describe('modelHistory — M8 split assistant lines', () => {
+  /** One assistant JSONL line of a split API response sharing `message.id`. */
+  function splitLine(
+    model: string,
+    messageId: string,
+    text: string,
+    usage: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    },
+  ): SessionMessage {
+    return {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model,
+        id: messageId,
+        content: [{ type: 'text', text }],
+        usage,
+      },
+    } as SessionMessage;
+  }
+
+  test('per-segment totals count a 3-line message.id group once', () => {
+    const shared = {
+      input_tokens: 500,
+      output_tokens: 900,
+      cache_read_input_tokens: 40,
+      cache_creation_input_tokens: 10,
+    };
+    const msgs: SessionMessage[] = [
+      userMsg('go'),
+      splitLine('claude-fable-5', 'msg_1', 'thinking about it', shared),
+      splitLine('claude-fable-5', 'msg_1', 'here is the plan', shared),
+      splitLine('claude-fable-5', 'msg_1', 'and the follow-up', shared),
+      userMsg('next'),
+      splitLine('claude-fable-5', 'msg_2', 'done', { input_tokens: 600, output_tokens: 50 }),
+    ];
+    const h = classifySession(msgs, emptyConfig).modelHistory!;
+    expect(h.segments.length).toBe(1);
+    const seg = h.segments[0]!;
+    expect(seg.totalOutputTokens).toBe(950); // 900 once + 50, not 2,750
+    expect(seg.totalInputTokens).toBe(1_100); // 500 once + 600
+    expect(seg.cacheReadTokens).toBe(40);
+    expect(seg.cacheCreationTokens).toBe(10);
+    // assistantMessageCount still counts JSONL lines, not API messages
+    expect(seg.assistantMessageCount).toBe(4);
+  });
+
+  test('legacy message.id group with differing per-line usage still sums per line', () => {
+    const msgs: SessionMessage[] = [
+      userMsg('go'),
+      splitLine('claude-opus-4-7', 'msg_l', 'a', { input_tokens: 500, output_tokens: 300 }),
+      splitLine('claude-opus-4-7', 'msg_l', 'b', { input_tokens: 500, output_tokens: 400 }),
+      splitLine('claude-opus-4-7', 'msg_l', 'c', { input_tokens: 500, output_tokens: 200 }),
+    ];
+    const h = classifySession(msgs, emptyConfig).modelHistory!;
+    expect(h.segments.length).toBe(1);
+    expect(h.segments[0]!.totalOutputTokens).toBe(900);
+    expect(h.segments[0]!.totalInputTokens).toBe(1_500);
+  });
+});

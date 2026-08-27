@@ -304,6 +304,14 @@ export interface ClassifiedMessage {
   accuracy: 'exact' | 'estimated';
   contentPreview: string;
   toolName?: string;
+  /** API request id (`req_...`) from the source record, when recorded */
+  requestId?: string;
+  /**
+   * API message id (`msg_...`). Split assistant lines of one API response
+   * share this id; their `tokens` are apportioned so the group sums to
+   * the response's `output_tokens` exactly once.
+   */
+  messageId?: string;
 }
 
 /** Breakdown of tool token usage */

@@ -1008,3 +1008,126 @@ describe('M7 resolved-exchange waste rule only fires on human confirmations', ()
     expect(resolvedCount(machineUser('got it, perfect', { isMeta: true }))).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// M8 — split assistant lines: output_tokens once per message.id group
+// ---------------------------------------------------------------------------
+
+/** Usage shared by every line of one split API response (2.1.114+ shape). */
+function splitUsage(u: { input?: number; output: number; thinkingTokens?: number }): TokenUsage {
+  return {
+    input_tokens: u.input ?? 500,
+    output_tokens: u.output,
+    ...(u.thinkingTokens !== undefined
+      ? { output_tokens_details: { thinking_tokens: u.thinkingTokens } }
+      : {}),
+  };
+}
+
+/** One assistant JSONL line of a split API response. */
+function splitLine(
+  content: ContentBlock[],
+  usage: TokenUsage,
+  ids: { messageId?: string; requestId?: string } = {},
+): SessionMessage {
+  return {
+    type: 'assistant',
+    ...(ids.requestId ? { requestId: ids.requestId } : {}),
+    message: {
+      role: 'assistant',
+      model: 'claude-fable-5',
+      content,
+      usage,
+      ...(ids.messageId ? { id: ids.messageId } : {}),
+    },
+  } as SessionMessage;
+}
+
+describe('M8 split assistant lines: output_tokens counted once per message.id group', () => {
+  // 800 chars of plain English -> ~200 tokens at the /4 divisor
+  const TEXT_800 = 'word '.repeat(160);
+  // ~336 chars of tool_use content (input JSON + id + name) -> ~100 tokens at /3.3
+  const BASH_INPUT = { command: 'x'.repeat(310) };
+
+  /** thinking / text / tool_use lines all repeating the same final usage. */
+  function threeLineGroup(usage: TokenUsage): SessionMessage[] {
+    const ids = { messageId: 'msg_01', requestId: 'req_01' };
+    return [
+      splitLine([{ type: 'thinking', thinking: '', signature: 's'.repeat(2_000) }], usage, ids),
+      splitLine([{ type: 'text', text: TEXT_800 }], usage, ids),
+      splitLine([{ type: 'tool_use', id: 'toolu_01', name: 'Bash', input: BASH_INPUT }], usage, ids),
+    ];
+  }
+
+  test('T1: three lines sharing message.id, output 900 -> group sums to 900, not 2,700', () => {
+    const msgs = [userText('go'), ...threeLineGroup(splitUsage({ output: 900 }))];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const groupTokens = b.messages.slice(1).reduce((sum, m) => sum + m.tokens, 0);
+    expect(groupTokens).toBe(900);
+    // The group sum is API-exact but the per-line split is content-estimated
+    expect(b.messages.slice(1).every((m) => m.accuracy === 'estimated')).toBe(true);
+  });
+
+  test('T2: apportioning follows content share; the thinking line takes the remainder (message.id group)', () => {
+    const msgs = [userText('go'), ...threeLineGroup(splitUsage({ output: 900 }))];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const tools = b.buckets.find((x) => x.category === 'tools')!;
+    const conv = b.buckets.find((x) => x.category === 'conversation')!;
+    // tool_use line ~100 tokens by content share
+    expect(tools.tokens).toBeGreaterThanOrEqual(90);
+    expect(tools.tokens).toBeLessThanOrEqual(110);
+    // thinking remainder (~600) + text (~200) -> conversation ~800
+    expect(conv.tokens).toBe(900 - tools.tokens);
+    expect(b.messages[1]!.tokens).toBeGreaterThanOrEqual(590);
+    expect(b.messages[1]!.tokens).toBeLessThanOrEqual(610);
+  });
+
+  test('thinking lines take output_tokens_details.thinking_tokens when the API recorded it (message.id group)', () => {
+    const msgs = [userText('go'), ...threeLineGroup(splitUsage({ output: 900, thinkingTokens: 650 }))];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages[1]!.tokens).toBe(650);
+    const groupTokens = b.messages.slice(1).reduce((sum, m) => sum + m.tokens, 0);
+    expect(groupTokens).toBe(900);
+  });
+
+  test('legacy message.id group with differing per-line usage keeps per-line output_tokens', () => {
+    const mk = (output: number, text: string): SessionMessage =>
+      splitLine([{ type: 'text', text }], { input_tokens: 500, output_tokens: output }, { messageId: 'msg_legacy' });
+    const msgs = [userText('go'), mk(300, 'alpha'), mk(400, 'beta'), mk(200, 'gamma')];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages.slice(1).map((m) => m.tokens)).toEqual([300, 400, 200]);
+    expect(b.messages.slice(1).every((m) => m.accuracy === 'exact')).toBe(true);
+  });
+
+  test('lines without message.id group by requestId (fallback key)', () => {
+    const usage = splitUsage({ output: 500 });
+    const msgs = [
+      userText('go'),
+      splitLine([{ type: 'thinking', thinking: '', signature: 'sig' }], usage, { requestId: 'req_9' }),
+      splitLine([{ type: 'text', text: TEXT_800 }], usage, { requestId: 'req_9' }),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages[1]!.tokens + b.messages[2]!.tokens).toBe(500);
+  });
+
+  test('distinct message.ids are never merged: each response keeps its own output_tokens', () => {
+    const msgs = [
+      userText('go'),
+      splitLine([{ type: 'text', text: 'one' }], splitUsage({ output: 120 }), { messageId: 'msg_a' }),
+      splitLine([{ type: 'text', text: 'two' }], splitUsage({ output: 80 }), { messageId: 'msg_b' }),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages[1]!.tokens).toBe(120);
+    expect(b.messages[2]!.tokens).toBe(80);
+    expect(b.messages[1]!.accuracy).toBe('exact');
+  });
+
+  test('ClassifiedMessage carries requestId and messageId from the record', () => {
+    const msgs = [userText('go'), ...threeLineGroup(splitUsage({ output: 900 }))];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.messages[1]!.messageId).toBe('msg_01');
+    expect(b.messages[1]!.requestId).toBe('req_01');
+    expect(b.messages[0]!.messageId).toBeUndefined();
+    expect(b.messages[0]!.requestId).toBeUndefined();
+  });
+});
