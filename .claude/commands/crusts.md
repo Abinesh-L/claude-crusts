@@ -9,7 +9,7 @@ Steps:
 
 2. Parse the JSON result. Focus on:
    - `breakdown.usage_percentage` and `breakdown.context_limit`
-   - `breakdown.buckets` (the 6 CRUSTS categories with token counts)
+   - `breakdown.buckets` (the 6 CRUSTS categories with token counts; each bucket's `tokens` is reconciled so the buckets sum to the API window total, while `contentTokens` keeps the raw classifier estimate)
    - `waste` array (each item has `description`, `estimated_tokens`, `severity`, `recommendation`)
    - `recommendations.context_health` (healthy/warming/hot/critical)
    - `recommendations.estimated_messages_until_compaction`

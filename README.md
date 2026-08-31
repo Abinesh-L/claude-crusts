@@ -49,7 +49,7 @@ TOTAL:  143,507 / 200,000  (71.8%)
 
 "index.ts" read 9 times
 "types.ts" read 6 times
-36 of 40 tool schemas unused
+11 of 22 loaded tool schemas unused
 Auto-compaction in ~12 msgs
 
 Context health: HOT
@@ -120,41 +120,48 @@ claude-crusts tui
 
 **What CRUSTS does.** Slices your Claude Code context window into 6 categories — **C**onversation, **R**etrieved, **U**ser, **S**ystem, **T**ools, **S**tate/memory — finds the crusts (what's gone stale or never got used), and trims them for you.
 
+Real output from a real session (a 1M-window Fable 5 run with one compaction behind it):
+
 ```
-╔════════════════════════════════════════════════════════════════╗
-║  CRUSTS Context Window Analysis                                ║
-║  Session: a1b2c3d4 | Model: claude-sonnet-4-6                  ║
-║  Messages: 426                                                 ║
-╠════════════════════════════════════════════════════════════════╣
-║                                                                ║
-║  C  Conversation        7,616 tkns   (5.3%)  █░░░░░░░░░░░░░░░░ ║
-║  R  Retrieved          35,996 tkns  (25.1%)  ████░░░░░░░░░░░░░ ║
-║  U  User Input          4,217 tkns   (2.9%)  █░░░░░░░░░░░░░░░░ ║
-║  S  System              7,319 tkns   (5.1%)  █░░░░░░░░░░░░░░░░ ║
-║  T  Tools              86,460 tkns  (60.3%)  ██████████░░░░░░░ ║
-║  S  State/Memory        1,899 tkns   (1.3%)  █░░░░░░░░░░░░░░░░ ║
-║  ──────────────────────────────────────────────────────────────║
-║  TOTAL: 143,507 / 200,000 tokens (71.8%)                       ║
-║  FREE:  56,493 tokens                                          ║
-║                                                                ║
-║  WASTE DETECTED:                                               ║
-║     "index.ts" read 9 times -- est. ~9,897 tokens              ║
-║     "types.ts" read 6 times -- est. ~5,972 tokens              ║
-║     ... and 6 more                                             ║
-║                                                                ║
-║  RECOMMENDATIONS:                                              ║
-║     /compact to remove duplicate reads                         ║
-║     Review loaded tools -- 36 of 40 were never used            ║
-║     Messages until auto-compaction: ~48                        ║
-║                                                                ║
-║  Context health: HOT                                           ║
-╚════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║  CRUSTS Context Window Analysis                              ║
+║  Session: 34ac6b07 | Model: claude-fable-5                   ║
+║  Messages: 281 | Duration: 216h 43m                          ║
+║  1 compaction(s) detected — showing current context          ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  C  Conversation       17,873 tkns  (14.7%)  ██░░░░░░░░░░░░░░║
+║  R  Retrieved           4,034 tkns   (3.3%)  █░░░░░░░░░░░░░░░║
+║  U  User Input             39 tkns   (0.0%)  ░░░░░░░░░░░░░░░░║
+║  S  System             40,004 tkns  (33.0%)  █████░░░░░░░░░░░║
+║  T  Tools              55,295 tkns  (45.6%)  ███████░░░░░░░░░║
+║  S  State/Memory        4,066 tkns   (3.4%)  █░░░░░░░░░░░░░░░║
+║  ──────────────────────────────────────────────────────────  ║
+║  TOTAL: 121,311 / 1,000,000 tokens (12.1%)                   ║
+║  FREE:  878,689 tokens                                       ║
+║                                                              ║
+║  Session lifetime: 237,324 tokens across 281 messages        ║
+║                                                              ║
+║  RECOMMENDATIONS:                                            ║
+║     MCP: 7 server(s) connected, none invoked                 ║
+║     Messages until auto-compaction: ~801                     ║
+║     Run `claude-crusts waste` for full details               ║
+║                                                              ║
+║  Context health: HEALTHY                                     ║
+║                                                              ║
+║  Derived from this session's API data:                       ║
+║    Internal system prompt: ~20,389 tokens                    ║
+║    Message framing: ~23 tokens/msg (11 samples)              ║
+║  Run `claude-crusts calibrate` for ground truth comparison.  ║
+╚══════════════════════════════════════════════════════════════╝
 ```
+
+The category buckets are reconciled to the API's own window total, so they sum to the TOTAL line exactly. Note the window: CRUSTS resolved 1,000,000 tokens from the session's own signals, not a hardcoded 200K.
 
 Fully offline. Zero API calls. Zero token cost.
 
 **Core capabilities:**
-- **Auto-inject** — `hooks auto-inject enable` installs a hook that writes a session-specific `/compact focus` command and surfaces it in Claude's next reply when you cross the configured threshold. You paste, Claude runs it, context drops. Every fire logged to `~/.claude-crusts/auto-inject.log` for audit.
+- **Auto-inject** — `hooks auto-inject enable` installs a hook that writes a session-specific `/compact focus` command and surfaces it in Claude's next reply when the window nears Claude Code's auto-compaction trigger (or your configured threshold). You paste, Claude runs it, context drops. Every fire logged to `~/.claude-crusts/auto-inject.log` for audit.
 - **Active optimization** — `optimize --apply` writes `.claudeignore` and CLAUDE.md rules for you, with confirmation prompts and backups under `~/.claude-crusts/backups/`.
 - **6-category context breakdown** — Conversation, Retrieved, User, System, Tools, State/Memory. See exactly where your tokens are going.
 - **Waste detection** — duplicate file reads, unused tool schemas, stale content, resolved exchanges, cache overhead, unused tool results.
@@ -386,35 +393,46 @@ claude-crusts waste
 claude-crusts waste e5f6a7b8       # any past session
 ```
 
+Real output from the same session as the `analyze` example above:
+
 ```
-── WASTE DETECTED ──
+  Waste Detection Report
+  Session: 34ac6b07 | Messages: 281
 
-[MEDIUM] "index.ts" read 9 times (earlier reads at #3, #45, #67, #89,
-         #102, #145, #201, #267 are redundant) ~9,897 tkns
-  → This file is already in context from msg #267. Tell Claude:
-    "In index.ts that you already read, fix the bug"
+  11 issue(s) found — ~6,850 tokens reclaimable (5.6%)
 
-[MEDIUM] "types.ts" read 6 times (earlier reads are redundant) ~5,972 tkns
-  → Avoid re-reading files that haven't changed.
+  ── LOW (10) ──
 
-── RECOMMENDATIONS ──
+  [LOW] Bash result at message #113 (~1503 tokens) appears unused by assistant ~1,503 tkns
+    → Consider whether this tool call was necessary. Unused results waste context space.
 
-P2 /compact focus on the renderer.ts, classifier.ts, types.ts changes
-   Estimated savings: ~11,159 tokens
+  [LOW] Bash result at message #85 (~1128 tokens) appears unused by assistant ~1,128 tkns
+    → Consider whether this tool call was necessary. Unused results waste context space.
 
-P3 Top 5 context consumers:
-   1. index.ts (read 9x) — 9,897 tokens in duplicates
-   2. Tool schemas (40 loaded, 4 used) — ~9,055 tokens
-   3. types.ts (read 6x) — 5,972 tokens in duplicates
-   4. System prompt (CLAUDE.md + internal) — 6,298 tokens
-   5. classifier.ts (read 6x) — 4,659 tokens in duplicates
+  ── INFO (1) ──
 
-P5 3 compactions this session — use /clear between distinct tasks
+  [INFO] Cache reads are 89.3% of total input — system prompt + tool schemas are re-sent every turn ~0 tkns
+    → Reduce CLAUDE.md size and disable unused MCP servers to lower per-turn cache cost.
+
+  ── RECOMMENDATIONS ──
+
+  P3 Top 5 context consumers:
+          1. Tool schemas (22 loaded, 11 used) — 22,500 tokens
+          2. System prompt (CLAUDE.md 1,294 + internal 20,389) — 21,683 tokens
+          3. Compaction summary (compressed context from 199,326 tokens) — 3,413 tokens
+          4. Memory files (56 file(s)) — 2,345 tokens
+     These items consume the most context window space in your current session.
+
+  P5 MCP: 7 server(s) connected, none invoked
+     MCP tools are loaded on-demand — no upfront token cost for connected but unused servers.
+
+  Context health: HEALTHY
+  Messages until auto-compaction: ~801
 ```
 
 Detects:
 - **Duplicate file reads** — which files, how many times, which messages, estimated wasted tokens
-- **Unused tools** — how many of 40 built-in tools were actually invoked vs loaded
+- **Unused tools** — which of the loaded tool schemas (core plus any ToolSearch-loaded deferred tools) were never invoked; deferred tools that were never loaded cost nothing and are never counted against you
 - **Cache overhead** — what percentage of your input is re-reading the same cached content every message
 - **Oversized system prompt** — when CLAUDE.md is large enough to consider splitting
 - **Compaction patterns** — how often you're hitting auto-compaction and what to do about it
@@ -750,7 +768,7 @@ Not everyone wants context info after every response — this is strictly opt-in
 
 ### `claude-crusts hooks auto-inject <subcommand>`
 
-**CRUSTS writes your next `/compact` for you.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every user prompt, crusts silently analyses the session; if usage has crossed the configured threshold (default 70%) and the last injection was more than `minGapMs` ago (default 5 min), it prepends a targeted advisory to Claude's context — including a `/compact focus "..."` tuned to the top waste items in **this** session.
+**CRUSTS writes your next `/compact` for you.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every user prompt, crusts silently analyses the session; if the live window is close to Claude Code's auto-compaction trigger (the trigger sits about 33K tokens below the window limit; the default gate fires within max(20K, 10% of the limit) of it) and the last injection was more than `minGapMs` ago (default 5 min), it prepends a targeted advisory to Claude's context — including a `/compact focus "..."` tuned to the top waste items in **this** session. Setting an explicit `threshold` (a usage percent) in config replaces the headroom gate.
 
 Claude reads the advisory and surfaces the `/compact focus` command in its reply — you paste and run it. CRUSTS never executes `/compact` directly; that stays your call. Every fire is logged to `~/.claude-crusts/auto-inject.log` so you can audit exactly when the hook fired and what advisory it generated.
 
@@ -762,7 +780,7 @@ claude-crusts hooks auto-inject log          # view injection history (newest fi
 claude-crusts hooks auto-inject log --limit 5 --verbose  # last 5 fires with full advisory text
 ```
 
-Tune via `~/.claude-crusts/config.json`:
+Tune via `~/.claude-crusts/config.json` (`threshold` is optional; when present it replaces the default headroom gate with a flat usage-percent gate):
 
 ```json
 {
@@ -867,13 +885,13 @@ CRUSTS classifies every token in your context window into 6 categories:
 | **R** | **Retrieved** | File reads, grep results, web fetches pulled into context |
 | **U** | **User Input** | Your current message and any attachments |
 | **S** | **System** | System prompt, CLAUDE.md files, compaction summaries |
-| **T** | **Tools** | Tool schemas (~40 built-in + MCP), tool calls, and tool results |
+| **T** | **Tools** | Tool schemas (20 always-loaded core tools + ToolSearch-loaded deferred/MCP tools), tool calls, and tool results |
 | **S** | **State/Memory** | Memory files, plans, skill metadata, agent summaries |
 
 Each category maps to a different lever you can pull to reclaim context space:
 
 - **Too much R?** → You're re-reading files Claude already has. Use `/compact`.
-- **Too much T?** → 40 tool schemas are loaded whether you use them or not. Start fresh sessions for different tasks.
+- **Too much T?** → The core tool schemas (~20K tokens on current Claude Code) are a fixed per-version tax, and every ToolSearch load adds more (~1,000 tokens per deferred built-in, ~330 per MCP tool). Tool *results* are the part you control: start fresh sessions for different tasks.
 - **Too much S?** → Trim your CLAUDE.md files. They're re-sent every message.
 - **Too much C?** → Long session. Time to `/compact` or `/clear` and start fresh.
 
@@ -891,7 +909,7 @@ CRUSTS reads Claude Code's session files directly from disk. **No API calls. No 
 
 **Past sessions work.** Claude Code forgets everything when a session ends. The JSONL files remain on disk permanently. CRUSTS can analyze sessions from days or weeks ago — useful for understanding why a past session hit compaction unexpectedly or consumed more tokens than expected.
 
-**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from the first assistant message's API token count minus all known components (CLAUDE.md, tool schemas, memory, discovered skills, first user message). Skills are discovered from `settings.json` — not hardcoded. Different sessions with different setups produce different derived values.
+**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from the first assistant message's API token count minus all known components (CLAUDE.md, core tool schemas, memory, skills, the first user message, and any attachment records injected before the first response). Skills are read from the session's own skill listing when present, falling back to `~/.claude/skills/` and installed plugins. Different sessions with different setups produce different derived values.
 
 **Token estimation** uses `output_tokens` from the API response (exact for assistant messages) and character-based heuristics for everything else (empirically calibrated). Use `claude-crusts calibrate` with `/context` output to measure estimation accuracy for your sessions.
 
@@ -904,15 +922,15 @@ On March 31, 2026, Claude Code's full TypeScript source (~512K lines) was accide
 | `isCompactSummary` flag on messages | Identifies compaction summaries in JSONL — these are 3-5K token messages that replace compacted content. Without this flag, they'd be misclassified as regular conversation. |
 | `compact_boundary` subtype with `compactMetadata.preTokens` | Precise compaction detection with exact pre/post token counts instead of heuristic-based guessing. |
 | `model: "<synthetic>"` on session exit messages | Filters out false compaction events caused by session exit/resume artifacts. |
-| Tool schema architecture (~40 tools) | Enables unused tool detection: CRUSTS tracks which tools were loaded vs actually invoked during a session. |
-| `block.signature` on thinking blocks | Includes thinking block signatures in token estimation — real content blocks that aren't visible in the message text. |
-| Cache read architecture | Detects cache overhead ratio: flags when cache re-reads exceed 90% of input tokens. |
+| Tool schema architecture (core + deferred tools) | Enables unused tool detection: CRUSTS tracks which schemas were loaded (always-loaded core tools plus ToolSearch-loaded deferred tools) vs actually invoked during a session. |
+| `block.signature` on thinking blocks | Confirms the signature is an opaque verification token, not content. CRUSTS excludes it from token estimation, and thinking text itself is never persisted in the JSONL. |
+| Cache read architecture | Detects cache overhead ratio: flags when cache re-reads exceed 60% of input tokens. |
 
 **What was already publicly known:**
 - JSONL session logs at `~/.claude/` — the community had already been parsing these
 - `/context` command output format — publicly documented by Anthropic
 
-The leak's specific contribution was the compaction markers, synthetic message filtering, and thinking block signatures — which enabled waste detection and compaction prediction features in CRUSTS.
+The leak's specific contribution was the compaction markers, synthetic message filtering, and the thinking-block internals — which enabled waste detection and compaction prediction features in CRUSTS.
 
 ## CRUSTS vs `/context`
 
@@ -943,8 +961,8 @@ CRUSTS doesn't replace `/context` — it complements it. Use `/context` for a qu
 CRUSTS answers the question behind the number — not just "how full is my context?" but **"so what?"**
 
 - **"I'm at 75% context — but what's eating it?"** → CRUSTS breakdown shows Tools at 65%, Retrieved at 25%, Conversation at 5%. The problem isn't your chat — it's tool schemas and redundant file reads.
-- **"Why does auto-compaction keep surprising me?"** → CRUSTS predicts when it will trigger based on the ~80% threshold from community analysis of the leaked source: "auto-compaction in ~48 messages." (Note: auto-compaction triggers around 80% but checks at turn boundaries — a heavy turn with multiple file reads can overshoot to ~85-90% before it fires.)
-- **"Why is my quota depleting so fast?"** → CRUSTS flags cache overhead: when cache re-reads exceed 90% of input tokens, most of your quota is re-sending the same content every message — even at the 90% cache discount.
+- **"Why does auto-compaction keep surprising me?"** → CRUSTS models the trigger the way Claude Code actually behaves: auto-compaction fires when about 33K tokens of headroom remain (83.5% of a 200K window, 96.7% of 1M), not at a flat 80%. "Auto-compaction in ~48 messages." (Note: the check lands on turn boundaries — a heavy turn with multiple file reads can overshoot the trigger before it fires.)
+- **"Why is my quota depleting so fast?"** → CRUSTS flags cache overhead: when cache re-reads exceed 60% of input tokens, most of your quota is re-sending the same content every message — even at the 90% cache discount.
 - **"What can I actually DO about it?"** → Run `claude-crusts fix` — it generates three pasteable blocks: one to paste into your current session (tells Claude which files to stop re-reading), one to add to your CLAUDE.md (prevents the same waste next time), and one /compact command with a content-based focus hint describing what to preserve.
 
 If you've ever been surprised by auto-compaction wiping your carefully built context, CRUSTS helps you see it coming and act before it happens.
@@ -982,14 +1000,13 @@ This is a command you paste directly into Claude Code. CRUSTS looks at the files
 
 ```
 💡 P3  Top 5 context consumers:
-       1. Tool schemas (40 loaded, 4 used) — ~9,055 tokens
-       2. index.ts (read 9x) — 9,897 tokens in duplicates
-       3. types.ts (read 6x) — 5,972 tokens in duplicates
-       4. System prompt (CLAUDE.md + internal) — 6,298 tokens
-       5. classifier.ts (read 6x) — 4,659 tokens in duplicates
+       1. Tool schemas (22 loaded, 11 used) — 22,500 tokens
+       2. System prompt (CLAUDE.md 1,294 + internal 20,389) — 21,683 tokens
+       3. Compaction summary (compressed context from 199,326 tokens) — 3,413 tokens
+       4. Memory files (56 file(s)) — 2,345 tokens
 ```
 
-Only 4 of 40 built-in tools were actually invoked (Bash, Read, Write, Edit). The other 36 tool schemas sit in context consuming ~9K tokens whether you use them or not.
+In this real session, 22 tool schemas were in the window: the 20 always-loaded core tools plus 2 deferred tools (WebSearch, WebFetch) that a ToolSearch call loaded mid-session. Only 11 were ever invoked. Deferred tools that were never loaded (19 built-ins and 71 MCP tools here) cost zero and are never reported as unused.
 
 ### Compaction prediction
 
@@ -1034,14 +1051,16 @@ All of these are generated from patterns in your session data — no LLM, no API
 CRUSTS produces estimates — like `/context` itself, which Claude Code labels "Estimated usage by category."
 
 **What is exact** (verified against raw JSONL data):
+- The TOTAL line — the latest API response's own token accounting (input + cache), not a sum of guesses
 - Duplicate file counts — every file, every read, every message number
 - Unused tool detection — loaded vs invoked, exact set difference
 - Cache overhead ratio — direct calculation from API usage fields
 - Compaction events — detected from actual `compact_boundary` markers in the JSONL
+- Assistant output tokens — `output_tokens` from the API, counted once per API message even when Claude Code splits one response across several JSONL lines
 
 **What is estimated:**
-- Per-message token counts — uses chars/3.35 for code, chars/4.0 for English text (empirically measured from session data)
-- Category breakdown percentages — based on estimated per-message tokens
+- Per-message token counts — uses chars/3.3 for code, chars/4.0 for English text (empirically measured from session data)
+- Category bucket values — content estimates, reconciled so they sum to the exact API window total (the raw pre-reconciliation values are kept as `contentTokens` in the JSON output)
 - System prompt size — derived from first API response minus known components
 - Compaction prediction — based on average token growth rate
 
@@ -1068,7 +1087,7 @@ bun run src/index.ts analyze
 
 # Verify your change before committing
 bun run typecheck                   # strict TS typecheck
-bun test                            # 190+ unit tests (under 10s)
+bun test                            # 450+ unit tests (under 10s)
 ```
 
 Every new user-visible command must land with:

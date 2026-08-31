@@ -95,7 +95,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 ### File Responsibilities
 
 - **types.ts**: All shared types and interfaces (including ComparisonResult, CategoryDelta, TrendRecord, TrendSummary, SkillInfo)
-- **index.ts**: CLI entrypoint with 18 Commander.js commands (adds `optimize`, `doctor`, `diff` to the hooks/statusline groups; `trend` gains `--format csv` / `--output` flags)
+- **index.ts**: CLI entrypoint with 23 user-facing Commander.js commands (see the CLI Commands table above; `trend` gains `--format csv` / `--output` flags)
 - **analyzer.ts**: Pipeline orchestrator, project path decoding, trend recording
 - **scanner.ts**: Session discovery, JSONL streaming, config readers (MCP, memory, skills). `discoverSessions` fills `SessionInfo.claudeCodeVersion` via `readClaudeCodeVersion(path)`, a chunked head probe (64 KB steps, 1 MB cap) for the first record with a non-empty `version`; `detectClaudeCodeVersion(messages)` does the same over parsed records and feeds `breakdown.claudeCodeVersion` in the classifier
 - **classifier.ts**: Core engine — classification, token estimation, compaction detection, derived overhead, auto-trim. `computeModelHistory` walks non-synthetic assistant turns and builds `ModelHistory` (one segment per contiguous same-model run, with per-segment input/output/cache token sums). `breakdown.model` reports the LAST non-synthetic model (current state), not the first.
@@ -140,7 +140,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 - NOT counted: `block.signature`. Thinking text is never persisted in the JSONL (every thinking block has `thinking: ''`); the signature is an opaque verification token, not content
 
 **Derived overhead** — per-session, not hardcoded:
-- Internal system prompt: first assistant `input_tokens` − known components (CLAUDE.md + core tool schemas [version-keyed, calibration-pinned; see built-in-tools.ts] + memory + discovered skills [fallback 476] + first user message). Range 1K-15K.
+- Internal system prompt: first assistant effective input − known components (CLAUDE.md + core tool schemas [version-keyed, calibration-pinned; see built-in-tools.ts] + memory + skills [skill_listing attachment preferred, else discovery, fallback 476] + first user message + attachment records preceding the first assistant). Accepted range: 1,000 up to the first turn's total effective input (the old 15K cap silently discarded the real ~20K+ fixed context on current Claude Code versions). Semantics: "Claude Code fixed context not present in the JSONL".
 - Message framing: median of ≤20 consecutive assistant pair deltas from post-compaction window. Range 0-50 tokens/msg. Distributed proportionally across categories.
 
 **Edit-aware waste detection**:
@@ -162,6 +162,8 @@ Supporting: `types.ts`, `built-in-tools.ts`
 
 **Health label reads current, not lifetime** — `recommender.ts` passes `breakdown.currentContext?.usage_percentage ?? breakdown.usage_percentage` to `getContextHealth`. Using `breakdown.usage_percentage` alone was a bug: post-compaction sessions accumulate lifetime tokens that routinely exceed the context limit, reading as "critical" even when the live window is cold. The fallback path preserves correct behaviour for pre-compaction sessions where `currentContext` is undefined.
 
+**Window reconciliation (v0.8.0)** — bucket `tokens` are scaled (floor + remainder to the largest bucket) so their sum equals the API window `total_tokens` exactly; the raw classifier estimate is preserved per bucket as `contentTokens`. `currentContext` buckets are always reconciled when usage data exists; lifetime buckets are reconciled only when the session never compacted (a compacted lifetime is a cumulative-flow number, kept on the content basis). Guard band: if the scale factor falls outside [0.7, 1.4] the buckets stay on the content basis (`reconciliation.basis === 'content'`) and the scale is printed under `--verbose`, keeping estimator drift visible instead of masking it. Trend records carry `bucketBasis` (`window` or `content`; blank for pre-0.8 records).
+
 ## All Constants
 
 | Constant | File | Value | Purpose |
@@ -174,7 +176,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 | `OVERSIZED_SYSTEM_THRESHOLD` | waste-detector.ts | 1,500 | System prompt token warning |
 | `CACHE_OVERHEAD_THRESHOLD` | waste-detector.ts | 0.6 | Cache read ratio warning (60%) |
 | `RESOLUTION_LOOKBACK` | waste-detector.ts | 10 | Messages to scan for resolved exchanges |
-| `COMPACTION_THRESHOLD` | recommender.ts | 0.80 | Auto-compaction trigger (~80%, actual fires at turn boundaries so heavy turns overshoot to ~85-90%) |
+| `AUTOCOMPACT_BUFFER_TOKENS` | model-context.ts | 33,000 | Auto-compaction headroom buffer; trigger = `autocompactTrigger(limit)` = limit − buffer (167,000 on 200K, 967,000 on 1M). `autocompactBufferTokens` in config.json overrides. Fires at turn boundaries, so heavy turns overshoot |
 | `HEALTH_THRESHOLDS` | recommender.ts | 50/70/85 | healthy/warming/hot/critical |
 | `MCP_TOKENS_PER_TOOL` | scanner.ts | 0 | MCP tools loaded on-demand |
 | `CORE_SCHEMA_TOKENS_BY_VERSION` | built-in-tools.ts | 20,500 / 17,500 / 15,000 | Core tool schema cost by Claude Code version band (>=2.1.214 / >=2.1.160 / >=2.1.150); `LEGACY_CORE_SCHEMA_TOKENS` 9,055 below that (aliased as `TOTAL_BUILTIN_TOOL_TOKENS`); a saved calibrate override wins |
@@ -189,7 +191,7 @@ Supporting: `types.ts`, `built-in-tools.ts`
 | `CRUSTS_CONFIG_PATH` | config.ts | `~/.claude-crusts/config.json` | Shared user config (hooks + wasteThresholds) |
 | `DEFAULT_WASTE_THRESHOLDS` | config.ts | see source | Defaults merged with user overrides |
 | `BACKUPS_PER_FILE` | optimizer.ts | 10 | Max backups kept per original filename under `~/.claude-crusts/backups/` |
-| `DEFAULT_AUTO_INJECT` | config.ts | `{enabled:false, threshold:70, minGapMs:300000}` | Default auto-injection config (opt-in via `hooks auto-inject enable`) |
+| `DEFAULT_AUTO_INJECT` | config.ts | `{enabled:false, threshold:70, minGapMs:300000}` | Default auto-injection config (opt-in via `hooks auto-inject enable`). The `threshold` percent gates ONLY when the user set it explicitly in config.json (`thresholdExplicit`); otherwise the gate is headroom-based: inject when the window is within max(20,000, 10% of limit) tokens of `autocompactTrigger(limit)` |
 | `AUTO_INJECT_HOOK_COMMAND` | hooks.ts | `claude-crusts auto-inject` | Command installed as Claude Code `UserPromptSubmit` hook |
 
 ## Waste Detection Rules
@@ -221,8 +223,10 @@ Every non-trivial change must land with unit test coverage.
 
 ## Known Issues
 
-- `bun.lock` still says `"name": "crusts"` (pre-rename, harmless)
-- Report version string is hardcoded in `html-report.ts` and `md-report.ts` footers (not read from package.json)
+- Interleaved concurrent-session chains: a JSONL where several prompt chains interleave (parallel Claude Code panes on one session file) shows unmarked >30K drops between consecutive assistants. Chain reconstruction from `last-prompt.leafUuid` is deferred (v0.8.0 mitigates it: phantom rows are dropped at parse time and compaction detection prefers markers over the drop heuristic)
+- Subagent session files are not discovered or merged into the parent analysis (`--include-subagents` deferred)
+- Attachment records are assumed to persist in the window on later turns; if Claude Code re-injects some types per turn (task_reminder is the big one), those buckets can over-count. Settling evidence: framing-delta sign across turns with large task reminders
+- `CORE_SCHEMA_TOKENS_BY_VERSION` values are minimums read off /context rows that may already include ToolSearch-loaded built-ins; a saved `calibrate` override is always the authority
 
 ## Dependencies
 
