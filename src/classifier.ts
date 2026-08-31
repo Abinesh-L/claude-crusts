@@ -2012,11 +2012,13 @@ export function classifySession(
   // data (pre-compaction pairs span compaction boundaries and produce
   // negative deltas). Distributed BEFORE the content sum and lifetime
   // buckets are computed (M9) so the lifetime view includes framing on
-  // the same basis as currentContext does.
+  // the same basis as currentContext does. The window opens right after
+  // the boundary record — the same slice start the currentContext view
+  // uses — so both derive from an identical post-compaction view.
   const framingStartIndex = compactionEvents.length > 0
-    ? compactionEvents[compactionEvents.length - 1]!.afterIndex
+    ? compactionEvents[compactionEvents.length - 1]!.beforeIndex + 1
     : 0;
-  const derivedFraming = deriveMessageFraming(effectiveMessages, classifiedMessages, framingStartIndex);
+  const derivedFraming = deriveMessageFraming(effectiveMessages, classifiedMessages, lineGroups, framingStartIndex);
 
   // Add derived framing overhead — distribute proportionally across
   // categories. Attachment rows are injected content, not messages, so
@@ -2235,7 +2237,14 @@ export function classifySession(
   let currentContext: CrustsBreakdown['currentContext'] = undefined;
   if (compactionEvents.length > 0) {
     const lastCompaction = compactionEvents[compactionEvents.length - 1]!;
-    const startIndex = lastCompaction.afterIndex;
+    // The new window starts right AFTER the boundary record: Claude Code
+    // re-sends everything written past the boundary — the compact summary
+    // itself, re-sent file attachments, hook output, task notifications —
+    // on the next request. `afterIndex` (the first post-boundary assistant
+    // with usage, kept on CompactionEvent for tokensAfter scanning) can sit
+    // many records later; slicing from it silently dropped those records
+    // from the live-window buckets on every compacted session.
+    const startIndex = lastCompaction.beforeIndex + 1;
 
     const currentCategoryTokens: Record<CrustsCategory, number> = {
       conversation: 0, retrieved: 0, user: 0, system: 0, tools: 0, state: 0,
@@ -2482,29 +2491,45 @@ function deriveInternalSystemPrompt(
 }
 
 /**
- * Derive per-message framing overhead from consecutive assistant message pairs.
+ * Derive per-message framing overhead from consecutive assistant PAIRS,
+ * one entry per API message.
  *
- * For each pair of consecutive assistant messages (both with usage data),
+ * For each pair of consecutive API messages (both with usage data),
  * compute: actual_delta = next_total_input - current_total_input.
- * Then compute expected_delta = sum of classified tokens for messages between.
- * The difference (actual - expected) / message_count = framing per message.
+ * Then compute expected_delta = sum of classified tokens for the window
+ * between them. The difference (actual - expected) / message_count =
+ * framing per message.
+ *
+ * Since Claude Code v2.1.114 one API response spans several JSONL lines
+ * (thinking / text / tool_use) sharing `message.id`, so the pair list is
+ * built per GROUP: the entry sits on the group's LAST line (whose usage is
+ * the response's final usage) while the expected-delta window opens at the
+ * group's FIRST line. Opening at the last line dropped the earlier lines'
+ * apportioned output shares (the thinking share is typically the bulk of
+ * `output_tokens`), inflating every sample past the 0-50 acceptance band
+ * and returning null on all split-line sessions.
  *
  * Uses the median of up to 20 samples for robustness against outliers.
  * Different sessions will produce different values.
  *
  * @param messages - Parsed session messages (post-compaction subset if applicable)
  * @param classifiedMessages - Already-classified messages with token estimates
+ * @param lineGroups - Split-line groups from `groupAssistantLines`
  * @param startIndex - Start index in messages to sample from (e.g., post-compaction)
  * @returns Derivation result or null if insufficient data
  */
 function deriveMessageFraming(
   messages: SessionMessage[],
   classifiedMessages: ClassifiedMessage[],
+  lineGroups: Map<number, AssistantLineGroup>,
   startIndex: number = 0,
 ): DerivedOverhead['messageFraming'] {
-  // Find consecutive assistant message pairs with usage
+  // One entry per API message, with the window boundary of its first line
   interface AssistantInfo {
+    /** Index of the API message's LAST line (carries the final usage) */
     index: number;
+    /** Index of its FIRST line — the expected-delta window opens here */
+    firstIndex: number;
     totalInput: number;
   }
 
@@ -2513,8 +2538,17 @@ function deriveMessageFraming(
     const msg = messages[i]!;
     if (msg.type !== 'assistant' || !msg.message?.usage) continue;
     const totalInput = effectiveInput(msg.message.usage);
-    if (totalInput > 0) {
-      assistants.push({ index: i, totalInput });
+    if (totalInput <= 0) continue;
+    const group = lineGroups.get(i);
+    if (group && group.identicalUsage && group.indices.length > 1) {
+      // Split-line response: one entry, emitted at the group's last line.
+      if (i !== group.indices[group.indices.length - 1]) continue;
+      assistants.push({ index: i, firstIndex: group.indices[0]!, totalInput });
+    } else {
+      // Single-line responses, legacy differing-usage groups, and
+      // ungroupable lines keep per-line pairing (their per-line tokens are
+      // their own output, so the old window arithmetic is already right).
+      assistants.push({ index: i, firstIndex: i, totalInput });
     }
   }
 
@@ -2533,13 +2567,15 @@ function deriveMessageFraming(
     // Skip pairs where input dropped (compaction or cache shift)
     if (actualDelta <= 0) continue;
 
-    // Sum classified tokens for messages between curr and next (exclusive of
-    // both). Attachment rows contribute their tokens to the expected delta
-    // (their text IS part of the input growth) but not to the per-message
-    // divisor — they are injected into a turn, not framed as messages.
+    // Sum classified tokens for the window [curr's first line, next's first
+    // line): the whole curr group's apportioned output plus every record
+    // between the responses, and nothing of next's own output. Attachment
+    // rows contribute their tokens to the expected delta (their text IS
+    // part of the input growth) but not to the per-message divisor — they
+    // are injected into a turn, not framed as messages.
     let expectedDelta = 0;
     let msgCountBetween = 0;
-    for (let i = curr.index; i < next.index; i++) {
+    for (let i = curr.firstIndex; i < next.firstIndex; i++) {
       const cm = classifiedMessages[i];
       if (cm) {
         expectedDelta += cm.tokens;

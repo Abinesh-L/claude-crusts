@@ -232,3 +232,93 @@ describe('M17 session habit counts only auto compactions (sandboxed)', () => {
     expect(habitRec([event(), event(), event()])).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review fix: attachment rows are excluded from the compaction-prediction
+// per-message average, so the priority recommendation and the summary
+// `estimated_messages_until_compaction` can never disagree
+// ---------------------------------------------------------------------------
+
+describe('review fix: compaction prediction excludes attachment rows (sandboxed)', () => {
+  let sandbox: string;
+  let savedOverride: string | undefined;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'crusts-recommender-'));
+    savedOverride = process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    process.env.CRUSTS_CONFIG_DIR_OVERRIDE = sandbox;
+  });
+
+  afterEach(() => {
+    if (savedOverride === undefined) {
+      delete process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    } else {
+      process.env.CRUSTS_CONFIG_DIR_OVERRIDE = savedOverride;
+    }
+    try { rmSync(sandbox, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  /** Attachment row: real window tokens, but not a message (M11). */
+  function attachmentRow(index: number, cumulative: number): ClassifiedMessage {
+    return {
+      index,
+      category: 'system',
+      tokens: 0,
+      cumulativeTokens: cumulative,
+      accuracy: 'estimated',
+      contentPreview: '[attachment: task_reminder]',
+      isAttachment: true,
+    };
+  }
+
+  /** Parse "~N messages until auto-compaction" out of a recommendation. */
+  function predictedMessages(report: ReturnType<typeof generateRecommendations>): number | undefined {
+    const rec = report.recommendations.find((r) => r.action.includes('until auto-compaction'));
+    const m = rec?.action.match(/~(\d+) messages until auto-compaction/);
+    return m ? Number(m[1]) : undefined;
+  }
+
+  test('prediction recommendation and estimated_messages_until_compaction agree on a fixture with attachment rows', () => {
+    // 1 real message + 2 attachment rows at 15,000 tokens on a 200K window.
+    // Undiluted average: 15,000/msg -> floor((167,000 - 15,000) / 15,000)
+    // = 10 messages left. The raw row count (3) diluted the average to
+    // 5,000/msg and printed ~30 in the SAME dashboard that summarized ~10.
+    const bd = breakdownTokens(15_000, 200_000, 1);
+    bd.messages = [
+      bd.messages[0]!,
+      attachmentRow(1, 15_000),
+      attachmentRow(2, 15_000),
+    ];
+    const report = generateRecommendations(bd, [], emptyConfig(), []);
+
+    expect(report.estimated_messages_until_compaction).toBe(10);
+    expect(predictedMessages(report)).toBe(10);
+  });
+
+  test('post-compaction slice with attachment rows: both counters still agree', () => {
+    // currentContext at startIndex 2; the slice holds 2 real + 2 attachment
+    // rows at 15,000 tokens. Undiluted: 7,500/msg -> 20 messages left.
+    const bd = breakdownTokens(15_000, 200_000, 2);
+    const real = bd.messages;
+    bd.messages = [
+      attachmentRow(0, 0), attachmentRow(1, 0),   // pre-compaction rows
+      real[0]!, attachmentRow(3, 100), real[1]!, attachmentRow(5, 15_000),
+    ];
+    bd.compactionEvents = [{
+      beforeIndex: 1, afterIndex: 2,
+      tokensBefore: 150_000, tokensAfter: 15_000, tokensDropped: 135_000,
+      detection: 'marker', trigger: 'auto',
+    }];
+    bd.currentContext = {
+      buckets: [],
+      total_tokens: 15_000,
+      free_tokens: 185_000,
+      usage_percentage: 7.5,
+      startIndex: 2,
+    } as CrustsBreakdown['currentContext'];
+
+    const report = generateRecommendations(bd, [], emptyConfig(), []);
+    expect(report.estimated_messages_until_compaction).toBe(20);
+    expect(predictedMessages(report)).toBe(20);
+  });
+});

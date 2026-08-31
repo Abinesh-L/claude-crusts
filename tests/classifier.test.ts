@@ -1824,3 +1824,129 @@ describe('M18 window reconciliation through classifySession', () => {
     expect(b.buckets.reduce((s, x) => s + x.tokens, 0)).not.toBe(b.total_tokens);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.8.0 review fixes — the current-context window opens at the boundary,
+// and framing derivation survives split-line (thinking+text) turns
+// ---------------------------------------------------------------------------
+
+describe('review fix: currentContext slice starts right after the boundary record', () => {
+  /**
+   * The exact shape that tripped the M18 guard band on real sessions: a
+   * compact summary, a re-sent file attachment, and a task-notification all
+   * sit BETWEEN the boundary and the first post-boundary assistant. They
+   * are re-sent in the new window, so they belong in currentContext.
+   */
+  function compactedWithInterstitials(): SessionMessage[] {
+    return [
+      userText('q1'),                                                     // 0 user
+      assistantWithCache(100, 400),                                       // 1 (derivation rejected: residual < 1K)
+      compactBoundary(150_000),                                           // 2 boundary
+      {
+        type: 'user', isCompactSummary: true,
+        message: { role: 'user', content: [{ type: 'text', text: 'S'.repeat(40_000) }] },
+      } as SessionMessage,                                                // 3 summary -> System 10,000
+      attachment('file', 8_000),                                          // 4 re-sent file -> Retrieved 2,000
+      {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: `<task-notification>${'t'.repeat(12_000)}</task-notification>` }] },
+      } as SessionMessage,                                                // 5 -> Tools 3,010
+      userText('q2'),                                                     // 6 user 1
+      assistantWithCache(100, 15_800),                                    // 7 first post-boundary assistant
+    ];
+  }
+
+  test('summary, attachments, and task-notifications between boundary and first assistant land in currentContext buckets', () => {
+    const b = classifySession(compactedWithInterstitials(), EMPTY_CONFIG);
+    expect(b.compactionEvents.length).toBe(1);
+    const cc = b.currentContext!;
+    // beforeIndex + 1, NOT afterIndex (which is the assistant at 7)
+    expect(cc.startIndex).toBe(3);
+    expect(b.compactionEvents[0]!.afterIndex).toBe(7);
+
+    const byCat = (cat: CrustsCategory) => cc.buckets.find((x) => x.category === cat)!;
+    // Raw content accounting: every skipped-before record now counts.
+    expect(byCat('system').contentTokens).toBe(10_000);   // the compact summary itself
+    expect(byCat('retrieved').contentTokens).toBe(2_000); // re-sent file attachment
+    expect(byCat('tools').contentTokens).toBe(3_010);     // task-notification
+    expect(byCat('user').contentTokens).toBe(1);
+    expect(byCat('conversation').contentTokens).toBe(100);
+  });
+
+  test('including the interstitial records keeps the scale in band: basis api and buckets sum EXACTLY to total_tokens', () => {
+    const b = classifySession(compactedWithInterstitials(), EMPTY_CONFIG);
+    const cc = b.currentContext!;
+    // API window: 15,900 effective input + 100 output. Content sum 15,111
+    // -> scale ~1.05. With the old afterIndex slice the content sum was
+    // 100 (just the assistant), scale 160 -> out of band, reconciliation
+    // skipped, and the dashboard rows did not sum to TOTAL.
+    expect(cc.total_tokens).toBe(16_000);
+    expect(cc.contentSumTokens).toBe(15_111);
+    expect(cc.reconciliation!.basis).toBe('api');
+    expect(cc.buckets.reduce((s, x) => s + x.tokens, 0)).toBe(cc.total_tokens);
+  });
+
+  test('the waste-detector post-compaction window follows the same slice start', () => {
+    const msgs = compactedWithInterstitials();
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    // detectWaste slices messages at currentContext.startIndex; with the
+    // boundary-anchored start this must not throw and must keep analyzing
+    // the post-boundary records (smoke assertion: it runs on the slice).
+    expect(() => detectWaste(msgs, b, EMPTY_CONFIG)).not.toThrow();
+  });
+});
+
+describe('review fix: framing derivation on split-line (thinking+text) turns', () => {
+  // ~200 tokens of plain English at the /4 divisor
+  const FRAMING_TEXT = 'word '.repeat(160);
+
+  /** One 2.1.114+ API response: thinking + text lines sharing message.id and final usage. */
+  function splitTurn(input: number, id: string): SessionMessage[] {
+    const usage: TokenUsage = { input_tokens: input, output_tokens: 900 };
+    return [
+      splitLine([{ type: 'thinking', thinking: '', signature: 's'.repeat(2_000) } as ContentBlock], usage, { messageId: id }),
+      splitLine([{ type: 'text', text: FRAMING_TEXT } as ContentBlock], usage, { messageId: id }),
+    ];
+  }
+
+  test('a session of split turns with true framing 30/msg derives exactly 30, mirroring the single-line case', () => {
+    // Each turn adds 900 output + 1 prompt token + 3 framed rows x 30
+    // = 991 to the next response's input. Before the fix the only positive
+    // pairs started at a group's LAST line, so the thinking line's ~700
+    // apportioned output share was missing from expectedDelta: every
+    // sample computed ~(90 + 700)/2 = 395 tokens/msg, failed the 0-50
+    // band, and derivation returned null on all split-line sessions.
+    const msgs: SessionMessage[] = [
+      userText('q0'), ...splitTurn(1_000, 'msg_f1'),
+      userText('q1'), ...splitTurn(1_991, 'msg_f2'),
+      userText('q2'), ...splitTurn(2_982, 'msg_f3'),
+      userText('q3'), ...splitTurn(3_973, 'msg_f4'),
+      userText('q4'), ...splitTurn(4_964, 'msg_f5'),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const framing = b.derivedOverhead!.messageFraming;
+    expect(framing).not.toBeNull();
+    expect(framing!.tokensPerMessage).toBe(30);
+    expect(framing!.sampleCount).toBe(4);
+    // Distributed per classified row (10 assistant lines + 5 prompts)
+    expect(framing!.totalTokens).toBe(30 * 15);
+  });
+
+  test('single-line turns still derive the same framing (control, unchanged path)', () => {
+    // Identical arithmetic with one line per response: 900 output + 1
+    // prompt + 2 framed rows x 30 = 961 per pair.
+    const single = (input: number): SessionMessage =>
+      splitLine([{ type: 'text', text: FRAMING_TEXT } as ContentBlock], { input_tokens: input, output_tokens: 900 }, {});
+    const msgs: SessionMessage[] = [
+      userText('q0'), single(1_000),
+      userText('q1'), single(1_961),
+      userText('q2'), single(2_922),
+      userText('q3'), single(3_883),
+      userText('q4'), single(4_844),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const framing = b.derivedOverhead!.messageFraming;
+    expect(framing).not.toBeNull();
+    expect(framing!.tokensPerMessage).toBe(30);
+  });
+});

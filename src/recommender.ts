@@ -15,6 +15,7 @@ import type {
   ConfigData,
   SessionMessage,
   FixPrompts,
+  ClassifiedMessage,
 } from './types.ts';
 import { buildCompactFocus } from './optimizer.ts';
 import { countAnalyzedMessages } from './classifier.ts';
@@ -59,6 +60,22 @@ function getContextHealth(usagePercent: number): ContextHealth {
 }
 
 /**
+ * Classified rows belonging to the live context window: the post-compaction
+ * slice when the session compacted, all rows otherwise. Every per-message
+ * average in this module counts through `countAnalyzedMessages` over these
+ * rows so the prediction recommendation and
+ * `estimated_messages_until_compaction` can never disagree.
+ *
+ * @param breakdown - The CRUSTS breakdown
+ * @returns Rows of the live window
+ */
+function currentWindowRows(breakdown: CrustsBreakdown): ClassifiedMessage[] {
+  return breakdown.currentContext
+    ? breakdown.messages.slice(breakdown.currentContext.startIndex)
+    : breakdown.messages;
+}
+
+/**
  * Estimate how many more messages can be sent before auto-compaction.
  *
  * Uses the average tokens per message from the current context window
@@ -71,10 +88,7 @@ function getContextHealth(usagePercent: number): ContextHealth {
  */
 function estimateMessagesUntilCompaction(breakdown: CrustsBreakdown): number | null {
   const ctx = breakdown.currentContext ?? breakdown;
-  const rows = breakdown.currentContext
-    ? breakdown.messages.slice(breakdown.currentContext.startIndex)
-    : breakdown.messages;
-  const msgCount = countAnalyzedMessages(rows);
+  const msgCount = countAnalyzedMessages(currentWindowRows(breakdown));
   if (msgCount === 0) return null;
 
   const { trigger } = resolveAutocompactTrigger(breakdown);
@@ -233,9 +247,12 @@ function recommendMCPInfo(
  */
 function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendation[] {
   const ctx = breakdown.currentContext ?? breakdown;
-  const msgCount = breakdown.currentContext
-    ? breakdown.messages.length - breakdown.currentContext.startIndex
-    : breakdown.messages.length;
+  // Same divisor as estimateMessagesUntilCompaction: analyzed (non-
+  // attachment) rows of the live window. Raw row counts included
+  // attachment records, diluting the per-message average and overstating
+  // the remaining runway in this recommendation while the summary line
+  // below printed the undiluted number.
+  const msgCount = countAnalyzedMessages(currentWindowRows(breakdown));
   if (msgCount === 0) return [];
 
   const { trigger, bufferTokens } = resolveAutocompactTrigger(breakdown);

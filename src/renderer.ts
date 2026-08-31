@@ -29,6 +29,7 @@ import type {
 import type { LostAnalysis, CompactionLoss, LostItem } from './lost-detector.ts';
 import { autocompactTrigger } from './model-context.ts';
 import { loadAutocompactBufferTokens } from './config.ts';
+import { countAnalyzedMessages } from './classifier.ts';
 
 // ---------------------------------------------------------------------------
 // Color scheme
@@ -428,7 +429,11 @@ export function renderTimeline(
   if (classified.length > 0) {
     const last = classified[classified.length - 1]!;
     if (last.cumulativeTokens < compactionTokens) {
-      const avgPerMsg = last.cumulativeTokens / classified.length;
+      // Per-message average over analyzed (non-attachment) rows only:
+      // attachment rows are injected context, not messages, and counting
+      // them diluted the average and overstated the remaining runway.
+      const analyzedCount = countAnalyzedMessages(classified);
+      const avgPerMsg = analyzedCount > 0 ? last.cumulativeTokens / analyzedCount : 0;
       if (avgPerMsg > 0) {
         const remaining = Math.floor((compactionTokens - last.cumulativeTokens) / avgPerMsg);
         console.log(chalk.dim(`\n  Compaction predicted at message ~${classified.length + remaining} (auto-compact trigger = ${compactionTokens.toLocaleString()} tokens)`));

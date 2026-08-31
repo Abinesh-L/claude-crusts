@@ -9,7 +9,7 @@
 import { statSync, watchFile, unwatchFile } from 'fs';
 import chalk from 'chalk';
 import { parseSession } from './scanner.ts';
-import { classifySession } from './classifier.ts';
+import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
 import { generateRecommendations } from './recommender.ts';
 import { gatherConfigData } from './analyzer.ts';
@@ -150,7 +150,9 @@ async function renderUpdate(
   const recommendations = generateRecommendations(breakdown, waste, configData, messages);
 
   if (firstRender) {
-    startMessageCount = breakdown.messages.length;
+    // Analyzed (non-attachment) rows only — the M11 exclusion rule — so
+    // every watch count agrees with `analyze` on the same session.
+    startMessageCount = countAnalyzedMessages(breakdown.messages);
     prevCompactionCount = breakdown.compactionEvents.length;
     firstRender = false;
   }
@@ -238,10 +240,11 @@ function renderDashboard(
   console.log(`  ${catParts.join('  ')}`);
   console.log();
 
-  // Message count
-  const msgDelta = breakdown.messages.length - startMessageCount;
+  // Message count (analyzed rows only, matching `analyze`)
+  const msgCount = countAnalyzedMessages(breakdown.messages);
+  const msgDelta = msgCount - startMessageCount;
   const msgSuffix = msgDelta > 0 ? chalk.dim(` (+${msgDelta} since watch started)`) : '';
-  console.log(`  Messages: ${chalk.bold(String(breakdown.messages.length))}${msgSuffix}`);
+  console.log(`  Messages: ${chalk.bold(String(msgCount))}${msgSuffix}`);
 
   // Compaction count
   if (breakdown.compactionEvents.length > 0) {
@@ -282,8 +285,11 @@ function renderDashboard(
 
 /**
  * Output a JSON line for the current state (newline-delimited JSON mode).
+ *
+ * Exported for regression tests (the message-count parity with `analyze`);
+ * the watch loop is the production caller.
  */
-function renderJsonUpdate(
+export function renderJsonUpdate(
   breakdown: CrustsBreakdown,
   wasteCount: number,
   msgsUntilCompaction: number | null,
@@ -302,7 +308,8 @@ function renderJsonUpdate(
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     sessionId: session.id,
-    messageCount: breakdown.messages.length,
+    // Analyzed (non-attachment) rows only, matching `analyze` messageCount
+    messageCount: countAnalyzedMessages(breakdown.messages),
     model: breakdown.model,
     totalTokens: total,
     contextLimit: breakdown.context_limit,
@@ -335,7 +342,7 @@ async function renderExitSummary(
   const total = hasCompaction ? breakdown.currentContext!.total_tokens : breakdown.total_tokens;
   const pct = hasCompaction ? breakdown.currentContext!.usage_percentage : breakdown.usage_percentage;
 
-  const endMessageCount = breakdown.messages.length;
+  const endMessageCount = countAnalyzedMessages(breakdown.messages);
   const observed = endMessageCount - startMessageCount;
 
   console.log();

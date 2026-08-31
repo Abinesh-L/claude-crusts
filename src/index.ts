@@ -14,7 +14,7 @@ import chalk from 'chalk';
 import Table from 'cli-table3';
 import { discoverSessions, parseSession } from './scanner.ts';
 import { analyzeSession, gatherConfigData } from './analyzer.ts';
-import { setVerbose, classifySession } from './classifier.ts';
+import { setVerbose, classifySession, countAnalyzedMessages } from './classifier.ts';
 import { runCalibration, renderCalibrationComparison } from './calibrator.ts';
 import { compareSessions } from './comparator.ts';
 import { generateSessionReport, generateComparisonReport } from './html-report.ts';
@@ -531,7 +531,9 @@ program
       usage_percentage: breakdown.usage_percentage,
     };
     const pct = view.usage_percentage;
-    const msgCount = breakdown.messages.length;
+    // Analyzed (non-attachment) rows only, so the hook-facing one-liner
+    // agrees with `analyze` on the same session (M11 exclusion rule).
+    const msgCount = countAnalyzedMessages(breakdown.messages);
     const compCount = breakdown.compactionEvents.length;
 
     const healthLabel = pct < 50 ? 'healthy' : pct < 70 ? 'warming' : pct < 85 ? 'hot' : 'critical';
