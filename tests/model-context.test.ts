@@ -187,8 +187,8 @@ describe('effectiveInput (M4 usage drift)', () => {
 // ---------------------------------------------------------------------------
 
 /** User record shaped like Claude Code's recorded /context output. */
-function contextUsageRecord(tokensLine: string, extra: { asBlocks?: boolean } = {}) {
-  const text = '## Context Usage\n\n**Model:** claude-fable-5  \n**Tokens:** ' + tokensLine
+function contextUsageRecord(tokensLine: string, extra: { asBlocks?: boolean; model?: string } = {}) {
+  const text = '## Context Usage\n\n**Model:** ' + (extra.model ?? 'claude-fable-5') + '  \n**Tokens:** ' + tokensLine
     + '\n\n### Estimated usage by category\n\n| Category | Tokens | Percentage |\n| System prompt | 4.1k | 0.4% |';
   return {
     type: 'user',
@@ -241,6 +241,26 @@ describe('M13 native-1M model table', () => {
   test('a dotted 5-generation session under 200K resolves natively, not to the default', () => {
     expect(resolveContextLimitWithSignal('claude-opus-5-5', []))
       .toEqual({ limit: 1_000_000, signal: 'native' });
+  });
+});
+
+describe('0.8.1 /context outputs are matched to the model they measured', () => {
+  test('a /context output from another model family is skipped', () => {
+    const fable = contextUsageRecord('300k / 1m (30%)', { model: 'claude-fable-5-1' });
+    expect(detectContextCommandWindow([fable], 'claude-opus-4-8')).toBeNull();
+    expect(resolveContextLimitWithSignal('claude-opus-4-8', [fable]).signal).toBe('default');
+  });
+
+  test('the same family matches across a [1m] variant and without a model filter', () => {
+    const opus = contextUsageRecord('287.3k / 1m (29%)', { model: 'claude-opus-4-8[1m]' });
+    expect(detectContextCommandWindow([opus], 'claude-opus-4-8')).toBe(1_000_000);
+    expect(detectContextCommandWindow([opus])).toBe(1_000_000);
+  });
+
+  test('the newest matching output wins over a newer one from another model', () => {
+    const opus = contextUsageRecord('177.2k / 1m (18%)', { model: 'claude-opus-4-8' });
+    const other = contextUsageRecord('55.4k / 200k (28%)', { model: 'claude-sonnet-4-6' });
+    expect(detectContextCommandWindow([opus, other], 'claude-opus-4-8')).toBe(1_000_000);
   });
 });
 
@@ -332,7 +352,7 @@ describe('M13 resolveContextLimitWithSignal priority order', () => {
   });
 
   test('context-command outranks model-id', () => {
-    expect(resolveContextLimitWithSignal('claude-opus-4-7[1m]', [contextUsageRecord('55.4k / 200k (28%)')]))
+    expect(resolveContextLimitWithSignal('claude-opus-4-7[1m]', [contextUsageRecord('55.4k / 200k (28%)', { model: 'claude-opus-4-7[1m]' })]))
       .toEqual({ limit: 200_000, signal: 'context-command' });
   });
 

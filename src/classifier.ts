@@ -39,7 +39,7 @@ import type {
   ModelHistory,
   ModelSegment,
 } from './types.ts';
-import { resolveContextLimitWithSignal, effectiveInput, cacheCreationTokens } from './model-context.ts';
+import { resolveContextLimitWithSignal, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
 import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName } from './built-in-tools.ts';
@@ -2251,6 +2251,28 @@ export function classifySession(
   // limit instead of inheriting the current model's window.
   const modelSpans = computeModelSpans(effectiveMessages, modelHistory);
   const lastSpan = modelSpans[modelSpans.length - 1]!;
+  // Evidence for one model's window is not confined to one contiguous run:
+  // after fable -> opus-4-8 -> fable -> opus-4-8, the last opus-4-8 run
+  // often has no /context output and no turn above 200K of its own, while an
+  // earlier opus-4-8 run proved the window ("/ 1m"). Scoping to the last run
+  // alone resolved 200K there and fired advisories at a real 16% of 1M. So
+  // each resolution reads every run of the same model family (other
+  // families' runs stay out, and a /context output is also checked against
+  // the model it names).
+  const familyMessageCache = new Map<string, SessionMessage[]>();
+  /** Messages of every span that ran on `target`'s model family. */
+  const sameFamilyMessages = (target: string): SessionMessage[] => {
+    const family = modelFamily(target);
+    const cached = familyMessageCache.get(family);
+    if (cached) return cached;
+    const out: SessionMessage[] = [];
+    for (const s of modelSpans) {
+      if (modelFamily(s.model) !== family) continue;
+      for (let k = s.start; k <= s.end; k++) out.push(effectiveMessages[k]!);
+    }
+    familyMessageCache.set(family, out);
+    return out;
+  };
   for (const event of compactionEvents) {
     // The window that ENDED at this event ran on the model of the last
     // real assistant at or before `beforeIndex` (the boundary record
@@ -2267,7 +2289,7 @@ export function classifySession(
     // live payload override describes the CURRENT window, never a past one.
     event.contextLimit = resolveContextLimitWithSignal(
       span.model,
-      effectiveMessages.slice(span.start, span.end + 1),
+      sameFamilyMessages(span.model),
       { settingsModels: configData.settingsModels },
     ).limit;
   }
@@ -2276,12 +2298,15 @@ export function classifySession(
   // every signal is combined in priority order: live payload override,
   // recorded /context output, model-ID variant, settings.json model,
   // usage above 200K (conclusive 1M), and the native-1M model table.
-  // Scoped to the LAST model span (the whole session when the model never
-  // switched) so `context_limit` reports the window the session is ON,
-  // not one a pre-switch model ran with.
+  // Scoped to the runs of the CURRENT model family (the whole session when
+  // the model never switched) so `context_limit` reports the window the
+  // session is ON, not one a different pre-switch model ran with.
+  const currentFamilyMessages = sameFamilyMessages(model);
   const contextResolution = resolveContextLimitWithSignal(
     model,
-    lastSpan.start > 0 ? effectiveMessages.slice(lastSpan.start) : effectiveMessages,
+    currentFamilyMessages.length > 0
+      ? currentFamilyMessages
+      : lastSpan.start > 0 ? effectiveMessages.slice(lastSpan.start) : effectiveMessages,
     {
       limitOverride,
       settingsModels: configData.settingsModels,

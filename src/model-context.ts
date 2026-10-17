@@ -26,7 +26,7 @@
  *                          maximum is larger.
  */
 
-import { parseContextWindowSize } from './calibrator.ts';
+import { parseContextWindowSize, parseModelHeader } from './calibrator.ts';
 
 /** Fallback window size for any model that doesn't match a known variant */
 export const DEFAULT_CONTEXT_LIMIT = 200_000;
@@ -265,15 +265,25 @@ function contentText(content: unknown): string {
  * record that parses, so a mid-session window change is reported from the
  * newest evidence.
  *
+ * The output names the model it measured (`**Model:** claude-opus-5[1m]`);
+ * when `modelId` is given, a record taken on a different model family is
+ * skipped, since it says nothing about this model's window.
+ *
  * @param messages - Session messages (only user records are considered)
- * @returns Window size in tokens, or null when no /context output is recorded
+ * @param modelId - Optional model whose window is wanted
+ * @returns Window size in tokens, or null when no matching /context output is recorded
  */
-export function detectContextCommandWindow(messages: UsageMessage[]): number | null {
+export function detectContextCommandWindow(messages: UsageMessage[], modelId?: string): number | null {
+  const family = modelId ? modelFamily(modelId) : '';
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
     if (m.type !== 'user' && m.message?.role !== 'user') continue;
     const text = contentText(m.message?.content);
     if (!text.trimStart().startsWith(CONTEXT_COMMAND_MARKER)) continue;
+    if (family) {
+      const recorded = parseModelHeader(text);
+      if (recorded && !familiesMatch(family, modelFamily(recorded))) continue;
+    }
     const window = parseContextWindowSize(text);
     if (window !== null && window > 0) return window;
   }
@@ -413,7 +423,7 @@ export function resolveContextLimitWithSignal(
   if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
     return { limit: Math.floor(override), signal: 'payload' };
   }
-  const commandWindow = detectContextCommandWindow(messages);
+  const commandWindow = detectContextCommandWindow(messages, modelId);
   if (commandWindow !== null) {
     return { limit: commandWindow, signal: 'context-command' };
   }

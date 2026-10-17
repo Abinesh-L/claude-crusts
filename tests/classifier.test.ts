@@ -2092,3 +2092,53 @@ describe('0.8.1: records carried over past a compaction boundary', () => {
     expect(b.derivedOverhead!.internalSystemPrompt).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.1: window evidence from every run of the same model
+// ---------------------------------------------------------------------------
+
+describe('0.8.1: window evidence from every run of the same model', () => {
+  /** A turn on `model` whose effective input sits in cache_read. */
+  function on(model: string, effective: number): SessionMessage {
+    return {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model,
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: effective, output_tokens: 100 },
+      },
+    } as SessionMessage;
+  }
+  /** Recorded /context output for `model`. */
+  function contextOutput(model: string, tokens: string): SessionMessage {
+    return machineUser(`## Context Usage\n\n**Model:** ${model}\n**Tokens:** ${tokens}\n`, { isMeta: true });
+  }
+
+  test('a later run of a 4.x model keeps the 1M window an earlier run proved', () => {
+    // fable -> opus-4-8 (/context says 1m) -> fable -> opus-4-8 at 160K.
+    // The last opus-4-8 run has no evidence of its own; 200K made 160K read 80%.
+    const msgs: SessionMessage[] = [
+      userText('a'), on('claude-fable-5-1', 300_000),
+      userText('b'), on('claude-opus-4-8', 280_000),
+      contextOutput('claude-opus-4-8', '287.3k / 1m (29%)'),
+      userText('c'), on('claude-fable-5-1', 310_000),
+      userText('d'), on('claude-opus-4-8', 160_000),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
+    expect(b.model).toBe('claude-opus-4-8');
+    expect(b.context_limit).toBe(1_000_000);
+    expect(b.usage_percentage).toBeCloseTo(16.01, 2);
+  });
+
+  test("another family's evidence never sets the current model's window", () => {
+    // Only fable proved 1M; the opus-4-8 run itself has no signal.
+    const msgs: SessionMessage[] = [
+      userText('a'), on('claude-fable-5-1', 300_000),
+      contextOutput('claude-fable-5-1', '300k / 1m (30%)'),
+      userText('b'), on('claude-opus-4-8', 120_000),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
+    expect(b.context_limit).toBe(200_000);
+  });
+});

@@ -191,10 +191,13 @@ export function parseContextWindowSize(text: string): number | null {
 /**
  * Parse the `**Model:** claude-opus-5` header.
  *
+ * Exposed so the context-limit resolver can tell which model a recorded
+ * /context output measured.
+ *
  * @param text - Full /context output
  * @returns Model id as printed (a `[1m]` suffix is retained), or null
  */
-function parseModelHeader(text: string): string | null {
+export function parseModelHeader(text: string): string | null {
   const match = text.match(/^\s*\**\s*model\s*\**\s*:\s*\**\s*(\S+)/im);
   return match ? match[1]!.replace(/\*+$/, '') : null;
 }
