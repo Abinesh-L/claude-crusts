@@ -82,8 +82,9 @@ export interface AutoInjectConfig {
    * Usage-percentage threshold (0-100) above which injection fires.
    * Honoured only when the user explicitly set it in config.json (see
    * `thresholdExplicit`); otherwise the gate is headroom-based: inject when
-   * the window is within `max(20K, 10% of limit)` tokens of the
-   * auto-compaction trigger (`autocompactTrigger` in model-context.ts).
+   * the window is within `max(20K, 10% of the auto-compact window)` tokens of
+   * the auto-compaction trigger (`breakdown.compaction`, see
+   * `resolveCompactionModel` in model-context.ts).
    */
   threshold: number;
   /**
@@ -94,11 +95,17 @@ export interface AutoInjectConfig {
   thresholdExplicit?: boolean;
   /** Minimum time (ms) between two injections on the same session */
   minGapMs: number;
-  /** ISO timestamp of the most recent injection (set by runtime) */
+  /** ISO timestamp of the most recent injection on any session (set by runtime) */
   lastInjectionAt?: string;
   /** Session id that received the most recent injection */
   lastInjectionSessionId?: string;
+  /** Most recent injection per session id (ISO timestamps; set by runtime,
+   * the newest `RECENT_INJECTIONS_KEPT` sessions kept) */
+  lastInjections?: Record<string, string>;
 }
+
+/** How many sessions' last-injection times config.json keeps. */
+export const RECENT_INJECTIONS_KEPT = 50;
 
 /** Tunable thresholds for waste and optimize detection. */
 export interface WasteThresholds {
@@ -161,12 +168,38 @@ export function saveConfig(updates: Record<string, unknown>): void {
   const target = crustsConfigPath();
   const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(temp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
-  try {
-    renameSync(temp, target);
-  } catch (err) {
-    try { unlinkSync(temp); } catch { /* best effort */ }
-    throw err;
+  // On Windows a rename over a file another process has open for reading
+  // fails with EPERM or EBUSY for a moment (seen under concurrent hooks), so
+  // it is retried briefly before giving up.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(temp, target);
+      return;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if ((code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') && attempt < RENAME_RETRIES) {
+        sleepSync(RENAME_RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+      try { unlinkSync(temp); } catch { /* best effort */ }
+      throw err;
+    }
   }
+}
+
+/** Rename attempts after the first, for a busy config.json on Windows. */
+const RENAME_RETRIES = 8;
+
+/** Base delay between rename attempts (grows linearly). */
+const RENAME_RETRY_DELAY_MS = 15;
+
+/**
+ * Block the thread for a few milliseconds (Atomics.wait on a private buffer).
+ *
+ * @param ms - Milliseconds to wait
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
@@ -212,6 +245,12 @@ export function loadAutoInjectConfig(): AutoInjectConfig {
   if (!raw || typeof raw !== 'object') return { ...DEFAULT_AUTO_INJECT, thresholdExplicit: false };
 
   const thresholdExplicit = typeof raw.threshold === 'number' && raw.threshold > 0 && raw.threshold <= 100;
+  const lastInjections: Record<string, string> = {};
+  if (raw.lastInjections && typeof raw.lastInjections === 'object') {
+    for (const [sid, ts] of Object.entries(raw.lastInjections)) {
+      if (typeof ts === 'string') lastInjections[sid] = ts;
+    }
+  }
   return {
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : DEFAULT_AUTO_INJECT.enabled,
     threshold: thresholdExplicit ? raw.threshold as number : DEFAULT_AUTO_INJECT.threshold,
@@ -221,6 +260,7 @@ export function loadAutoInjectConfig(): AutoInjectConfig {
       : DEFAULT_AUTO_INJECT.minGapMs,
     lastInjectionAt: typeof raw.lastInjectionAt === 'string' ? raw.lastInjectionAt : undefined,
     lastInjectionSessionId: typeof raw.lastInjectionSessionId === 'string' ? raw.lastInjectionSessionId : undefined,
+    lastInjections,
   };
 }
 
@@ -233,17 +273,30 @@ export function loadAutoInjectConfig(): AutoInjectConfig {
  * into config.json would make them read back as explicit user choices and
  * silently disable the headroom-based default gate. Sibling config keys and
  * the user's own `enabled` / `threshold` / `minGapMs` values are preserved.
+ *
+ * The time is also kept per session (`lastInjections`), so the min-gap
+ * holds for each session on its own: with one shared slot, two hot sessions
+ * alternated and each got an advisory on every prompt.
  */
 export function recordInjection(sessionId: string): void {
   const cfg = loadConfig();
   const raw = cfg.autoInject && typeof cfg.autoInject === 'object'
     ? cfg.autoInject as Record<string, unknown>
     : {};
+  const now = new Date().toISOString();
+  const previous = raw.lastInjections && typeof raw.lastInjections === 'object'
+    ? raw.lastInjections as Record<string, unknown>
+    : {};
+  const entries = Object.entries(previous)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[0] !== sessionId)
+    .sort((a, b) => b[1].localeCompare(a[1]))
+    .slice(0, RECENT_INJECTIONS_KEPT - 1);
   saveConfig({
     autoInject: {
       ...raw,
-      lastInjectionAt: new Date().toISOString(),
+      lastInjectionAt: now,
       lastInjectionSessionId: sessionId,
+      lastInjections: Object.fromEntries([[sessionId, now], ...entries]),
     },
   });
 }

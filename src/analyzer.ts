@@ -74,7 +74,7 @@ export function gatherConfigData(
  * @param sessionPath - Path to the session JSONL file
  * @returns Decoded project directory path, or undefined if not derivable
  */
-function deriveProjectPath(sessionPath: string): string | undefined {
+export function deriveProjectPath(sessionPath: string): string | undefined {
   const projectDir = dirname(sessionPath);
   const projectSlug = basename(projectDir);
 

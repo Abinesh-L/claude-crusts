@@ -19,7 +19,7 @@
 import { existsSync, appendFileSync, readFileSync, mkdirSync } from 'fs';
 import { basename, dirname, join } from 'path';
 import { parseSession, collectObservedMcpServers } from './scanner.ts';
-import { gatherConfigData } from './analyzer.ts';
+import { gatherConfigData, deriveProjectPath } from './analyzer.ts';
 import { classifySession, nonHumanPromptKind } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
 import { loadAutoInjectConfig, loadAutocompactBufferTokens, recordInjection } from './config.ts';
@@ -156,7 +156,8 @@ export function promptSkipReason(prompt: string | undefined): string | null {
   if (typeof prompt !== 'string') return null;
   const kind = nonHumanPromptKind(prompt);
   if (kind === 'local-command' || kind === 'interrupt') return `not a prompt (${kind})`;
-  if (/^\/(compact|clear)(\s|$)/.test(prompt.trimStart())) return 'compaction command';
+  // /reset and /new are documented aliases of /clear.
+  if (/^\/(compact|clear|reset|new)(\s|$)/i.test(prompt.trimStart())) return 'compaction command';
   return null;
 }
 
@@ -172,15 +173,17 @@ export type InjectDecision =
  *   1. config.enabled — opted in
  *   2. the hotness gate:
  *      - explicit `autoInject.threshold` in config.json → usage percent
- *        ≥ threshold (the user's choice is honoured verbatim);
+ *        ≥ threshold, honoured while that point comes before Claude Code's
+ *        trigger; when the trigger sits below it, the headroom gate below;
  *      - otherwise (default) → headroom-based: the live window is within
- *        `max(20K, 10% of limit)` tokens of the auto-compaction trigger
- *        (the classifier's compaction model, which honours Claude Code's
- *        auto-compact window settings; `limit - buffer` without one, and
- *        the window itself when auto-compaction is off). A percentage
- *        default cannot serve both window sizes: 70% of 1M is still 267K
- *        clear of the trigger, while 70% of 200K is genuinely close to it.
- *   3. min-gap elapsed since last injection (or last was a different session)
+ *        `max(20K, 10% of the auto-compact window)` tokens of the
+ *        auto-compaction trigger (the classifier's compaction model, which
+ *        honours Claude Code's auto-compact window settings; `limit -
+ *        buffer` without one, and the window itself when auto-compaction is
+ *        off). A percentage default cannot serve both window sizes: 70% of
+ *        1M is still 267K clear of the trigger, while 70% of 200K is
+ *        genuinely close to it.
+ *   3. min-gap elapsed since this session's last injection
  *
  * @param breakdown - Live session breakdown (currentContext preferred)
  * @param config - Auto-inject config from `loadAutoInjectConfig`
@@ -201,26 +204,38 @@ export function shouldInject(
 
   const ctx = breakdown.currentContext ?? breakdown;
   const usage = ctx.usage_percentage;
-  if (config.thresholdExplicit) {
+  const limit = breakdown.context_limit;
+  // The headroom gate: within max(20K, 10% of the auto-compact window) of
+  // the trigger. The margin follows the auto-compact window, not the
+  // context window: with a 200K window on a 1M model, 10% of 1M put the gate
+  // at 67K and every prompt from there on got an advisory.
+  const trigger = breakdown.compaction
+    ? breakdown.compaction.trigger ?? limit
+    : autocompactTrigger(limit, bufferTokens);
+  const compactWindow = breakdown.compaction?.autoCompactWindow ?? limit;
+  const gate = trigger - Math.max(20_000, 0.10 * compactWindow);
+
+  // An explicit threshold is honoured while it can still fire before the
+  // trigger. When the trigger sits below it (a smaller auto-compact window,
+  // a percent override), the headroom gate takes over, so a threshold of 80
+  // cannot go silent on a session Claude Code compacts at 27%.
+  const thresholdTokens = (config.threshold / 100) * limit;
+  if (config.thresholdExplicit && thresholdTokens < trigger) {
     if (usage < config.threshold) {
       return { inject: false, reason: `usage ${usage.toFixed(1)}% < threshold ${config.threshold}%` };
     }
-  } else {
-    const limit = breakdown.context_limit;
-    const trigger = breakdown.compaction
-      ? breakdown.compaction.trigger ?? limit
-      : autocompactTrigger(limit, bufferTokens);
-    const gate = trigger - Math.max(20_000, 0.10 * limit);
-    if (ctx.total_tokens < gate) {
-      return {
-        inject: false,
-        reason: `window ${ctx.total_tokens.toLocaleString()} tokens < headroom gate ${Math.round(gate).toLocaleString()} (auto-compact trigger minus margin)`,
-      };
-    }
+  } else if (ctx.total_tokens < gate) {
+    return {
+      inject: false,
+      reason: `window ${ctx.total_tokens.toLocaleString()} tokens < headroom gate ${Math.round(gate).toLocaleString()} (auto-compact trigger minus margin)`,
+    };
   }
 
-  if (config.lastInjectionAt && config.lastInjectionSessionId === sessionId) {
-    const lastMs = Date.parse(config.lastInjectionAt);
+  // The min-gap is per session: each session's own last injection.
+  const last = config.lastInjections?.[sessionId]
+    ?? (config.lastInjectionSessionId === sessionId ? config.lastInjectionAt : undefined);
+  if (last) {
+    const lastMs = Date.parse(last);
     if (Number.isFinite(lastMs) && now - lastMs < config.minGapMs) {
       const remainingS = Math.round((config.minGapMs - (now - lastMs)) / 1000);
       return { inject: false, reason: `last injection ${remainingS}s ago (min-gap ${Math.round(config.minGapMs / 1000)}s)` };
@@ -313,19 +328,36 @@ function describeCompactionTiming(breakdown: CrustsBreakdown): string {
   if (!compaction) {
     return 'Claude Code auto-compacts when about 33K tokens of headroom remain (about 83.5% of a 200K window, 96.7% of 1M).';
   }
-  const k = (tokens: number): string => `${Math.round(tokens / 1000).toLocaleString()}K`;
   const limit = breakdown.context_limit;
   const sentences: string[] = [];
   if (compaction.trigger === null) {
-    sentences.push(`Auto-compaction is off here, so the session stops with a context-limit error at ${k(limit)} tokens.`);
+    sentences.push(`Auto-compaction is off here, so the session stops with a context-limit error at ${formatTokens(limit)} tokens.`);
   } else {
     const pct = ((compaction.trigger / limit) * 100).toFixed(1);
-    sentences.push(`Claude Code auto-compacts this session at about ${k(compaction.trigger)} tokens (${pct}% of the ${k(limit)} window, ${k(compaction.bufferTokens)} of headroom kept free).`);
+    const windowNote = compaction.autoCompactWindow < limit
+      ? `its auto-compact window is set to ${formatTokens(compaction.autoCompactWindow)}`
+      : `${formatTokens(limit - compaction.trigger)} short of the full window`;
+    sentences.push(`Claude Code auto-compacts this session at about ${formatTokens(compaction.trigger)} tokens (${pct}% of the ${formatTokens(limit)} window; ${windowNote}).`);
   }
   if (compaction.idle.applies) {
-    sentences.push(`It may also compact it if the session sits idle about ${compaction.idle.afterMinutes} minutes, since the window is over ${k(compaction.idle.minTokens)} tokens.`);
+    sentences.push(`It may also compact it if the session sits idle about ${compaction.idle.afterMinutes} minutes, since the window is over ${formatTokens(compaction.idle.minTokens)} tokens.`);
   }
   return sentences.join(' ');
+}
+
+/**
+ * Short token count for messages: "1M" for a whole million, else thousands
+ * ("967K", "1,200K" never; "1.2M" above a million).
+ *
+ * @param tokens - Token count
+ * @returns Compact label
+ */
+export function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  return `${Math.round(tokens / 1000).toLocaleString()}K`;
 }
 
 /**
@@ -362,8 +394,10 @@ function emitHookResponse(additionalContext: string, systemMessage: string): voi
  */
 export function buildUserNotice(breakdown: CrustsBreakdown, usagePercent: number, compactLine: string): string {
   const live = (breakdown.currentContext ?? breakdown).total_tokens;
-  const k = (tokens: number): string => `${Math.round(tokens / 1000).toLocaleString()}K`;
-  return `claude-crusts: context at ${usagePercent.toFixed(1)}% (${k(live)} of ${k(breakdown.context_limit)}). Run ${compactLine} to choose what stays before Claude Code compacts it.`;
+  const ending = breakdown.compaction?.trigger === null
+    ? 'to choose what stays before the window fills.'
+    : 'to choose what stays before Claude Code compacts it.';
+  return `claude-crusts: context at ${usagePercent.toFixed(1)}% (${formatTokens(live)} of ${formatTokens(breakdown.context_limit)}). Run ${compactLine} ${ending}`;
 }
 
 /**
@@ -394,13 +428,14 @@ export async function runAutoInject(): Promise<void> {
 
     // The session's own project: its CLAUDE.md, memory folder, project
     // settings (model, auto-compact window, idle compaction) and the MCP
-    // servers the transcript used. A bare gatherConfigData() read only the
-    // user-level files.
-    const configData = gatherConfigData(
-      payload.cwd && existsSync(payload.cwd) ? payload.cwd : undefined,
-      basename(dirname(transcriptPath)),
-      collectObservedMcpServers(messages),
-    );
+    // servers the transcript used. The project root comes from the
+    // transcript's folder (the session's start directory), as in `analyze`;
+    // payload.cwd follows a `cd` mid-session and would drop the project's
+    // settings. A bare gatherConfigData() read only the user-level files.
+    const slug = basename(dirname(transcriptPath));
+    const projectRoot = deriveProjectPath(transcriptPath)
+      ?? (payload.cwd && existsSync(payload.cwd) ? payload.cwd : undefined);
+    const configData = gatherConfigData(projectRoot, slug, collectObservedMcpServers(messages));
     const breakdown = classifySession(messages, configData, undefined, payload.model?.id);
 
     const sessionId = payload.session_id ?? basename(transcriptPath).replace(/\.jsonl$/, '');
@@ -413,7 +448,8 @@ export async function runAutoInject(): Promise<void> {
     const reclaimableTokens = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
     emitHookResponse(text, buildUserNotice(breakdown, decision.usagePercent, compactCommandFor(waste)));
-    recordInjection(sessionId);
+    // The advisory is out: log it first, then arm this session's min-gap.
+    // Each step fails on its own, so a busy config.json cannot cost the log.
     writeInjectionLog({
       ts: new Date().toISOString(),
       sessionId,
@@ -421,6 +457,7 @@ export async function runAutoInject(): Promise<void> {
       reclaimableTokens,
       advisoryText: text,
     });
+    try { recordInjection(sessionId); } catch { /* the next prompt may advise again */ }
   } catch {
     // Auto-inject must never break Claude Code — swallow all errors.
   }

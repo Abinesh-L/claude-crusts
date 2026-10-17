@@ -164,3 +164,47 @@ describe('config file overrides (sandboxed)', () => {
     expect(cfg.lastInjectionSessionId).toBe('session-y');
   });
 });
+
+describe('0.8.1 per-session injection record and atomic writes', () => {
+  let sandbox: string;
+  let savedOverride: string | undefined;
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'crusts-config-081-'));
+    savedOverride = process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    process.env.CRUSTS_CONFIG_DIR_OVERRIDE = sandbox;
+  });
+  afterEach(() => {
+    if (savedOverride === undefined) delete process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    else process.env.CRUSTS_CONFIG_DIR_OVERRIDE = savedOverride;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  test('recordInjection keeps a time per session and the user settings intact', () => {
+    writeFileSync(join(sandbox, 'config.json'), JSON.stringify({ autoInject: { enabled: true, threshold: 80, minGapMs: 300000 } }), 'utf-8');
+    recordInjection('A');
+    recordInjection('B');
+    const cfg = loadAutoInjectConfig();
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.threshold).toBe(80);
+    expect(cfg.lastInjectionSessionId).toBe('B');
+    expect(Object.keys(cfg.lastInjections ?? {}).sort()).toEqual(['A', 'B']);
+  });
+
+  test('the per-session record keeps only the newest sessions', () => {
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 60; i++) many[`s${i}`] = new Date(Date.UTC(2026, 9, 1, 0, i)).toISOString();
+    writeFileSync(join(sandbox, 'config.json'), JSON.stringify({ autoInject: { enabled: true, lastInjections: many } }), 'utf-8');
+    recordInjection('fresh');
+    const kept = Object.keys(loadAutoInjectConfig().lastInjections ?? {});
+    expect(kept.length).toBe(50);
+    expect(kept).toContain('fresh');
+    expect(kept).toContain('s59');
+    expect(kept).not.toContain('s0');
+  });
+
+  test('saveConfig leaves no temp file behind', () => {
+    recordInjection('A');
+    const leftovers = require('fs').readdirSync(sandbox).filter((f: string) => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+  });
+});

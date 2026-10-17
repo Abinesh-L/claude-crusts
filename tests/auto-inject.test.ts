@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { shouldInject, buildInjectionText, writeInjectionLog, readInjectionLog, promptSkipReason, buildUserNotice, compactCommandFor } from '../src/auto-inject.ts';
+import { shouldInject, buildInjectionText, writeInjectionLog, readInjectionLog, promptSkipReason, buildUserNotice, compactCommandFor, formatTokens } from '../src/auto-inject.ts';
 import type { CrustsBreakdown, WasteItem } from '../src/types.ts';
 import { DEFAULT_AUTO_INJECT } from '../src/config.ts';
 
@@ -385,7 +385,7 @@ describe('0.8.1 advisory timing names the compaction that comes first', () => {
 
   test('states the token trigger for this session', () => {
     const text = buildInjectionText(onModel(82, false), [], 82);
-    expect(text).toContain('auto-compacts this session at about 967K tokens (96.7% of the 1,000K window, 33K of headroom kept free)');
+    expect(text).toContain('auto-compacts this session at about 967K tokens (96.7% of the 1M window; 33K short of the full window)');
     expect(text).not.toContain('idle');
   });
 
@@ -420,10 +420,75 @@ describe('0.8.1 the person sees every advisory', () => {
       description: 'File "src/app.ts" read 3 times', recommendation: '', message_range: [1, 9],
     } as WasteItem];
     const notice = buildUserNotice(bd, 82.4, compactCommandFor(waste));
-    expect(notice).toBe('claude-crusts: context at 82.4% (824K of 1,000K). Run /compact focus "keep only latest read of src/app.ts" to choose what stays before Claude Code compacts it.');
+    expect(notice).toBe('claude-crusts: context at 82.4% (824K of 1M). Run /compact focus "keep only latest read of src/app.ts" to choose what stays before Claude Code compacts it.');
   });
 
   test('without waste targets the notice suggests a bare /compact', () => {
     expect(compactCommandFor([])).toBe('/compact');
+  });
+});
+
+describe('0.8.1 review: hook gate and wording', () => {
+  /** A 1M breakdown at `live` tokens with the given trigger and auto-compact window. */
+  function at(live: number, trigger: number | null, compactWindow = 1_000_000): CrustsBreakdown {
+    return breakdownAt((live / 1_000_000) * 100, {
+      context_limit: 1_000_000,
+      total_tokens: live,
+      compaction: {
+        trigger,
+        autoCompactWindow: compactWindow,
+        windowSource: compactWindow < 1_000_000 ? 'env' : 'default',
+        bufferTokens: 33_000,
+        idle: { enabled: false, minTokens: 200_000, afterMinutes: 54, cacheTtl: 'unknown', applies: false },
+      },
+    });
+  }
+
+  test('the default gate margin follows the auto-compact window, not the context window', () => {
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    // 200K auto-compact window on a 1M model: trigger 167K, margin 20K, gate 147K.
+    expect(shouldInject(at(70_000, 167_000, 200_000), cfg, 'sid').inject).toBe(false);
+    expect(shouldInject(at(150_000, 167_000, 200_000), cfg, 'sid').inject).toBe(true);
+  });
+
+  test('an explicit threshold beyond the trigger falls back to the headroom gate', () => {
+    // Threshold 80 (800K) but Claude Code compacts at 267K: the hook must not go silent.
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 80, thresholdExplicit: true };
+    expect(shouldInject(at(250_000, 267_000, 300_000), cfg, 'sid').inject).toBe(true);
+    expect(shouldInject(at(200_000, 267_000, 300_000), cfg, 'sid').inject).toBe(false);
+    // A reachable threshold is still honoured as set.
+    expect(shouldInject(at(790_000, 967_000), cfg, 'sid').inject).toBe(false);
+    expect(shouldInject(at(810_000, 967_000), cfg, 'sid').inject).toBe(true);
+  });
+
+  test('the min-gap is per session', () => {
+    const now = Date.parse('2026-10-17T12:00:00.000Z');
+    const cfg = {
+      ...DEFAULT_AUTO_INJECT, enabled: true, threshold: 50, thresholdExplicit: true, minGapMs: 300_000,
+      lastInjectionAt: '2026-10-17T11:59:30.000Z', lastInjectionSessionId: 'B',
+      lastInjections: { A: '2026-10-17T11:59:00.000Z', B: '2026-10-17T11:59:30.000Z' },
+    };
+    // A injected a minute ago: still inside its own gap even though B was the latest.
+    expect(shouldInject(at(900_000, 967_000), cfg, 'A', now).inject).toBe(false);
+    expect(shouldInject(at(900_000, 967_000), cfg, 'C', now).inject).toBe(true);
+  });
+
+  test('/reset and /new are aliases of /clear and are skipped, in any case', () => {
+    expect(promptSkipReason('/reset')).toBe('compaction command');
+    expect(promptSkipReason('/new old-work')).toBe('compaction command');
+    expect(promptSkipReason('/Clear')).toBe('compaction command');
+    expect(promptSkipReason('/newsletter draft')).toBeNull();
+  });
+
+  test('with auto-compaction off the notice does not promise a compaction', () => {
+    const notice = buildUserNotice(at(900_000, null), 90, '/compact');
+    expect(notice).toBe('claude-crusts: context at 90.0% (900K of 1M). Run /compact to choose what stays before the window fills.');
+  });
+
+  test('formatTokens writes millions as M and the rest as K', () => {
+    expect(formatTokens(1_000_000)).toBe('1M');
+    expect(formatTokens(1_500_000)).toBe('1.5M');
+    expect(formatTokens(967_000)).toBe('967K');
+    expect(formatTokens(200_000)).toBe('200K');
   });
 });
