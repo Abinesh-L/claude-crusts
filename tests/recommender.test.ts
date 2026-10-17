@@ -322,3 +322,53 @@ describe('review fix: compaction prediction excludes attachment rows (sandboxed)
     expect(predictedMessages(report)).toBe(20);
   });
 });
+
+describe('0.8.1 compaction model in recommendations', () => {
+  let sandbox: string;
+  let savedOverride: string | undefined;
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'crusts-rec-081-'));
+    savedOverride = process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    process.env.CRUSTS_CONFIG_DIR_OVERRIDE = sandbox;
+  });
+  afterEach(() => {
+    if (savedOverride === undefined) delete process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+    else process.env.CRUSTS_CONFIG_DIR_OVERRIDE = savedOverride;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  /** A 1M-window breakdown carrying the classifier's compaction model. */
+  function withModel(total: number, idleApplies: boolean, trigger: number | null = 967_000): CrustsBreakdown {
+    const bd = breakdownTokens(total, 1_000_000, 50);
+    bd.compaction = {
+      trigger,
+      autoCompactWindow: 1_000_000,
+      windowSource: trigger === null ? 'disabled' : 'default',
+      bufferTokens: 33_000,
+      idle: { enabled: idleApplies, minTokens: 200_000, afterMinutes: 54, applies: idleApplies },
+    };
+    return bd;
+  }
+
+  test('an idle-compaction warning appears when it applies to the live window', () => {
+    const report = generateRecommendations(withModel(350_000, true), [], emptyConfig(), []);
+    const idle = report.recommendations.find((r) => r.action.includes('idle'));
+    expect(idle).toBeDefined();
+    expect(idle!.action).toContain('~54 min');
+    expect(idle!.reason).toContain('200,000-token idle-compaction threshold');
+    expect(idle!.reason).toContain('"idleCompaction": false');
+  });
+
+  test('no idle-compaction warning when it is off or under the threshold', () => {
+    const report = generateRecommendations(withModel(350_000, false), [], emptyConfig(), []);
+    expect(report.recommendations.some((r) => r.action.includes('idle'))).toBe(false);
+  });
+
+  test("the classifier's trigger drives the prediction, and auto-compaction off means no countdown", () => {
+    const configured = withModel(400_000, false, 467_000);
+    // 400K over 50 messages = 8K per message; (467K - 400K) / 8K = 8.
+    expect(generateRecommendations(configured, [], emptyConfig(), []).estimated_messages_until_compaction).toBe(8);
+    const off = withModel(400_000, false, null);
+    expect(generateRecommendations(off, [], emptyConfig(), []).estimated_messages_until_compaction).toBeNull();
+  });
+});

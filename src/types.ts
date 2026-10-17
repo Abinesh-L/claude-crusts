@@ -316,6 +316,68 @@ export interface ConfigData {
    * `[1m]` variant but settings.json keeps it. See `readSettingsModels`.
    */
   settingsModels?: string[];
+  /**
+   * Claude Code settings that move the window and compaction (auto-compact
+   * window, idle compaction, the 1M and auto-compact switches). See
+   * `readCompactionSettings` in scanner.ts. Absent in hand-built fixtures,
+   * where Claude Code's defaults apply.
+   */
+  compaction?: CompactionSettings;
+}
+
+/**
+ * Claude Code settings that move the context window and compaction.
+ *
+ * Read by `readCompactionSettings` (scanner.ts) from the settings files
+ * (project .claude/settings.local.json, project .claude/settings.json,
+ * ~/.claude/settings.json, highest precedence first), their `env` blocks,
+ * and the process environment, which wins: Claude Code passes its
+ * environment to hooks.
+ */
+export interface CompactionSettings {
+  /** False when `autoCompactEnabled` is false or DISABLE_AUTO_COMPACT is set */
+  autoCompactEnabled: boolean;
+  /** Top-level `autoCompactWindow` (tokens) */
+  autoCompactWindow?: number;
+  /** Per-model windows saved by `/autocompact` under `modelSettings`, keyed by model ID */
+  modelAutoCompactWindows?: Record<string, number>;
+  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW, which takes precedence over every setting */
+  envAutoCompactWindow?: number;
+  /** False when `idleCompaction` is false or auto-compaction is off */
+  idleCompaction: boolean;
+  /** Idle compaction's size threshold (CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, default 200,000, floor 100,000) */
+  idleCompactMinTokens: number;
+  /** CLAUDE_CODE_DISABLE_1M_CONTEXT is set: every model runs at 200K */
+  disable1m: boolean;
+  /** crusts' own `autocompactBufferTokens` override from ~/.claude-crusts/config.json */
+  bufferTokens?: number;
+}
+
+/**
+ * How and when Claude Code will compact a session, resolved from the
+ * window, the model, the live window size, and `CompactionSettings` (see
+ * `resolveCompactionModel` in model-context.ts).
+ */
+export interface CompactionModel {
+  /** Token level that fires auto-compaction; null when auto-compaction is off */
+  trigger: number | null;
+  /** Auto-compact window in effect, capped at the context window */
+  autoCompactWindow: number;
+  /** Where the auto-compact window came from */
+  windowSource: 'default' | 'setting' | 'model-setting' | 'env' | 'disabled';
+  /** Headroom buffer subtracted from the window to get the trigger */
+  bufferTokens: number;
+  /** Idle compaction (Claude Code 2.1.299+) */
+  idle: {
+    /** On for this install (not turned off by `idleCompaction` or auto-compact switches) */
+    enabled: boolean;
+    /** Size threshold the window must reach */
+    minTokens: number;
+    /** Approximate idle minutes before it fires (shortly before the 1h prompt cache expires) */
+    afterMinutes: number;
+    /** Enabled and the live window is at or above the threshold */
+    applies: boolean;
+  };
 }
 
 /** Classification result for a single message */
@@ -701,6 +763,12 @@ export interface CrustsBreakdown {
   };
   /** Values derived from THIS SESSION's API usage data */
   derivedOverhead?: DerivedOverhead;
+  /**
+   * How and when Claude Code will compact this session (token trigger and
+   * idle compaction), set by classifySession. Absent on hand-built
+   * breakdowns; consumers then fall back to the window minus the buffer.
+   */
+  compaction?: CompactionModel;
 }
 
 /** A detected waste item with recommendation */

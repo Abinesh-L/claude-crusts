@@ -13,6 +13,7 @@ import type {
   CrustsBucket,
   ClassifiedMessage,
   CompactionEvent,
+  CompactionModel,
   ComparisonResult,
   CrustsCategory,
   DerivedOverhead,
@@ -336,11 +337,15 @@ function formatDuration(seconds: number | null): string | null {
  * @param classified - Array of classified messages
  * @param contextLimit - Context window limit
  * @param compactionEvents - Detected compaction events to mark in timeline
+ * @param compaction - The classifier's compaction model (auto-compact window
+ *   settings, idle compaction); without it the trigger is the window minus
+ *   the buffer
  */
 export function renderTimeline(
   classified: ClassifiedMessage[],
   contextLimit: number,
   compactionEvents: CompactionEvent[] = [],
+  compaction?: CompactionModel,
 ): void {
   console.log();
 
@@ -424,9 +429,13 @@ export function renderTimeline(
   console.log(table.toString());
 
   // Compaction prediction: auto-compaction fires when the reserved headroom
-  // buffer is exhausted (limit minus ~33K, config-overridable), not at 80%.
-  const compactionTokens = autocompactTrigger(contextLimit, loadAutocompactBufferTokens());
-  if (classified.length > 0) {
+  // buffer is exhausted (the auto-compact window minus ~33K), not at 80%.
+  const compactionTokens = compaction
+    ? compaction.trigger
+    : autocompactTrigger(contextLimit, loadAutocompactBufferTokens());
+  if (compactionTokens === null) {
+    console.log(chalk.dim('\n  Auto-compaction is off: the session stops with a context-limit error at the window instead.'));
+  } else if (classified.length > 0) {
     const last = classified[classified.length - 1]!;
     if (last.cumulativeTokens < compactionTokens) {
       // Per-message average over analyzed (non-attachment) rows only:

@@ -366,3 +366,48 @@ describe('writeInjectionLog / readInjectionLog', () => {
     expect(entries.map((e) => e.sessionId)).toEqual(['three', 'two', 'one']);
   });
 });
+
+describe('0.8.1 advisory timing names the compaction that comes first', () => {
+  /** A 1M breakdown with a compaction model attached. */
+  function onModel(pct: number, idleApplies: boolean, trigger: number | null = 967_000): CrustsBreakdown {
+    return breakdownAt(pct, {
+      context_limit: 1_000_000,
+      total_tokens: pct * 10_000,
+      compaction: {
+        trigger,
+        autoCompactWindow: 1_000_000,
+        windowSource: trigger === null ? 'disabled' : 'default',
+        bufferTokens: 33_000,
+        idle: { enabled: idleApplies, minTokens: 200_000, afterMinutes: 54, applies: idleApplies },
+      },
+    });
+  }
+
+  test('states the token trigger for this session', () => {
+    const text = buildInjectionText(onModel(82, false), [], 82);
+    expect(text).toContain('auto-compacts this session at about 967K tokens (96.7% of the 1,000K window, 33K of headroom kept free)');
+    expect(text).not.toContain('idle');
+  });
+
+  test('adds idle compaction when it applies', () => {
+    const text = buildInjectionText(onModel(82, true), [], 82);
+    expect(text).toContain('if the session sits idle about 54 minutes, since the window is over 200K tokens');
+  });
+
+  test('says so when auto-compaction is off', () => {
+    const text = buildInjectionText(onModel(82, false, null), [], 82);
+    expect(text).toContain('Auto-compaction is off here');
+  });
+
+  test("the default gate uses the classifier's trigger", () => {
+    // A 500K auto-compact window puts the trigger at 467K: 400K is inside the
+    // max(20K, 10% of 1M) = 100K margin, so the default gate opens.
+    const cfg = { ...DEFAULT_AUTO_INJECT, enabled: true };
+    const bd = onModel(40, false, 467_000);
+    bd.total_tokens = 400_000;
+    expect(shouldInject(bd, cfg, 'sid').inject).toBe(true);
+    const wide = onModel(40, false, 967_000);
+    wide.total_tokens = 400_000;
+    expect(shouldInject(wide, cfg, 'sid').inject).toBe(false);
+  });
+});

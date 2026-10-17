@@ -173,17 +173,20 @@ export type InjectDecision =
  *        ≥ threshold (the user's choice is honoured verbatim);
  *      - otherwise (default) → headroom-based: the live window is within
  *        `max(20K, 10% of limit)` tokens of the auto-compaction trigger
- *        (`limit - buffer`). A percentage default cannot serve both window
- *        sizes: 70% of 1M is still 267K clear of the trigger, while 70% of
- *        200K is genuinely close to it.
+ *        (the classifier's compaction model, which honours Claude Code's
+ *        auto-compact window settings; `limit - buffer` without one, and
+ *        the window itself when auto-compaction is off). A percentage
+ *        default cannot serve both window sizes: 70% of 1M is still 267K
+ *        clear of the trigger, while 70% of 200K is genuinely close to it.
  *   3. min-gap elapsed since last injection (or last was a different session)
  *
  * @param breakdown - Live session breakdown (currentContext preferred)
  * @param config - Auto-inject config from `loadAutoInjectConfig`
  * @param sessionId - Session receiving the prompt
  * @param now - Clock override for tests (ms since epoch)
- * @param bufferTokens - Auto-compaction buffer; callers honouring the
- *   user's config override pass `loadAutocompactBufferTokens()`
+ * @param bufferTokens - Auto-compaction buffer for breakdowns without a
+ *   compaction model; callers honouring the user's config override pass
+ *   `loadAutocompactBufferTokens()`
  */
 export function shouldInject(
   breakdown: CrustsBreakdown,
@@ -202,7 +205,10 @@ export function shouldInject(
     }
   } else {
     const limit = breakdown.context_limit;
-    const gate = autocompactTrigger(limit, bufferTokens) - Math.max(20_000, 0.10 * limit);
+    const trigger = breakdown.compaction
+      ? breakdown.compaction.trigger ?? limit
+      : autocompactTrigger(limit, bufferTokens);
+    const gate = trigger - Math.max(20_000, 0.10 * limit);
     if (ctx.total_tokens < gate) {
       return {
         inject: false,
@@ -274,11 +280,41 @@ export function buildInjectionText(
     ``,
     `    ${compactLine}`,
     ``,
-    `Why now: Claude Code auto-compacts when about 33K tokens of headroom remain (about 83.5% of a 200K window, 96.7% of 1M); it summarises aggressively and drops more than this targeted command would. Running this compact first lets the user keep control of what stays and what gets cleared.`,
+    `Why now: ${describeCompactionTiming(breakdown)} An automatic compaction summarises generically and drops more than this targeted command would. Running this compact first lets the user keep control of what stays and what gets cleared.`,
     ``,
     `Files dropped by /compact remain on disk. Re-read any that become relevant later. \`claude-crusts lost\` inspects what the compaction dropped.`,
   ];
   return lines.join('\n');
+}
+
+/**
+ * One or two sentences on when Claude Code will compact this session.
+ *
+ * Uses the classifier's compaction model: the token trigger (from the
+ * auto-compact window settings) and, when it applies, idle compaction.
+ * Breakdowns without a model get the general headroom explanation.
+ *
+ * @param breakdown - Live session breakdown
+ * @returns Plain-language timing for the advisory's "Why now" line
+ */
+function describeCompactionTiming(breakdown: CrustsBreakdown): string {
+  const compaction = breakdown.compaction;
+  if (!compaction) {
+    return 'Claude Code auto-compacts when about 33K tokens of headroom remain (about 83.5% of a 200K window, 96.7% of 1M).';
+  }
+  const k = (tokens: number): string => `${Math.round(tokens / 1000).toLocaleString()}K`;
+  const limit = breakdown.context_limit;
+  const sentences: string[] = [];
+  if (compaction.trigger === null) {
+    sentences.push(`Auto-compaction is off here, so the session stops with a context-limit error at ${k(limit)} tokens.`);
+  } else {
+    const pct = ((compaction.trigger / limit) * 100).toFixed(1);
+    sentences.push(`Claude Code auto-compacts this session at about ${k(compaction.trigger)} tokens (${pct}% of the ${k(limit)} window, ${k(compaction.bufferTokens)} of headroom kept free).`);
+  }
+  if (compaction.idle.applies) {
+    sentences.push(`It also compacts it if the session sits idle about ${compaction.idle.afterMinutes} minutes, since the window is over ${k(compaction.idle.minTokens)} tokens.`);
+  }
+  return sentences.join(' ');
 }
 
 /**

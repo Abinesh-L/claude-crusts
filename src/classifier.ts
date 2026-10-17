@@ -39,7 +39,7 @@ import type {
   ModelHistory,
   ModelSegment,
 } from './types.ts';
-import { resolveContextLimitWithSignal, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
+import { resolveContextLimitWithSignal, resolveCompactionModel, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
 import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName } from './built-in-tools.ts';
@@ -2290,7 +2290,7 @@ export function classifySession(
     event.contextLimit = resolveContextLimitWithSignal(
       span.model,
       sameFamilyMessages(span.model),
-      { settingsModels: configData.settingsModels },
+      { settingsModels: configData.settingsModels, disable1m: configData.compaction?.disable1m },
     ).limit;
   }
 
@@ -2310,18 +2310,20 @@ export function classifySession(
     {
       limitOverride,
       settingsModels: configData.settingsModels,
+      disable1m: configData.compaction?.disable1m,
     },
   );
   const contextLimit = contextResolution.limit;
   if (verbose) {
     const signalExplanation =
       contextResolution.signal === 'payload' ? 'live payload supplied context_window.context_window_size' :
-      contextResolution.signal === 'context-command' ? 'latest /context output recorded in the transcript reported this window' :
+      contextResolution.signal === 'context-command' ? 'latest /context output recorded for this model reported this window' :
+      contextResolution.signal === 'disable-1m' ? 'CLAUDE_CODE_DISABLE_1M_CONTEXT holds every model at 200K' :
       contextResolution.signal === 'model-id' ? `model-ID "${model}" matched a 1M-variant pattern` :
       contextResolution.signal === 'settings' ? 'settings.json pins a [1m] model matching this session model family' :
       contextResolution.signal === 'usage' ? 'an observed message exceeded 200K effective input (conclusive 1M)' :
       contextResolution.signal === 'native' ? `model "${model}" ships a native 1M window` :
-      'no signal fired (payload, /context output, model-id, settings, usage, native); defaulting to 200K. A fresh 1M session below that usage resolves via settings.json or the statusline payload.';
+      'no signal fired (payload, /context output, model-id, settings, usage, native); defaulting to 200K, the window of Opus 4.6, Sonnet 4.6 and older models without [1m].';
     console.error(`[verbose] Context limit: ${contextLimit.toLocaleString()} (signal: ${contextResolution.signal}) \u2014 ${signalExplanation}`);
     const coreExplanation =
       coreSchema.source === 'calibration' ? 'pinned by `claude-crusts calibrate` (/context "System tools" row)' :
@@ -2435,6 +2437,15 @@ export function classifySession(
     if (diffMs > 0) durationSeconds = Math.round(diffMs / 1000);
   }
 
+  // When Claude Code will compact this window: the token trigger from the
+  // auto-compact window settings, and whether idle compaction applies.
+  const compaction = resolveCompactionModel(
+    contextLimit,
+    model,
+    currentContext?.total_tokens ?? totalTokens,
+    configData.compaction,
+  );
+
   return {
     buckets,
     total_tokens: totalTokens,
@@ -2456,6 +2467,7 @@ export function classifySession(
       internalSystemPrompt: derivedSystemPrompt,
       messageFraming: derivedFraming,
     },
+    compaction,
   };
 }
 

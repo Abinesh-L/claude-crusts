@@ -335,6 +335,7 @@ export async function executeCommand(input: string, state: TuiState): Promise<bo
         r.breakdown.messages,
         r.breakdown.context_limit,
         r.breakdown.compactionEvents,
+        r.breakdown.compaction,
       );
       return true;
     }

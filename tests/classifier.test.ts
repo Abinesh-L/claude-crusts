@@ -1503,9 +1503,14 @@ describe('M13 context-limit resolution threading', () => {
     expect(b.context_limit).toBe(1_000_000);
   });
 
-  test('a bare 4.x session with no signal stays at 200K', () => {
-    const b = classifySession([userText('hi'), assistantWithCache(100, 50_000)], EMPTY_CONFIG);
-    expect(b.context_limit).toBe(200_000);
+  test('Opus 4.7 runs at its native 1M; Opus 4.6 with no signal stays at 200K', () => {
+    const b47 = classifySession([userText('hi'), assistantWithCache(100, 50_000)], EMPTY_CONFIG);
+    expect(b47.model).toBe('claude-opus-4-7');
+    expect(b47.context_limit).toBe(1_000_000);
+    const turn46 = assistantWithCache(100, 50_000);
+    turn46.message!.model = 'claude-opus-4-6';
+    const b46 = classifySession([userText('hi'), turn46], EMPTY_CONFIG);
+    expect(b46.context_limit).toBe(200_000);
   });
 });
 
@@ -2115,28 +2120,30 @@ describe('0.8.1: window evidence from every run of the same model', () => {
     return machineUser(`## Context Usage\n\n**Model:** ${model}\n**Tokens:** ${tokens}\n`, { isMeta: true });
   }
 
-  test('a later run of a 4.x model keeps the 1M window an earlier run proved', () => {
-    // fable -> opus-4-8 (/context says 1m) -> fable -> opus-4-8 at 160K.
-    // The last opus-4-8 run has no evidence of its own; 200K made 160K read 80%.
+  test('a later run of a model keeps the 1M window an earlier run of it proved', () => {
+    // fable -> opus-4-6 (/context says 1m: it ran as opus-4-6[1m]) -> fable
+    // -> opus-4-6 at 160K. The JSONL strips [1m] and the last opus-4-6 run
+    // has no evidence of its own; 200K made 160K read 80%. (The same shape
+    // on opus-4-8 is now also covered by its native 1M window.)
     const msgs: SessionMessage[] = [
       userText('a'), on('claude-fable-5-1', 300_000),
-      userText('b'), on('claude-opus-4-8', 280_000),
-      contextOutput('claude-opus-4-8', '287.3k / 1m (29%)'),
+      userText('b'), on('claude-opus-4-6', 280_000),
+      contextOutput('claude-opus-4-6[1m]', '287.3k / 1m (29%)'),
       userText('c'), on('claude-fable-5-1', 310_000),
-      userText('d'), on('claude-opus-4-8', 160_000),
+      userText('d'), on('claude-opus-4-6', 160_000),
     ];
     const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
-    expect(b.model).toBe('claude-opus-4-8');
+    expect(b.model).toBe('claude-opus-4-6');
     expect(b.context_limit).toBe(1_000_000);
     expect(b.usage_percentage).toBeCloseTo(16.01, 2);
   });
 
   test("another family's evidence never sets the current model's window", () => {
-    // Only fable proved 1M; the opus-4-8 run itself has no signal.
+    // Only fable proved 1M; the opus-4-6 run itself has no signal.
     const msgs: SessionMessage[] = [
       userText('a'), on('claude-fable-5-1', 300_000),
       contextOutput('claude-fable-5-1', '300k / 1m (30%)'),
-      userText('b'), on('claude-opus-4-8', 120_000),
+      userText('b'), on('claude-opus-4-6', 120_000),
     ];
     const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
     expect(b.context_limit).toBe(200_000);

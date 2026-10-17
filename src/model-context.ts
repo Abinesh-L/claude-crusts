@@ -1,11 +1,12 @@
 /**
  * Model-to-context-window resolution.
  *
- * Claude Code sessions can run on windows of different sizes: 200K for
- * the 4.x generations, 1M for `[1m]` variants and for the 5-generation
- * families that ship 1M natively, and other sizes (a 500K window has
- * been observed) that only the live payload or a recorded /context
- * output can reveal.
+ * Claude Code sessions can run on windows of different sizes: 1M for the
+ * models that ship it natively (Fable, Sonnet 5 and later, Haiku 5.5,
+ * Opus 4.7 and later, per Claude Code's model-config docs), 1M for `[1m]`
+ * variants of the others, 200K for the rest (Opus 4.6, Sonnet 4.6 and
+ * older), and other sizes (a 500K window has been observed) that only the
+ * live payload or a recorded /context output can reveal.
  *
  * `resolveContextLimitWithSignal` combines every available signal in a
  * fixed priority order and reports which one was decisive:
@@ -13,20 +14,21 @@
  *   1. `payload`         - an explicit window size handed in by the caller
  *                          (statusline stdin `context_window.context_window_size`)
  *   2. `context-command` - the latest /context output recorded in the
- *                          transcript (`## Context Usage` user record)
- *   3. `model-id`        - the model ID carries a `[1m]` variant
- *   4. `settings`        - settings.json pins a `[1m]` model whose family
+ *                          transcript for this model (`## Context Usage`)
+ *   3. `disable-1m`      - CLAUDE_CODE_DISABLE_1M_CONTEXT is set, which holds
+ *                          every model at 200K
+ *   4. `model-id`        - the model ID carries a `[1m]` variant
+ *   5. `settings`        - settings.json pins a `[1m]` model whose family
  *                          matches the session model
- *   5. `usage`           - observed effective input above 200K (conclusive 1M)
- *   6. `native`          - the model family ships 1M natively (fable-5 /
- *                          mythos-5 / opus-5 / sonnet-5)
- *   7. `default`         - 200K. The 4.x models (opus-4-6/4-7/4-8,
- *                          sonnet-4-6) land here without a signal: Claude
- *                          Code runs them at 200K even where the API's own
- *                          maximum is larger.
+ *   6. `usage`           - observed effective input above 200K (conclusive 1M)
+ *   7. `native`          - the model ships 1M natively (see
+ *                          `getNativeContextLimit`)
+ *   8. `default`         - 200K: Opus 4.6, Sonnet 4.6 and older models
+ *                          without a `[1m]` variant
  */
 
 import { parseContextWindowSize, parseModelHeader } from './calibrator.ts';
+import type { CompactionModel, CompactionSettings } from './types.ts';
 
 /** Fallback window size for any model that doesn't match a known variant */
 export const DEFAULT_CONTEXT_LIMIT = 200_000;
@@ -61,6 +63,84 @@ export function autocompactTrigger(
   return Math.max(0, limit - bufferTokens);
 }
 
+/** Idle compaction's default size threshold (Claude Code settings docs). */
+export const IDLE_COMPACT_MIN_TOKENS = 200_000;
+
+/** The lowest idle-compaction threshold Claude Code accepts; smaller values are raised to it. */
+export const IDLE_COMPACT_FLOOR_TOKENS = 100_000;
+
+/** Approximate idle minutes before idle compaction fires, shortly before the 1h prompt cache expires. */
+export const IDLE_COMPACT_AFTER_MINUTES = 54;
+
+/**
+ * How and when Claude Code will compact a session.
+ *
+ * Token trigger: the auto-compact window (CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+ * then the model's `/autocompact` window under `modelSettings`, then the
+ * top-level `autoCompactWindow`, else the context window itself), capped at
+ * the context window, less the headroom buffer. With no setting that is
+ * about 967K on a 1M window and 167K on 200K; a configured window is
+ * assumed to keep the same buffer. Null when auto-compaction is off.
+ *
+ * Idle compaction (Claude Code 2.1.299+): a conversation at or above the
+ * idle threshold (200K by default) left idle about 54 minutes is compacted
+ * before its one-hour prompt cache expires. It is off when `idleCompaction`
+ * is false or auto-compaction is off. Hand-built breakdowns and fixtures
+ * pass no settings and get Claude Code's defaults.
+ *
+ * @param limit - Resolved context window in tokens
+ * @param modelId - Session model, for a per-model `/autocompact` window
+ * @param liveTokens - Live window size, for whether idle compaction applies
+ * @param settings - Claude Code compaction settings (see `readCompactionSettings`)
+ * @returns The compaction model
+ */
+export function resolveCompactionModel(
+  limit: number,
+  modelId: string | undefined,
+  liveTokens: number,
+  settings?: CompactionSettings,
+): CompactionModel {
+  const bufferTokens = settings?.bufferTokens && settings.bufferTokens > 0
+    ? settings.bufferTokens
+    : AUTOCOMPACT_BUFFER_TOKENS;
+  const autoEnabled = settings?.autoCompactEnabled ?? true;
+
+  let window = limit;
+  let windowSource: CompactionModel['windowSource'] = 'default';
+  if (settings?.envAutoCompactWindow) {
+    window = settings.envAutoCompactWindow;
+    windowSource = 'env';
+  } else {
+    const perModel = modelId && settings?.modelAutoCompactWindows
+      ? Object.entries(settings.modelAutoCompactWindows)
+        .find(([key]) => modelFamily(key) === modelFamily(modelId))?.[1]
+      : undefined;
+    if (perModel) {
+      window = perModel;
+      windowSource = 'model-setting';
+    } else if (settings?.autoCompactWindow) {
+      window = settings.autoCompactWindow;
+      windowSource = 'setting';
+    }
+  }
+  window = Math.min(window, limit);
+
+  const idleEnabled = autoEnabled && (settings?.idleCompaction ?? true);
+  const idleMin = settings?.idleCompactMinTokens ?? IDLE_COMPACT_MIN_TOKENS;
+  return {
+    trigger: autoEnabled ? autocompactTrigger(window, bufferTokens) : null,
+    autoCompactWindow: window,
+    windowSource: autoEnabled ? windowSource : 'disabled',
+    bufferTokens,
+    idle: {
+      enabled: idleEnabled,
+      minTokens: idleMin,
+      afterMinutes: IDLE_COMPACT_AFTER_MINUTES,
+      applies: idleEnabled && liveTokens >= idleMin,
+    },
+  };
+}
+
 /**
  * Pattern table mapping model-ID substrings to their context-window size.
  *
@@ -73,16 +153,52 @@ export const MODEL_CONTEXT_LIMITS: Array<{ pattern: RegExp; limit: number }> = [
 ];
 
 /**
- * Model families whose Claude Code window is natively 1M tokens with no
- * `[1m]` variant suffix: the 5-generation fable/mythos/opus/sonnet IDs,
- * including point releases (`claude-opus-5-5`, `claude-fable-5-1`) and an
- * optional 8-digit date suffix. The version part must end the ID (or meet
- * a bracketed variant), so `claude-opus-50` and `claude-opus-5-mini` do
- * not match. The 4.x generations are deliberately NOT listed; Claude Code
- * runs them at 200K unless an explicit signal (variant, settings, payload,
- * /context output, observed usage) says otherwise.
+ * Shape of a Claude model ID: `claude-<family>-<major>[-<minor>][-<date>]`
+ * with an optional bracketed variant (`[1m]`). The version must end the ID
+ * (or meet the variant), so `claude-opus-50` reads as major 50 and
+ * `claude-opus-5-mini` does not parse at all.
  */
-export const NATIVE_1M_MODEL_PATTERN = /^claude-(fable|mythos|opus|sonnet)-5(?:-\d{1,2})?(?:-\d{8})?(?=$|\[)/i;
+const CLAUDE_MODEL_ID = /^claude-([a-z]+)-(\d{1,2})(?:-(\d{1,2}))?(?:-\d{8})?(?:\[[^\]]*\])?$/i;
+
+/** A parsed Claude model ID. */
+export interface ClaudeModelVersion {
+  family: string;
+  major: number;
+  minor: number;
+}
+
+/**
+ * Parse a Claude model ID into family and version.
+ *
+ * @param modelId - Model identifier (`claude-opus-5-5`, `claude-haiku-4-5-20251001`)
+ * @returns Lowercased family plus major/minor (minor 0 when absent), or null
+ */
+export function parseClaudeModelId(modelId: string | undefined): ClaudeModelVersion | null {
+  if (!modelId) return null;
+  const match = CLAUDE_MODEL_ID.exec(modelId.trim());
+  if (!match) return null;
+  return {
+    family: match[1]!.toLowerCase(),
+    major: Number(match[2]),
+    minor: match[3] !== undefined ? Number(match[3]) : 0,
+  };
+}
+
+/**
+ * Models whose Claude Code window is natively 1M with no `[1m]` variant,
+ * as `[family, first native major, first native minor]`. From Claude
+ * Code's model-config docs: "Fable 5.1, Fable 5, Sonnet 5 and later,
+ * Haiku 5.5, and Opus 4.7 and later get the 1M window with no [1m] variant
+ * to select", while Opus 4.6 and Sonnet 4.6 run at 200K without it. Mythos
+ * keeps its earlier 5-generation entry.
+ */
+const NATIVE_1M_FROM: ReadonlyArray<readonly [string, number, number]> = [
+  ['fable', 0, 0],
+  ['mythos', 5, 0],
+  ['sonnet', 5, 0],
+  ['haiku', 5, 5],
+  ['opus', 4, 7],
+];
 
 /**
  * Resolve the context-window size for a given model ID.
@@ -104,12 +220,22 @@ export function getContextLimit(modelId: string | undefined): number {
 /**
  * Native window size for a bare model ID (no variant suffix required).
  *
+ * Point releases and dated IDs count (`claude-opus-5-5`,
+ * `claude-fable-5-1`, `claude-haiku-5-5`); an ID that does not parse as a
+ * Claude model has no entry.
+ *
  * @param modelId - Model identifier extracted from a session message
- * @returns 1,000,000 for native-1M families, or null when the table has no entry
+ * @returns 1,000,000 for natively-1M models, or null when the table has no entry
  */
 export function getNativeContextLimit(modelId: string | undefined): number | null {
-  if (!modelId) return null;
-  return NATIVE_1M_MODEL_PATTERN.test(modelId) ? 1_000_000 : null;
+  const parsed = parseClaudeModelId(modelId);
+  if (!parsed) return null;
+  for (const [family, major, minor] of NATIVE_1M_FROM) {
+    if (parsed.family !== family) continue;
+    const atLeast = parsed.major > major || (parsed.major === major && parsed.minor >= minor);
+    return atLeast ? 1_000_000 : null;
+  }
+  return null;
 }
 
 /**
@@ -353,19 +479,21 @@ export function detectSettingsContextLimit(
  *                     `context_window.context_window_size`)
  * `context-command` - the latest /context output recorded in the transcript
  *                     reported the window in its `**Tokens:**` header
+ * `disable-1m`      - CLAUDE_CODE_DISABLE_1M_CONTEXT holds every model at 200K
  * `model-id`        - the model-ID regex matched a `[1m]` (or similar) variant
  * `settings`        - settings.json pins a `[1m]`-variant model whose family
  *                     matches the session model
  * `usage`           - at least one message's effective input exceeded 200K,
  *                     proving the window must be 1M
- * `native`          - the model family ships a 1M window natively (fable-5 /
- *                     mythos-5 / opus-5 / sonnet-5)
- * `default`         - no signal fired; fell back to 200K. A fresh 1M session
- *                     that no other signal covers will show this.
+ * `native`          - the model ships a 1M window natively (see
+ *                     `getNativeContextLimit`)
+ * `default`         - no signal fired; fell back to 200K (Opus 4.6, Sonnet
+ *                     4.6, older and unrecognised models)
  */
 export type ContextLimitSignal =
   | 'payload'
   | 'context-command'
+  | 'disable-1m'
   | 'model-id'
   | 'settings'
   | 'usage'
@@ -393,6 +521,11 @@ export interface ContextLimitOptions {
    * `readSettingsModels` in scanner.ts.
    */
   settingsModels?: string[];
+  /**
+   * CLAUDE_CODE_DISABLE_1M_CONTEXT is set (process environment or a
+   * settings `env` block): Claude Code treats every model as a 200K window.
+   */
+  disable1m?: boolean;
 }
 
 /**
@@ -402,12 +535,13 @@ export interface ContextLimitOptions {
  *   1. `options.limitOverride`: live payload window size (a free integer,
  *      not restricted to 200K / 1M)
  *   2. the latest `## Context Usage` (/context output) user record's window
- *   3. model-ID `[1m]` variant
- *   4. settings.json `[1m]` model whose family matches the session model
- *   5. observed usage above 200K (conclusive 1M)
- *   6. native-1M model families (fable-5 / mythos-5 / opus-5 / sonnet-5)
- *   7. the 200K default; 4.x models (opus-4-x, sonnet-4-6) land here
- *      without a signal
+ *      for this model
+ *   3. CLAUDE_CODE_DISABLE_1M_CONTEXT: 200K for every model
+ *   4. model-ID `[1m]` variant
+ *   5. settings.json `[1m]` model whose family matches the session model
+ *   6. observed usage above 200K (conclusive 1M)
+ *   7. natively-1M models (Fable, Sonnet 5+, Haiku 5.5, Opus 4.7+, Mythos 5)
+ *   8. the 200K default (Opus 4.6, Sonnet 4.6, older and unrecognised IDs)
  *
  * @param modelId - Model ID for the session (live override preferred when available)
  * @param messages - Session messages (usage + recorded /context output)
@@ -426,6 +560,9 @@ export function resolveContextLimitWithSignal(
   const commandWindow = detectContextCommandWindow(messages, modelId);
   if (commandWindow !== null) {
     return { limit: commandWindow, signal: 'context-command' };
+  }
+  if (options?.disable1m) {
+    return { limit: DEFAULT_CONTEXT_LIMIT, signal: 'disable-1m' };
   }
   const modelLimit = getContextLimit(modelId);
   if (modelLimit > DEFAULT_CONTEXT_LIMIT) {

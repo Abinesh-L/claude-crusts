@@ -29,9 +29,11 @@ import type {
   MemoryFileSummary,
   SkillInfo,
   ConfigData,
+  CompactionSettings,
 } from './types.ts';
 import { CORE_TOOL_NAMES, LEGACY_CORE_SCHEMA_TOKENS, mcpServerName } from './built-in-tools.ts';
 import { loadCoreSchemaOverride } from './calibrator.ts';
+import { IDLE_COMPACT_FLOOR_TOKENS, IDLE_COMPACT_MIN_TOKENS } from './model-context.ts';
 
 /** Average tokens per character (rough English text heuristic) */
 const CHARS_PER_TOKEN = 4;
@@ -601,6 +603,107 @@ export function readSettingsModels(projectPath?: string): string[] {
   }
   push(readJsonRecord(join(homedir(), '.claude', 'settings.json')));
   return models;
+}
+
+/**
+ * Read the Claude Code settings that move the context window and compaction.
+ *
+ * Settings files are read highest precedence first (project
+ * .claude/settings.local.json, project .claude/settings.json,
+ * ~/.claude/settings.json); the first file that sets a key wins. Variables
+ * come from the process environment first (Claude Code passes its
+ * environment, settings `env` blocks included, to hooks), then from the
+ * settings files' `env` blocks, which is what a standalone `claude-crusts`
+ * run sees. Keys read:
+ *
+ *   - `autoCompactEnabled` / DISABLE_AUTO_COMPACT: auto-compaction on or off
+ *     (either one turning it off wins; off also turns idle compaction off)
+ *   - `autoCompactWindow` (top level) and `modelSettings.<model>.autoCompactWindow`
+ *     (written by `/autocompact`); CLAUDE_CODE_AUTO_COMPACT_WINDOW beats both
+ *   - `idleCompaction` and CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS (values below
+ *     100,000 are raised to 100,000, as Claude Code does)
+ *   - CLAUDE_CODE_DISABLE_1M_CONTEXT
+ *
+ * A window value that is not a positive number (`"auto"`, garbage) counts as
+ * unset. Missing or corrupt files are skipped.
+ *
+ * @param projectPath - Optional project directory for project-level settings
+ * @param env - Environment to read variables from (defaults to process.env)
+ * @returns The compaction settings, Claude Code defaults where nothing is set
+ */
+export function readCompactionSettings(
+  projectPath?: string,
+  env: Record<string, string | undefined> = process.env,
+): CompactionSettings {
+  const records: Array<Record<string, unknown>> = [];
+  const add = (record: Record<string, unknown> | null): void => {
+    if (record) records.push(record);
+  };
+  if (projectPath) {
+    add(readJsonRecord(join(projectPath, '.claude', 'settings.local.json')));
+    add(readJsonRecord(join(projectPath, '.claude', 'settings.json')));
+  }
+  add(readJsonRecord(join(homedir(), '.claude', 'settings.json')));
+
+  /** First value of a top-level key, in precedence order. */
+  const first = (key: string): unknown => {
+    for (const record of records) {
+      if (record[key] !== undefined) return record[key];
+    }
+    return undefined;
+  };
+  /** A variable from the process environment, else a settings `env` block. */
+  const variable = (name: string): string | undefined => {
+    const live = env[name];
+    if (typeof live === 'string' && live.trim() !== '') return live.trim();
+    for (const record of records) {
+      const block = record.env;
+      if (!block || typeof block !== 'object') continue;
+      const value = (block as Record<string, unknown>)[name];
+      if (typeof value === 'string' && value.trim() !== '') return value.trim();
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    }
+    return undefined;
+  };
+  /** A positive whole token count, or undefined. */
+  const tokens = (value: unknown): number | undefined => {
+    const n = typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value.trim()) : Number.NaN;
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  };
+  /** An environment flag is set when present and not an explicit false. */
+  const flag = (value: string | undefined): boolean =>
+    value !== undefined && !/^(0|false|no|off)$/i.test(value);
+
+  const autoCompactEnabled = !flag(variable('DISABLE_AUTO_COMPACT')) && first('autoCompactEnabled') !== false;
+
+  // Lowest precedence first, so a higher-precedence file overwrites a model's entry.
+  const modelAutoCompactWindows: Record<string, number> = {};
+  for (const record of [...records].reverse()) {
+    const modelSettings = record.modelSettings;
+    if (!modelSettings || typeof modelSettings !== 'object') continue;
+    for (const [model, entry] of Object.entries(modelSettings as Record<string, unknown>)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const window = tokens((entry as Record<string, unknown>).autoCompactWindow);
+      if (window !== undefined) modelAutoCompactWindows[model] = window;
+    }
+  }
+
+  const idleMin = tokens(variable('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS'));
+  const autoCompactWindow = tokens(first('autoCompactWindow'));
+  const envAutoCompactWindow = tokens(variable('CLAUDE_CODE_AUTO_COMPACT_WINDOW'));
+  return {
+    autoCompactEnabled,
+    ...(autoCompactWindow !== undefined ? { autoCompactWindow } : {}),
+    ...(Object.keys(modelAutoCompactWindows).length > 0 ? { modelAutoCompactWindows } : {}),
+    ...(envAutoCompactWindow !== undefined ? { envAutoCompactWindow } : {}),
+    idleCompaction: autoCompactEnabled && first('idleCompaction') !== false,
+    idleCompactMinTokens: idleMin !== undefined
+      ? Math.max(IDLE_COMPACT_FLOOR_TOKENS, idleMin)
+      : IDLE_COMPACT_MIN_TOKENS,
+    disable1m: flag(variable('CLAUDE_CODE_DISABLE_1M_CONTEXT')),
+  };
 }
 
 /**

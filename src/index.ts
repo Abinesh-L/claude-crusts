@@ -175,7 +175,7 @@ program
     console.log(chalk.bold(`\n  Timeline: ${session.id.slice(0, 8)}`));
     console.log(chalk.dim(`  Messages: ${result.messageCount} | Project: ${session.project}`));
 
-    renderTimeline(result.breakdown.messages, result.breakdown.context_limit, result.breakdown.compactionEvents);
+    renderTimeline(result.breakdown.messages, result.breakdown.context_limit, result.breakdown.compactionEvents, result.breakdown.compaction);
   });
 
 program

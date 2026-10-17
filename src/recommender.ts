@@ -26,15 +26,22 @@ import { loadAutocompactBufferTokens } from './config.ts';
  * Resolve the auto-compaction trigger level for this breakdown's window.
  *
  * Auto-compaction fires when the reserved headroom buffer is exhausted:
- * `limit - buffer` tokens (167,000 on a 200K window, 967,000 on 1M), not at
- * a flat 80%. The buffer honours the user's `autocompactBufferTokens`
- * config override. Approximate at the edges: the actual trigger lands on
- * turn boundaries, so a heavy turn can overshoot before compaction fires.
+ * the auto-compact window minus the buffer (167,000 on a 200K window,
+ * 967,000 on 1M with no setting), not at a flat 80%. The classifier's
+ * compaction model already honours Claude Code's auto-compact window
+ * settings and crusts' `autocompactBufferTokens` override; hand-built
+ * breakdowns without one fall back to the window minus the buffer.
+ * Approximate at the edges: the actual trigger lands on turn boundaries,
+ * so a heavy turn can overshoot before compaction fires.
  *
- * @param breakdown - The CRUSTS breakdown (supplies `context_limit`)
- * @returns The trigger level in tokens plus the buffer used to compute it
+ * @param breakdown - The CRUSTS breakdown (supplies `compaction` or `context_limit`)
+ * @returns The trigger level in tokens (null when auto-compaction is off)
+ *   plus the buffer used to compute it
  */
-function resolveAutocompactTrigger(breakdown: CrustsBreakdown): { trigger: number; bufferTokens: number } {
+function resolveAutocompactTrigger(breakdown: CrustsBreakdown): { trigger: number | null; bufferTokens: number } {
+  if (breakdown.compaction) {
+    return { trigger: breakdown.compaction.trigger, bufferTokens: breakdown.compaction.bufferTokens };
+  }
   const bufferTokens = loadAutocompactBufferTokens();
   return { trigger: autocompactTrigger(breakdown.context_limit, bufferTokens), bufferTokens };
 }
@@ -92,6 +99,7 @@ function estimateMessagesUntilCompaction(breakdown: CrustsBreakdown): number | n
   if (msgCount === 0) return null;
 
   const { trigger } = resolveAutocompactTrigger(breakdown);
+  if (trigger === null) return null;
   if (ctx.total_tokens >= trigger) return 0;
 
   const avgTokensPerMessage = ctx.total_tokens / msgCount;
@@ -256,6 +264,7 @@ function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendati
   if (msgCount === 0) return [];
 
   const { trigger, bufferTokens } = resolveAutocompactTrigger(breakdown);
+  if (trigger === null) return [];
   const bufferK = `${Math.round(bufferTokens / 1000)}K`;
   const avgPerMsg = ctx.total_tokens / msgCount;
   const remaining = avgPerMsg > 0
@@ -288,6 +297,34 @@ function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendati
     action: `~${remaining} messages until auto-compaction`,
     impact: 0,
     reason: `${ctx.total_tokens.toLocaleString()} tokens, ~${Math.round(avgPerMsg)} per message. You have room. No action needed.`,
+  }];
+}
+
+/**
+ * Warn that Claude Code will compact this session if it is left idle.
+ *
+ * Since Claude Code 2.1.299, a conversation at or above the idle threshold
+ * (200K by default) that sits idle about 54 minutes is compacted before its
+ * one-hour prompt cache expires. A 1M window rarely reaches a percentage
+ * advisory before a break, so this is usually the compaction that comes
+ * first. Silent when idle compaction is off or the window is under the
+ * threshold.
+ *
+ * @param breakdown - CRUSTS breakdown (needs the classifier's compaction model)
+ * @returns At most one recommendation
+ */
+function recommendIdleCompaction(breakdown: CrustsBreakdown): Recommendation[] {
+  const idle = breakdown.compaction?.idle;
+  if (!idle?.applies) return [];
+  const total = (breakdown.currentContext ?? breakdown).total_tokens;
+  // Priority 2, listed ahead of the duplicate-read tips: on a 1M window this
+  // is usually the compaction that comes first, and the dashboard shows only
+  // the top three actions.
+  return [{
+    priority: 2,
+    action: `If left idle ~${idle.afterMinutes} min, Claude Code compacts this session`,
+    impact: 0,
+    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes ends in a generic summary. Before a break, run the /compact focus command above to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or /config).`,
   }];
 }
 
@@ -542,6 +579,7 @@ export function generateRecommendations(
   const recommendations: Recommendation[] = [
     ...recommendCompactCommand(waste, breakdown),
     ...recommendCompactionPrediction(breakdown),
+    ...recommendIdleCompaction(breakdown),
     ...recommendDuplicateFiles(waste),
     ...recommendTopConsumers(breakdown, waste, configData, messages),
     ...recommendMCPInfo(configData, breakdown, messages),

@@ -15,9 +15,11 @@ import {
   readMemoryFiles,
   readSkillsConfig,
   readSettingsModels,
+  readCompactionSettings,
   getBuiltInToolList,
   collectObservedMcpServers,
 } from './scanner.ts';
+import { loadAutocompactBufferTokens } from './config.ts';
 import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
 import { generateRecommendations } from './recommender.ts';
@@ -58,6 +60,7 @@ export function gatherConfigData(
       totalEstimatedTokens: skillItems.reduce((sum, s) => sum + s.estimatedTokens, 0),
     },
     settingsModels: readSettingsModels(projectPath),
+    compaction: { ...readCompactionSettings(projectPath), bufferTokens: loadAutocompactBufferTokens() },
   };
 }
 

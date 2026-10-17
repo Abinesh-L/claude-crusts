@@ -27,6 +27,7 @@ import {
   readMCPConfig,
   readSkillsConfig,
   readSettingsModels,
+  readCompactionSettings,
   collectObservedMcpServers,
 } from '../src/scanner.ts';
 import { classifySession, detectCompactionEvents } from '../src/classifier.ts';
@@ -815,6 +816,91 @@ describe('readSettingsModels (M13)', () => {
       expect(readSettingsModels()).toEqual([]);
       writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ model: '  ' }), 'utf-8');
       expect(readSettingsModels()).toEqual([]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.1 — Claude Code compaction settings
+// ---------------------------------------------------------------------------
+
+describe('readCompactionSettings (0.8.1)', () => {
+  /** Write ~/.claude/settings.json in the sandbox home. */
+  function userSettings(home: string, settings: Record<string, unknown>): void {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(settings), 'utf-8');
+  }
+
+  test("nothing set means Claude Code's defaults", () => {
+    withTempHome(() => {
+      expect(readCompactionSettings(undefined, {})).toEqual({
+        autoCompactEnabled: true,
+        idleCompaction: true,
+        idleCompactMinTokens: 200_000,
+        disable1m: false,
+      });
+    });
+  });
+
+  test('idleCompaction false turns idle compaction off and leaves auto-compaction on', () => {
+    withTempHome((home) => {
+      userSettings(home, { idleCompaction: false });
+      const s = readCompactionSettings(undefined, {});
+      expect(s.idleCompaction).toBe(false);
+      expect(s.autoCompactEnabled).toBe(true);
+    });
+  });
+
+  test('auto-compaction off (setting or DISABLE_AUTO_COMPACT) turns idle compaction off too', () => {
+    withTempHome((home) => {
+      userSettings(home, { autoCompactEnabled: false });
+      expect(readCompactionSettings(undefined, {})).toMatchObject({ autoCompactEnabled: false, idleCompaction: false });
+      userSettings(home, {});
+      expect(readCompactionSettings(undefined, { DISABLE_AUTO_COMPACT: '1' }))
+        .toMatchObject({ autoCompactEnabled: false, idleCompaction: false });
+      expect(readCompactionSettings(undefined, { DISABLE_AUTO_COMPACT: '0' }).autoCompactEnabled).toBe(true);
+    });
+  });
+
+  test('auto-compact windows: top level, per model from /autocompact, and the env override', () => {
+    withTempHome((home) => {
+      userSettings(home, {
+        autoCompactWindow: 500_000,
+        modelSettings: { 'claude-opus-5-5': { effortLevel: 'low', autoCompactWindow: 400_000 }, 'claude-fable-5-1': { autoCompactWindow: 'auto' } },
+      });
+      const s = readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '300000' });
+      expect(s.autoCompactWindow).toBe(500_000);
+      expect(s.modelAutoCompactWindows).toEqual({ 'claude-opus-5-5': 400_000 });
+      expect(s.envAutoCompactWindow).toBe(300_000);
+    });
+  });
+
+  test('variables come from a settings env block when the process does not set them', () => {
+    withTempHome((home) => {
+      userSettings(home, { env: { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '150000', CLAUDE_CODE_DISABLE_1M_CONTEXT: '1' } });
+      expect(readCompactionSettings(undefined, {})).toMatchObject({ idleCompactMinTokens: 150_000, disable1m: true });
+      // The process environment wins over the settings block.
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '600000' }).idleCompactMinTokens)
+        .toBe(600_000);
+    });
+  });
+
+  test('an idle threshold below 100K is raised to 100K, and garbage is ignored', () => {
+    withTempHome(() => {
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '50000' }).idleCompactMinTokens).toBe(100_000);
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: 'lots' }).idleCompactMinTokens).toBe(200_000);
+    });
+  });
+
+  test('project settings take precedence over user settings', () => {
+    withTempHome((home) => {
+      userSettings(home, { idleCompaction: false, autoCompactWindow: 500_000 });
+      const project = join(home, 'proj');
+      mkdirSync(join(project, '.claude'), { recursive: true });
+      writeFileSync(join(project, '.claude', 'settings.json'), JSON.stringify({ idleCompaction: true, autoCompactWindow: 700_000 }), 'utf-8');
+      const s = readCompactionSettings(project, {});
+      expect(s.idleCompaction).toBe(true);
+      expect(s.autoCompactWindow).toBe(700_000);
     });
   });
 });

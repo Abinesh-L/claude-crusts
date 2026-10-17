@@ -9,6 +9,8 @@ import {
   DEFAULT_CONTEXT_LIMIT,
   MODEL_CONTEXT_LIMITS,
   getNativeContextLimit,
+  parseClaudeModelId,
+  resolveCompactionModel,
   modelFamily,
   detectContextCommandWindow,
   detectSettingsContextLimit,
@@ -206,13 +208,28 @@ describe('M13 native-1M model table', () => {
     }
   });
 
-  test('4.x models and unknown ids have no native entry', () => {
+  test('models that need a [1m] variant, and unknown ids, have no native entry', () => {
+    // Claude Code model-config docs: Opus 4.6 and Sonnet 4.6 run at 200K
+    // without the [1m] variant.
     const ids: Array<string | undefined> = [
-      'claude-opus-4-6', 'claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-4-6',
-      'claude-haiku-4-5-20251001', 'some-future-model', undefined,
+      'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001',
+      'some-future-model', undefined,
     ];
     for (const id of ids) {
       expect(getNativeContextLimit(id)).toBeNull();
+    }
+  });
+
+  test('Opus 4.7 and later, Sonnet 5 and later, Haiku 5.5 and Fable are natively 1M', () => {
+    // "Fable 5.1, Fable 5, Sonnet 5 and later, Haiku 5.5, and Opus 4.7 and
+    // later get the 1M window with no [1m] variant to select."
+    const ids = [
+      'claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-5', 'claude-opus-5-5',
+      'claude-sonnet-5', 'claude-sonnet-5-5', 'claude-haiku-5-5',
+      'claude-fable-5', 'claude-fable-5-1',
+    ];
+    for (const id of ids) {
+      expect(getNativeContextLimit(id)).toBe(1_000_000);
     }
   });
 
@@ -232,10 +249,28 @@ describe('M13 native-1M model table', () => {
     }
   });
 
-  test('look-alike IDs stay off the native table', () => {
-    for (const id of ['claude-opus-50', 'claude-opus-5x', 'claude-opus-5-mini', 'claude-haiku-5-5', 'claude-opus-5-123']) {
+  test('IDs that do not parse as a Claude model version stay off the native table', () => {
+    for (const id of ['claude-opus-5x', 'claude-opus-5-mini', 'claude-opus-5-123', 'opus-5-5', 'claude-haiku-4-4']) {
       expect(getNativeContextLimit(id)).toBeNull();
     }
+  });
+
+  test('parseClaudeModelId reads family, major and minor', () => {
+    expect(parseClaudeModelId('claude-opus-5-5')).toEqual({ family: 'opus', major: 5, minor: 5 });
+    expect(parseClaudeModelId('claude-fable-5')).toEqual({ family: 'fable', major: 5, minor: 0 });
+    expect(parseClaudeModelId('claude-haiku-4-5-20251001')).toEqual({ family: 'haiku', major: 4, minor: 5 });
+    expect(parseClaudeModelId('claude-opus-4-8[1m]')).toEqual({ family: 'opus', major: 4, minor: 8 });
+    expect(parseClaudeModelId('claude-opus-5-mini')).toBeNull();
+    expect(parseClaudeModelId(undefined)).toBeNull();
+  });
+
+  test('CLAUDE_CODE_DISABLE_1M_CONTEXT holds a native-1M model at 200K', () => {
+    expect(resolveContextLimitWithSignal('claude-opus-5-5', [], { disable1m: true }))
+      .toEqual({ limit: 200_000, signal: 'disable-1m' });
+    // A recorded /context output still wins: it is the window Claude Code measured.
+    const measured = contextUsageRecord('300k / 1m (30%)', { model: 'claude-opus-5-5' });
+    expect(resolveContextLimitWithSignal('claude-opus-5-5', [measured], { disable1m: true }).signal)
+      .toBe('context-command');
   });
 
   test('a dotted 5-generation session under 200K resolves natively, not to the default', () => {
@@ -247,8 +282,8 @@ describe('M13 native-1M model table', () => {
 describe('0.8.1 /context outputs are matched to the model they measured', () => {
   test('a /context output from another model family is skipped', () => {
     const fable = contextUsageRecord('300k / 1m (30%)', { model: 'claude-fable-5-1' });
-    expect(detectContextCommandWindow([fable], 'claude-opus-4-8')).toBeNull();
-    expect(resolveContextLimitWithSignal('claude-opus-4-8', [fable]).signal).toBe('default');
+    expect(detectContextCommandWindow([fable], 'claude-opus-4-6')).toBeNull();
+    expect(resolveContextLimitWithSignal('claude-opus-4-6', [fable]).signal).toBe('default');
   });
 
   test('the same family matches across a [1m] variant and without a model filter', () => {
@@ -347,7 +382,7 @@ describe('M13 resolveContextLimitWithSignal priority order', () => {
 
   test('zero, negative, and non-finite overrides are ignored', () => {
     for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(resolveContextLimitWithSignal('claude-opus-4-7', [], { limitOverride: bad }).signal).toBe('default');
+      expect(resolveContextLimitWithSignal('claude-opus-4-6', [], { limitOverride: bad }).signal).toBe('default');
     }
   });
 
@@ -388,14 +423,73 @@ describe('M13 resolveContextLimitWithSignal priority order', () => {
       .toEqual({ limit: 1_000_000, signal: 'native' });
   });
 
-  test('bare 4.x models stay at 200K without a signal', () => {
-    for (const id of ['claude-opus-4-6', 'claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-4-6']) {
+  test('Opus 4.6, Sonnet 4.6 and Haiku 4.5 stay at 200K without a signal', () => {
+    for (const id of ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001']) {
       expect(resolveContextLimitWithSignal(id, [msg(6, 0, 100_000)]))
         .toEqual({ limit: DEFAULT_CONTEXT_LIMIT, signal: 'default' });
     }
   });
 
+  test('Opus 4.7 and 4.8 resolve to their native 1M without a signal', () => {
+    for (const id of ['claude-opus-4-7', 'claude-opus-4-8']) {
+      expect(resolveContextLimitWithSignal(id, [msg(6, 0, 100_000)]))
+        .toEqual({ limit: 1_000_000, signal: 'native' });
+    }
+  });
+
   test('back-compat wrapper threads options through', () => {
     expect(resolveContextLimit('claude-opus-4-7', [], { limitOverride: 300_000 })).toBe(300_000);
+  });
+});
+
+describe('0.8.1 resolveCompactionModel', () => {
+  test("defaults: the trigger is the window minus 33K and idle compaction applies from 200K", () => {
+    const m = resolveCompactionModel(1_000_000, 'claude-opus-5-5', 350_000);
+    expect(m.trigger).toBe(967_000);
+    expect(m.autoCompactWindow).toBe(1_000_000);
+    expect(m.windowSource).toBe('default');
+    expect(m.bufferTokens).toBe(33_000);
+    expect(m.idle).toEqual({ enabled: true, minTokens: 200_000, afterMinutes: 54, applies: true });
+    expect(resolveCompactionModel(200_000, 'claude-opus-4-6', 50_000).trigger).toBe(167_000);
+  });
+
+  test('idle compaction does not apply under its threshold, or when it is off', () => {
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 150_000).idle.applies).toBe(false);
+    const off = resolveCompactionModel(1_000_000, 'claude-opus-5-5', 600_000, {
+      autoCompactEnabled: true, idleCompaction: false, idleCompactMinTokens: 200_000, disable1m: false,
+    });
+    expect(off.idle.enabled).toBe(false);
+    expect(off.idle.applies).toBe(false);
+    expect(off.trigger).toBe(967_000);
+  });
+
+  test('auto-compact windows: env beats the per-model window, which beats the top level; all capped at the window', () => {
+    const base = { autoCompactEnabled: true, idleCompaction: true, idleCompactMinTokens: 200_000, disable1m: false };
+    const settings = { ...base, autoCompactWindow: 500_000, modelAutoCompactWindows: { 'claude-opus-5-5': 400_000 } };
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, settings))
+      .toMatchObject({ autoCompactWindow: 400_000, windowSource: 'model-setting', trigger: 367_000 });
+    expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 0, settings))
+      .toMatchObject({ autoCompactWindow: 500_000, windowSource: 'setting', trigger: 467_000 });
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, { ...settings, envAutoCompactWindow: 300_000 }))
+      .toMatchObject({ autoCompactWindow: 300_000, windowSource: 'env' });
+    expect(resolveCompactionModel(200_000, 'claude-opus-4-6', 0, { ...base, autoCompactWindow: 500_000 }).autoCompactWindow)
+      .toBe(200_000);
+  });
+
+  test('auto-compaction off: no trigger and no idle compaction', () => {
+    const m = resolveCompactionModel(1_000_000, 'claude-opus-5-5', 900_000, {
+      autoCompactEnabled: false, idleCompaction: false, idleCompactMinTokens: 200_000, disable1m: false,
+    });
+    expect(m.trigger).toBeNull();
+    expect(m.windowSource).toBe('disabled');
+    expect(m.idle.applies).toBe(false);
+  });
+
+  test("crusts' own buffer override moves the trigger", () => {
+    const m = resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, {
+      autoCompactEnabled: true, idleCompaction: true, idleCompactMinTokens: 200_000, disable1m: false, bufferTokens: 50_000,
+    });
+    expect(m.trigger).toBe(950_000);
+    expect(m.bufferTokens).toBe(50_000);
   });
 });
