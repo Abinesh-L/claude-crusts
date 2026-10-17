@@ -20,7 +20,7 @@ import { existsSync, appendFileSync, readFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { parseSession } from './scanner.ts';
 import { gatherConfigData } from './analyzer.ts';
-import { classifySession } from './classifier.ts';
+import { classifySession, nonHumanPromptKind } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
 import { loadAutoInjectConfig, loadAutocompactBufferTokens, recordInjection } from './config.ts';
 import { autocompactTrigger, AUTOCOMPACT_BUFFER_TOKENS } from './model-context.ts';
@@ -132,6 +132,32 @@ export async function readAutoInjectPayload(): Promise<AutoInjectPayload | null>
   }
 }
 
+/**
+ * Why a submitted prompt must not carry an advisory, or null when it may.
+ *
+ * Claude Code fires UserPromptSubmit for machine-written turns too: a
+ * background task finishing submits a `<task-notification>` turn, and
+ * slash-command wrappers arrive as `<command-name>` text. An advisory
+ * attached to one of those lands in a turn the person is not reading, and
+ * the per-session min-gap it consumes then holds back the advisory on their
+ * next real prompt (observed: injected into a task notification at 81.5%,
+ * then suppressed four minutes later when they typed at 81.9%). `/compact`
+ * and `/clear` are typed by the person, but advising a compaction on the
+ * command that compacts or clears the window is noise.
+ *
+ * Payloads without a `prompt` field are not skipped (older Claude Code).
+ *
+ * @param prompt - The payload's `prompt` field
+ * @returns A short reason to skip, or null when the prompt may carry one
+ */
+export function promptSkipReason(prompt: string | undefined): string | null {
+  if (typeof prompt !== 'string') return null;
+  const kind = nonHumanPromptKind(prompt);
+  if (kind) return `machine-written prompt (${kind})`;
+  if (/^\/(compact|clear)(\s|$)/.test(prompt.trimStart())) return 'compaction command';
+  return null;
+}
+
 /** Decision outcome for whether this invocation should emit an injection. */
 export type InjectDecision =
   | { inject: false; reason: string }
@@ -231,8 +257,12 @@ export function buildInjectionText(
 
   // Read the live window's buckets: post-compaction sessions keep lifetime
   // buckets on the top-level breakdown, but the advisory describes the
-  // CURRENT context, so prefer currentContext when it exists.
-  const bucketSource = (breakdown.currentContext ?? breakdown).buckets;
+  // CURRENT context, so prefer currentContext when it exists. Buckets come
+  // in fixed CRUSTS order, so rank them by size before naming the dominant
+  // ones (the head of the fixed order read "conversation 0%, retrieved 1%,
+  // user 0%" on windows that System or Tools filled).
+  const bucketSource = [...(breakdown.currentContext ?? breakdown).buckets]
+    .sort((a, b) => b.tokens - a.tokens);
   const headerTail = saveable > 0
     ? ` ~${saveable.toLocaleString()} tokens of reclaimable waste identified.`
     : ` Dominant categories: ${bucketSource.slice(0, 3).map((b) => `${b.category} ${b.percentage.toFixed(0)}%`).join(', ')}.`;
@@ -281,6 +311,10 @@ export async function runAutoInject(): Promise<void> {
   try {
     const payload = await readAutoInjectPayload();
     if (!payload) return;
+    // Only a prompt the person typed may carry (and spend the min-gap on)
+    // an advisory; checked before the transcript parse, which is the
+    // expensive part.
+    if (promptSkipReason(payload.prompt) !== null) return;
 
     const transcriptPath = payload.transcript_path;
     if (!transcriptPath || !existsSync(transcriptPath)) return;

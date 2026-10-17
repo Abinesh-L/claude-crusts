@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { shouldInject, buildInjectionText, writeInjectionLog, readInjectionLog } from '../src/auto-inject.ts';
+import { shouldInject, buildInjectionText, writeInjectionLog, readInjectionLog, promptSkipReason } from '../src/auto-inject.ts';
 import type { CrustsBreakdown, WasteItem } from '../src/types.ts';
 import { DEFAULT_AUTO_INJECT } from '../src/config.ts';
 
@@ -222,6 +222,51 @@ describe('buildInjectionText', () => {
     const text = buildInjectionText(bd, [], 75);
     expect(text).toContain('state 60%');
     expect(text).not.toContain('conversation 40%');
+  });
+
+  test('dominant categories are the three largest buckets, not the head of the fixed order', () => {
+    // buildBuckets emits fixed CRUSTS order (C, R, U, S, T, St). A window
+    // that System and Tools fill must name them, largest first.
+    const bd = breakdownAt(83, {
+      buckets: [
+        { category: 'conversation', tokens: 1_000, percentage: 1, accuracy: 'estimated' },
+        { category: 'retrieved', tokens: 2_000, percentage: 1, accuracy: 'estimated' },
+        { category: 'user', tokens: 100, percentage: 0, accuracy: 'estimated' },
+        { category: 'system', tokens: 120_000, percentage: 73, accuracy: 'estimated' },
+        { category: 'tools', tokens: 40_000, percentage: 24, accuracy: 'estimated' },
+        { category: 'state', tokens: 3_000, percentage: 2, accuracy: 'estimated' },
+      ],
+    });
+    const text = buildInjectionText(bd, [], 83);
+    expect(text).toContain('Dominant categories: system 73%, tools 24%, state 2%.');
+  });
+});
+
+describe('promptSkipReason', () => {
+  test('a typed prompt may carry an advisory', () => {
+    expect(promptSkipReason('please fix the failing test')).toBeNull();
+    expect(promptSkipReason('/review the diff')).toBeNull();
+  });
+
+  test('payloads without a prompt field are not skipped', () => {
+    expect(promptSkipReason(undefined)).toBeNull();
+  });
+
+  test('background task notifications are skipped', () => {
+    const text = '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>';
+    expect(promptSkipReason(text)).toBe('machine-written prompt (task-notification)');
+  });
+
+  test('slash-command wrappers and interrupts are skipped', () => {
+    expect(promptSkipReason('<command-name>/model</command-name>')).toContain('local-command');
+    expect(promptSkipReason('[Request interrupted by user]')).toContain('interrupt');
+  });
+
+  test('/compact and /clear are skipped, with or without arguments', () => {
+    expect(promptSkipReason('/compact')).toBe('compaction command');
+    expect(promptSkipReason('/compact focus "keep the plan"')).toBe('compaction command');
+    expect(promptSkipReason('  /clear')).toBe('compaction command');
+    expect(promptSkipReason('/compactor')).toBeNull();
   });
 });
 

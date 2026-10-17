@@ -127,7 +127,7 @@ const NON_HUMAN_USER_PREFIXES: ReadonlyArray<{ prefix: string; kind: NonHumanUse
 ];
 
 /** Kinds of machine-written user records recognised by their leading marker */
-type NonHumanUserKind = 'task-notification' | 'local-command' | 'interrupt';
+export type NonHumanUserKind = 'task-notification' | 'local-command' | 'interrupt';
 
 /** Keywords that indicate state/memory content */
 const STATE_MARKERS = [
@@ -797,10 +797,24 @@ function userRecordText(msg: SessionMessage): string {
  * @returns The record kind, or null when no marker matches
  */
 function nonHumanUserKind(msg: SessionMessage): NonHumanUserKind | null {
-  const text = userRecordText(msg).trimStart();
-  if (!text) return null;
+  return nonHumanPromptKind(userRecordText(msg));
+}
+
+/**
+ * Identify machine-written prompt text by its leading marker.
+ *
+ * The raw-text form of `nonHumanUserKind`, for callers that hold the prompt
+ * string itself (the UserPromptSubmit hook payload's `prompt`) rather than a
+ * transcript record, so both agree on what a typed prompt is.
+ *
+ * @param text - Prompt text as submitted
+ * @returns The machine-written kind, or null when no marker matches
+ */
+export function nonHumanPromptKind(text: string): NonHumanUserKind | null {
+  const trimmed = text.trimStart();
+  if (!trimmed) return null;
   for (const entry of NON_HUMAN_USER_PREFIXES) {
-    if (text.startsWith(entry.prefix)) return entry.kind;
+    if (trimmed.startsWith(entry.prefix)) return entry.kind;
   }
   return null;
 }
