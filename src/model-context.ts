@@ -74,12 +74,15 @@ export const MODEL_CONTEXT_LIMITS: Array<{ pattern: RegExp; limit: number }> = [
 
 /**
  * Model families whose Claude Code window is natively 1M tokens with no
- * `[1m]` variant suffix: the 5-generation fable/mythos/opus/sonnet IDs.
- * The 4.x generations are deliberately NOT listed; Claude Code runs them
- * at 200K unless an explicit signal (variant, settings, payload, /context
- * output, observed usage) says otherwise.
+ * `[1m]` variant suffix: the 5-generation fable/mythos/opus/sonnet IDs,
+ * including point releases (`claude-opus-5-5`, `claude-fable-5-1`) and an
+ * optional 8-digit date suffix. The version part must end the ID (or meet
+ * a bracketed variant), so `claude-opus-50` and `claude-opus-5-mini` do
+ * not match. The 4.x generations are deliberately NOT listed; Claude Code
+ * runs them at 200K unless an explicit signal (variant, settings, payload,
+ * /context output, observed usage) says otherwise.
  */
-export const NATIVE_1M_MODEL_PATTERN = /^claude-(fable|mythos|opus|sonnet)-5(?![\w-])/i;
+export const NATIVE_1M_MODEL_PATTERN = /^claude-(fable|mythos|opus|sonnet)-5(?:-\d{1,2})?(?:-\d{8})?(?=$|\[)/i;
 
 /**
  * Resolve the context-window size for a given model ID.

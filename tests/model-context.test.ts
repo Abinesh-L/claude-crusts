@@ -219,6 +219,29 @@ describe('M13 native-1M model table', () => {
   test('a variant suffix does not defeat the native match', () => {
     expect(getNativeContextLimit('claude-fable-5[1m]')).toBe(1_000_000);
   });
+
+  test('5-generation point releases and dated IDs resolve to 1M', () => {
+    // Real IDs from Claude Code 2.1.28x-2.1.300 transcripts: these ran
+    // sessions past 800K effective input, so their window is 1M.
+    const ids = [
+      'claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5',
+      'claude-opus-5-5[1m]', 'claude-fable-5-1-20261001', 'claude-opus-5-20260115',
+    ];
+    for (const id of ids) {
+      expect(getNativeContextLimit(id)).toBe(1_000_000);
+    }
+  });
+
+  test('look-alike IDs stay off the native table', () => {
+    for (const id of ['claude-opus-50', 'claude-opus-5x', 'claude-opus-5-mini', 'claude-haiku-5-5', 'claude-opus-5-123']) {
+      expect(getNativeContextLimit(id)).toBeNull();
+    }
+  });
+
+  test('a dotted 5-generation session under 200K resolves natively, not to the default', () => {
+    expect(resolveContextLimitWithSignal('claude-opus-5-5', []))
+      .toEqual({ limit: 1_000_000, signal: 'native' });
+  });
 });
 
 describe('M13 modelFamily', () => {
