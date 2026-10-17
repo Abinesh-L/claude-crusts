@@ -179,6 +179,7 @@ program
     renderTimeline(bd.messages, bd.context_limit, bd.compactionEvents, bd.compaction, {
       totalTokens: bd.currentContext?.total_tokens ?? bd.total_tokens,
       startIndex: bd.currentContext?.startIndex ?? 0,
+      messagesUntilCompaction: result.recommendations.estimated_messages_until_compaction,
     });
   });
 

@@ -82,30 +82,56 @@ function currentWindowRows(breakdown: CrustsBreakdown): ClassifiedMessage[] {
     : breakdown.messages;
 }
 
+/** Messages a live window needs before its growth rate is worth projecting. */
+const MIN_MESSAGES_FOR_RUNWAY = 4;
+
+/**
+ * How fast the live window grows per message.
+ *
+ * Growth is measured from the window's starting size, not from zero: the
+ * size right after the last compaction (its `tokensAfter`), or for a fresh
+ * session the first turn's input (fixed context and first prompt). Dividing
+ * the whole window by a handful of messages counted the fixed context and
+ * the compact summary as per-message growth, and every compaction was
+ * followed by a false "~19 messages until auto-compaction, act soon" at 9%.
+ * Attachment rows are excluded from the message count, and fewer than
+ * `MIN_MESSAGES_FOR_RUNWAY` messages give no projection.
+ *
+ * @param breakdown - The CRUSTS breakdown
+ * @returns Tokens per message and the message count, or null when the
+ *   window is too young or has not grown
+ */
+function windowGrowth(breakdown: CrustsBreakdown): { perMessage: number; messages: number } | null {
+  const ctx = breakdown.currentContext ?? breakdown;
+  const messages = countAnalyzedMessages(currentWindowRows(breakdown));
+  if (messages < MIN_MESSAGES_FOR_RUNWAY) return null;
+  const lastEvent = breakdown.compactionEvents[breakdown.compactionEvents.length - 1];
+  const baseline = breakdown.currentContext && lastEvent
+    ? lastEvent.tokensAfter
+    : breakdown.derivedOverhead?.internalSystemPrompt?.derivation.firstAssistantInputTokens ?? 0;
+  const growth = ctx.total_tokens - baseline;
+  if (growth <= 0) return null;
+  return { perMessage: growth / messages, messages };
+}
+
 /**
  * Estimate how many more messages can be sent before auto-compaction.
  *
- * Uses the average tokens per message from the current context window
- * (post-compaction if applicable) for more accurate projection. Attachment
- * rows are excluded from the message count so injected context does not
- * dilute the per-message average.
+ * Projects the live window's growth per message (see `windowGrowth`) to the
+ * auto-compaction trigger. Null when auto-compaction is off or the window is
+ * too young to project; 0 once the trigger is reached.
  *
  * @param breakdown - The CRUSTS breakdown
  * @returns Estimated messages remaining, or null if can't calculate
  */
 function estimateMessagesUntilCompaction(breakdown: CrustsBreakdown): number | null {
   const ctx = breakdown.currentContext ?? breakdown;
-  const msgCount = countAnalyzedMessages(currentWindowRows(breakdown));
-  if (msgCount === 0) return null;
-
   const { trigger } = resolveAutocompactTrigger(breakdown);
   if (trigger === null) return null;
   if (ctx.total_tokens >= trigger) return 0;
-
-  const avgTokensPerMessage = ctx.total_tokens / msgCount;
-  if (avgTokensPerMessage <= 0) return null;
-
-  return Math.floor((trigger - ctx.total_tokens) / avgTokensPerMessage);
+  const growth = windowGrowth(breakdown);
+  if (!growth) return null;
+  return Math.floor((trigger - ctx.total_tokens) / growth.perMessage);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,21 +281,13 @@ function recommendMCPInfo(
  */
 function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendation[] {
   const ctx = breakdown.currentContext ?? breakdown;
-  // Same divisor as estimateMessagesUntilCompaction: analyzed (non-
-  // attachment) rows of the live window. Raw row counts included
-  // attachment records, diluting the per-message average and overstating
-  // the remaining runway in this recommendation while the summary line
-  // below printed the undiluted number.
-  const msgCount = countAnalyzedMessages(currentWindowRows(breakdown));
-  if (msgCount === 0) return [];
-
+  // Same projection as estimateMessagesUntilCompaction (growth per analyzed
+  // message since the window started), so the two can never disagree.
   const { trigger, bufferTokens } = resolveAutocompactTrigger(breakdown);
   if (trigger === null) return [];
   const bufferK = `${Math.round(bufferTokens / 1000)}K`;
-  const avgPerMsg = ctx.total_tokens / msgCount;
-  const remaining = avgPerMsg > 0
-    ? Math.floor((trigger - ctx.total_tokens) / avgPerMsg)
-    : null;
+  const remaining = estimateMessagesUntilCompaction(breakdown);
+  const avgPerMsg = windowGrowth(breakdown)?.perMessage ?? 0;
 
   if (remaining === null) return [];
   if (remaining <= 0) {
@@ -313,10 +331,14 @@ function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendati
  * @param breakdown - CRUSTS breakdown (needs the classifier's compaction model)
  * @returns At most one recommendation
  */
-function recommendIdleCompaction(breakdown: CrustsBreakdown): Recommendation[] {
+function recommendIdleCompaction(breakdown: CrustsBreakdown, waste: WasteItem[]): Recommendation[] {
   const idle = breakdown.compaction?.idle;
   if (!idle?.applies) return [];
   const total = (breakdown.currentContext ?? breakdown).total_tokens;
+  // The command is named here: below half the window there is no /compact
+  // recommendation above to point at, and most of a 1M window's idle band
+  // (200K-500K) is there.
+  const command = buildCompactFocus(waste)?.text ?? '/compact';
   // Priority 2, listed ahead of the duplicate-read tips: on a 1M window this
   // is usually the compaction that comes first, and the dashboard shows only
   // the top three actions.
@@ -324,7 +346,7 @@ function recommendIdleCompaction(breakdown: CrustsBreakdown): Recommendation[] {
     priority: 2,
     action: `Idle ~${idle.afterMinutes} min and Claude Code may compact this session`,
     impact: 0,
-    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes can end in a generic summary. Before a break, run the /compact focus command above to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or /config).`,
+    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes can end in a generic summary. Before a break, run ${command} to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or /config).`,
   }];
 }
 
@@ -506,8 +528,11 @@ function recommendTopConsumers(
     detail: `${tb.loadedTools.length} loaded, ${tb.usedTools.length} used`,
   });
 
-  // 3. System prompt (CLAUDE.md + derived internal)
-  const claudeMdTokens = configData.systemPrompt.totalEstimatedTokens;
+  // 3. System prompt (CLAUDE.md + derived internal). CLAUDE.md and memory
+  // use the figures the classifier used (the session's own instructions
+  // record when Claude Code wrote one), so this list and the buckets agree.
+  const derivation = breakdown.derivedOverhead?.internalSystemPrompt?.derivation;
+  const claudeMdTokens = derivation?.knownClaudeMd ?? configData.systemPrompt.totalEstimatedTokens;
   const derivedPrompt = breakdown.derivedOverhead?.internalSystemPrompt?.tokens ?? 0;
   consumers.push({
     name: 'System prompt',
@@ -530,12 +555,12 @@ function recommendTopConsumers(
   }
 
   // 5. Memory files
-  const memTokens = configData.memoryFiles.totalEstimatedTokens;
+  const memTokens = derivation?.knownMemory ?? configData.memoryFiles.totalEstimatedTokens;
   if (memTokens > 0) {
     consumers.push({
       name: 'Memory files',
       tokens: memTokens,
-      detail: `${configData.memoryFiles.files.length} file(s)`,
+      detail: derivation ? 'as loaded in this session' : `${configData.memoryFiles.files.length} file(s)`,
     });
   }
 
@@ -583,7 +608,7 @@ export function generateRecommendations(
   const recommendations: Recommendation[] = [
     ...recommendCompactCommand(waste, breakdown),
     ...recommendCompactionPrediction(breakdown),
-    ...recommendIdleCompaction(breakdown),
+    ...recommendIdleCompaction(breakdown, waste),
     ...recommendDuplicateFiles(waste),
     ...recommendTopConsumers(breakdown, waste, configData, messages),
     ...recommendMCPInfo(configData, breakdown, messages),

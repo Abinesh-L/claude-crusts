@@ -339,6 +339,7 @@ export async function executeCommand(input: string, state: TuiState): Promise<bo
         {
           totalTokens: r.breakdown.currentContext?.total_tokens ?? r.breakdown.total_tokens,
           startIndex: r.breakdown.currentContext?.startIndex ?? 0,
+          messagesUntilCompaction: r.recommendations.estimated_messages_until_compaction,
         },
       );
       return true;

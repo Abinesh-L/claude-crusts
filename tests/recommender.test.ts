@@ -279,30 +279,26 @@ describe('review fix: compaction prediction excludes attachment rows (sandboxed)
   }
 
   test('prediction recommendation and estimated_messages_until_compaction agree on a fixture with attachment rows', () => {
-    // 1 real message + 2 attachment rows at 15,000 tokens on a 200K window.
-    // Undiluted average: 15,000/msg -> floor((167,000 - 15,000) / 15,000)
-    // = 10 messages left. The raw row count (3) diluted the average to
-    // 5,000/msg and printed ~30 in the SAME dashboard that summarized ~10.
-    const bd = breakdownTokens(15_000, 200_000, 1);
-    bd.messages = [
-      bd.messages[0]!,
-      attachmentRow(1, 15_000),
-      attachmentRow(2, 15_000),
-    ];
+    // 4 real messages + 2 attachment rows at 60,000 tokens on a 200K window.
+    // Undiluted: 15,000/msg -> floor((167,000 - 60,000) / 15,000) = 7 left.
+    // Counting the 6 raw rows diluted it to 10,000/msg and printed ~10.
+    const bd = breakdownTokens(60_000, 200_000, 4);
+    bd.messages = [...bd.messages, attachmentRow(4, 15_000), attachmentRow(5, 15_000)];
     const report = generateRecommendations(bd, [], emptyConfig(), []);
 
-    expect(report.estimated_messages_until_compaction).toBe(10);
-    expect(predictedMessages(report)).toBe(10);
+    expect(report.estimated_messages_until_compaction).toBe(7);
+    expect(predictedMessages(report)).toBe(7);
   });
 
   test('post-compaction slice with attachment rows: both counters still agree', () => {
-    // currentContext at startIndex 2; the slice holds 2 real + 2 attachment
-    // rows at 15,000 tokens. Undiluted: 7,500/msg -> 20 messages left.
-    const bd = breakdownTokens(15_000, 200_000, 2);
+    // currentContext at startIndex 2; the slice holds 4 real + 2 attachment
+    // rows. The window grew from 15,000 (right after the compaction) to
+    // 55,000: 10,000 per message -> floor((167,000 - 55,000) / 10,000) = 11.
+    const bd = breakdownTokens(55_000, 200_000, 4);
     const real = bd.messages;
     bd.messages = [
       attachmentRow(0, 0), attachmentRow(1, 0),   // pre-compaction rows
-      real[0]!, attachmentRow(3, 100), real[1]!, attachmentRow(5, 15_000),
+      real[0]!, attachmentRow(3, 100), real[1]!, real[2]!, attachmentRow(6, 15_000), real[3]!,
     ];
     bd.compactionEvents = [{
       beforeIndex: 1, afterIndex: 2,
@@ -311,15 +307,32 @@ describe('review fix: compaction prediction excludes attachment rows (sandboxed)
     }];
     bd.currentContext = {
       buckets: [],
-      total_tokens: 15_000,
-      free_tokens: 185_000,
-      usage_percentage: 7.5,
+      total_tokens: 55_000,
+      free_tokens: 145_000,
+      usage_percentage: 27.5,
       startIndex: 2,
     } as CrustsBreakdown['currentContext'];
 
     const report = generateRecommendations(bd, [], emptyConfig(), []);
-    expect(report.estimated_messages_until_compaction).toBe(20);
-    expect(predictedMessages(report)).toBe(20);
+    expect(report.estimated_messages_until_compaction).toBe(11);
+    expect(predictedMessages(report)).toBe(11);
+  });
+
+  test('right after a compaction there is no countdown and no false "act soon"', () => {
+    // 2 messages since a compaction that left 80K on a 1M window: the old
+    // average (88K / 2 = 44K per message) predicted ~19 messages, "act soon".
+    const bd = breakdownTokens(88_000, 1_000_000, 2);
+    bd.compactionEvents = [{
+      beforeIndex: 0, afterIndex: 0,
+      tokensBefore: 547_000, tokensAfter: 80_000, tokensDropped: 467_000,
+      detection: 'marker', trigger: 'auto',
+    }];
+    bd.currentContext = {
+      buckets: [], total_tokens: 88_000, free_tokens: 912_000, usage_percentage: 8.8, startIndex: 0,
+    } as CrustsBreakdown['currentContext'];
+    const report = generateRecommendations(bd, [], emptyConfig(), []);
+    expect(report.estimated_messages_until_compaction).toBeNull();
+    expect(report.recommendations.some((r) => r.action.includes('act soon'))).toBe(false);
   });
 });
 

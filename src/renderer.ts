@@ -341,14 +341,15 @@ function formatDuration(seconds: number | null): string | null {
  *   settings, idle compaction); without it the trigger is the window minus
  *   the buffer
  * @param live - The live window's total and first index (the breakdown's
- *   current context); without it the prediction uses the lifetime column
+ *   current context), and the recommender's `estimated_messages_until_compaction`
+ *   when known; without it the prediction uses the lifetime column
  */
 export function renderTimeline(
   classified: ClassifiedMessage[],
   contextLimit: number,
   compactionEvents: CompactionEvent[] = [],
   compaction?: CompactionModel,
-  live?: { totalTokens: number; startIndex: number },
+  live?: { totalTokens: number; startIndex: number; messagesUntilCompaction?: number | null },
 ): void {
   console.log();
 
@@ -439,6 +440,16 @@ export function renderTimeline(
     : autocompactTrigger(contextLimit, loadAutocompactBufferTokens());
   if (compactionTokens === null) {
     console.log(chalk.dim('\n  Auto-compaction is off: the session stops with a context-limit error at the window instead.'));
+  } else if (live && live.messagesUntilCompaction !== undefined) {
+    // The same projection `analyze` prints (growth per message since the
+    // live window started), so the two views agree.
+    if (live.messagesUntilCompaction === null) {
+      console.log(chalk.dim('\n  Too few messages since the window started to project the next compaction.'));
+    } else if (live.messagesUntilCompaction <= 0) {
+      console.log(chalk.red(`\n  Context already past the auto-compact trigger (${compactionTokens.toLocaleString()} tokens)`));
+    } else {
+      console.log(chalk.dim(`\n  Compaction predicted at message ~${classified.length + live.messagesUntilCompaction} (auto-compact trigger = ${compactionTokens.toLocaleString()} tokens)`));
+    }
   } else if (classified.length > 0) {
     // Predict from the LIVE window: the cumulative column is a lifetime
     // content sum that never resets at a compaction, so a compacted session
