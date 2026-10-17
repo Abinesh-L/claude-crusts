@@ -354,14 +354,18 @@ export interface ConfigData {
  * environment to hooks.
  */
 export interface CompactionSettings {
-  /** False when `autoCompactEnabled` is false or DISABLE_AUTO_COMPACT is set */
+  /** False when `autoCompactEnabled` is false, or DISABLE_AUTO_COMPACT or DISABLE_COMPACT is set */
   autoCompactEnabled: boolean;
-  /** Top-level `autoCompactWindow` (tokens) */
+  /** Effective top-level `autoCompactWindow` (tokens) after layering the settings files */
   autoCompactWindow?: number;
-  /** Per-model windows saved by `/autocompact` under `modelSettings`, keyed by model ID */
-  modelAutoCompactWindows?: Record<string, number>;
-  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW, which takes precedence over every setting */
+  /** Per-model windows saved by `/autocompact` under `modelSettings`, keyed by
+   * model ID; 'auto' means the model's tuned default */
+  modelAutoCompactWindows?: Record<string, number | 'auto'>;
+  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW (floored at 100K, capped at 1M), which
+   * takes precedence over every setting */
   envAutoCompactWindow?: number;
+  /** CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (1-100) */
+  autoCompactPct?: number;
   /** False when `idleCompaction` is false or auto-compaction is off */
   idleCompaction: boolean;
   /** Idle compaction's size threshold (CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, default 200,000, floor 100,000) */
@@ -386,15 +390,17 @@ export interface CompactionModel {
   windowSource: 'default' | 'setting' | 'model-setting' | 'env' | 'disabled';
   /** Headroom buffer subtracted from the window to get the trigger */
   bufferTokens: number;
-  /** Idle compaction (Claude Code 2.1.299+) */
+  /** Idle compaction (Claude Code 2.1.286+, rolled out in stages) */
   idle: {
-    /** On for this install (not turned off by `idleCompaction` or auto-compact switches) */
+    /** On for this install and Claude Code version (not turned off by
+     * `idleCompaction` or the auto-compact switches) */
     enabled: boolean;
     /** Size threshold the window must reach */
     minTokens: number;
     /** Approximate idle minutes before it fires (shortly before the 1h prompt cache expires) */
     afterMinutes: number;
-    /** TTL of the session's latest cache write; idle compaction needs '1h' */
+    /** TTL of the session's latest cache write; a '5m' write rules idle
+     * compaction out, 'unknown' does not */
     cacheTtl: '1h' | '5m' | 'unknown';
     /** Enabled, not on the 5-minute cache, and the live window is at or
      * above the threshold: a long enough pause MAY compact it (Claude Code

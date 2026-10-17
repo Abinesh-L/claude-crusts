@@ -73,6 +73,40 @@ export const IDLE_COMPACT_FLOOR_TOKENS = 100_000;
 export const IDLE_COMPACT_AFTER_MINUTES = 54;
 
 /**
+ * First Claude Code version seen compacting idle sessions. The CHANGELOG
+ * announces it in 2.1.299, but real transcripts show it on 2.1.289 and
+ * 2.1.296 (recorded as "manual" before 2.1.290) and reports put it at
+ * 2.1.286: a staged rollout.
+ */
+export const IDLE_COMPACTION_SINCE = '2.1.286';
+
+/** Output headroom Claude Code subtracts before applying CLAUDE_AUTOCOMPACT_PCT_OVERRIDE. */
+const PCT_OUTPUT_HEADROOM_TOKENS = 20_000;
+
+/**
+ * Whether a dotted version is at or above another (numeric parts compared
+ * in order; a missing part counts as 0).
+ *
+ * @param version - Version to test, e.g. "2.1.289"
+ * @param floor - Minimum version
+ * @returns True when `version` >= `floor`; true when either does not parse
+ */
+function versionAtLeast(version: string, floor: string): boolean {
+  const parse = (v: string): number[] | null => {
+    const match = /^v?(\d+(?:\.\d+)*)/.exec(v.trim());
+    return match ? match[1]!.split('.').map(Number) : null;
+  };
+  const a = parse(version);
+  const b = parse(floor);
+  if (!a || !b) return true;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return true;
+}
+
+/**
  * How and when Claude Code will compact a session.
  *
  * Token trigger: the auto-compact window (CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -93,12 +127,20 @@ export const IDLE_COMPACT_AFTER_MINUTES = 54;
  * override) does not qualify. Claude Code rolls the feature out in stages,
  * so "applies" means "may happen", never "will".
  *
+ * With CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, Claude Code 2.1.302 fires at that
+ * percent of the window less output headroom (min(max output, 20K)) when
+ * that comes before the buffer trigger: min(floor((window - 20K) * pct /
+ * 100), window - buffer).
+ *
  * @param limit - Resolved context window in tokens
  * @param modelId - Session model, for a per-model `/autocompact` window
  * @param liveTokens - Live window size, for whether idle compaction applies
  * @param settings - Claude Code compaction settings (see `readCompactionSettings`)
  * @param cacheTtl - TTL of the session's latest cache write ('unknown' when
  *   the usage records do not say)
+ * @param claudeCodeVersion - The Claude Code version running the session
+ *   (its latest records); idle compaction needs IDLE_COMPACTION_SINCE or
+ *   later when known
  * @returns The compaction model
  */
 export function resolveCompactionModel(
@@ -107,6 +149,7 @@ export function resolveCompactionModel(
   liveTokens: number,
   settings?: CompactionSettings,
   cacheTtl: '1h' | '5m' | 'unknown' = 'unknown',
+  claudeCodeVersion?: string,
 ): CompactionModel {
   const bufferTokens = settings?.bufferTokens && settings.bufferTokens > 0
     ? settings.bufferTokens
@@ -123,7 +166,10 @@ export function resolveCompactionModel(
       ? Object.entries(settings.modelAutoCompactWindows)
         .find(([key]) => modelFamily(key) === modelFamily(modelId))?.[1]
       : undefined;
-    if (perModel) {
+    if (perModel === 'auto') {
+      // The model's tuned default, even over a top-level window.
+      windowSource = 'model-setting';
+    } else if (perModel) {
       window = perModel;
       windowSource = 'model-setting';
     } else if (settings?.autoCompactWindow) {
@@ -133,10 +179,20 @@ export function resolveCompactionModel(
   }
   window = Math.min(window, limit);
 
-  const idleEnabled = autoEnabled && (settings?.idleCompaction ?? true);
+  let trigger: number | null = null;
+  if (autoEnabled) {
+    trigger = autocompactTrigger(window, bufferTokens);
+    if (settings?.autoCompactPct !== undefined) {
+      const pctTrigger = Math.floor(Math.max(0, window - PCT_OUTPUT_HEADROOM_TOKENS) * settings.autoCompactPct / 100);
+      trigger = Math.min(trigger, pctTrigger);
+    }
+  }
+
+  const versionSupportsIdle = !claudeCodeVersion || versionAtLeast(claudeCodeVersion, IDLE_COMPACTION_SINCE);
+  const idleEnabled = autoEnabled && versionSupportsIdle && (settings?.idleCompaction ?? true);
   const idleMin = settings?.idleCompactMinTokens ?? IDLE_COMPACT_MIN_TOKENS;
   return {
-    trigger: autoEnabled ? autocompactTrigger(window, bufferTokens) : null,
+    trigger,
     autoCompactWindow: window,
     windowSource: autoEnabled ? windowSource : 'disabled',
     bufferTokens,
@@ -400,6 +456,11 @@ export function effectiveInput(usage: UsageLike | undefined): number {
  * exceeded 200K are reported against the standard window (no harm done,
  * users below 200K see identical output regardless).
  *
+ * A zeroed copy (see `isZeroedUsageCopy`) describes no request, but its
+ * nested cache breakdown still records the window the earlier run of this
+ * conversation reached, so it counts as evidence here: a continuation file
+ * of a `[1m]` session would otherwise read 200K until a new turn passed it.
+ *
  * @param messages - Session messages with API usage metadata
  * @returns Detected window size in tokens
  */
@@ -407,7 +468,10 @@ export function detectContextLimitFromUsage(messages: UsageMessage[]): number {
   for (const m of messages) {
     const u = m.message?.usage;
     if (!u) continue;
-    if (effectiveInput(u) > DEFAULT_CONTEXT_LIMIT) return 1_000_000;
+    const reached = isZeroedUsageCopy(u)
+      ? usageField(u.cache_creation?.ephemeral_5m_input_tokens) + usageField(u.cache_creation?.ephemeral_1h_input_tokens)
+      : effectiveInput(u);
+    if (reached > DEFAULT_CONTEXT_LIMIT) return 1_000_000;
   }
   return DEFAULT_CONTEXT_LIMIT;
 }

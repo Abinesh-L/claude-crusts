@@ -2203,3 +2203,86 @@ describe('0.8.1: attachments sized from the text Claude Code sent', () => {
     expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownMemory).toBe(1_100);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.1 review fixes
+// ---------------------------------------------------------------------------
+
+describe('0.8.1 review fixes', () => {
+  /** Timestamped turn whose effective input sits in cache_read. */
+  function turnAt(effective: number, ts: string, model = 'claude-opus-4-6'): SessionMessage {
+    return {
+      type: 'assistant',
+      timestamp: ts,
+      message: {
+        role: 'assistant',
+        model,
+        id: `msg-${ts}`,
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: effective, output_tokens: 300 },
+      },
+    } as SessionMessage;
+  }
+  function promptAt(text: string, ts: string): SessionMessage {
+    return { type: 'user', timestamp: ts, message: { role: 'user', content: text } } as SessionMessage;
+  }
+
+  test('a big paste right after a compaction is a live turn, not an in-flight one', () => {
+    // 200K model, /compact at 158K (post 20K), then the person pastes ~80K.
+    const msgs: SessionMessage[] = [
+      promptAt('work', '2026-10-17T01:00:00.000Z'),
+      turnAt(158_000, '2026-10-17T01:00:10.000Z'),
+      {
+        type: 'system', subtype: 'compact_boundary', timestamp: '2026-10-17T01:01:00.000Z', uuid: 'b-1',
+        compactMetadata: { trigger: 'manual', preTokens: 158_300, postTokens: 20_000 },
+      } as SessionMessage,
+      promptAt('x'.repeat(320_000), '2026-10-17T01:01:30.000Z'),
+      turnAt(131_000, '2026-10-17T01:01:50.000Z'),
+      promptAt('and this', '2026-10-17T01:02:30.000Z'),
+      turnAt(152_000, '2026-10-17T01:02:50.000Z'),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
+    expect(b.compactionEvents[0]!.firstLiveIndex).toBe(4);
+    expect(b.currentContext!.total_tokens).toBe(152_000 + 300);
+  });
+
+  test('an empty window classifies without throwing', () => {
+    const b = classifySession([], EMPTY_CONFIG);
+    expect(b.total_tokens).toBe(0);
+    expect(b.context_limit).toBe(200_000);
+    expect(classifySession([userText('hi')], EMPTY_CONFIG, 0).total_tokens).toBe(0);
+  });
+
+  test("before the first response the model attachment names the model, so its window is right", () => {
+    const announce = {
+      type: 'attachment',
+      attachment: { type: 'model', identity: { modelId: 'claude-opus-5-5', marketingName: 'Opus 5.5' }, text: '...' },
+    } as SessionMessage;
+    const b = classifySession([announce, userText('hello')], EMPTY_CONFIG, 2);
+    expect(b.model).toBe('claude-opus-5-5');
+    expect(b.context_limit).toBe(1_000_000);
+  });
+
+  test('a delta instructions attachment adds to the full one instead of replacing it', () => {
+    const full = {
+      type: 'attachment', version: '2.1.300',
+      attachment: {
+        type: 'instructions',
+        files: [
+          { type: 'Project', path: 'C:/p/CLAUDE.md', content: 'p'.repeat(2_000) },
+          { type: 'AutoMem', path: 'C:/m/MEMORY.md', content: 'm'.repeat(2_000) },
+        ],
+      },
+      rendered: [{ content: 'z'.repeat(4_000) }],
+    } as SessionMessage;
+    const delta = {
+      type: 'attachment', version: '2.1.300',
+      attachment: { type: 'instructions', changed: true, reason: 'session_start', files: [{ type: 'AutoMem', path: 'C:/m/MEMORY.md', content: 'n'.repeat(2_400) }] },
+      rendered: [{ content: 'y'.repeat(2_400) }],
+    } as SessionMessage;
+    const b = classifySession([full, userText('go'), assistantWithCache(2, 40_000), delta, userText('more'), assistantWithCache(2, 41_000)], EMPTY_CONFIG);
+    // Full: 1,000 tokens, half memory; delta: 600 tokens, all memory.
+    expect(b.buckets.find((x) => x.category === 'state')!.contentTokens).toBe(500 + 600);
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(500);
+  });
+});

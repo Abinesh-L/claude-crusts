@@ -874,7 +874,7 @@ describe('readCompactionSettings (0.8.1)', () => {
       });
       const s = readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '300000' });
       expect(s.autoCompactWindow).toBe(500_000);
-      expect(s.modelAutoCompactWindows).toEqual({ 'claude-opus-5-5': 400_000 });
+      expect(s.modelAutoCompactWindows).toEqual({ 'claude-opus-5-5': 400_000, 'claude-fable-5-1': 'auto' });
       expect(s.envAutoCompactWindow).toBe(300_000);
     });
   });
@@ -955,5 +955,66 @@ describe('parseSession idle compactions and bookkeeping records (0.8.1)', () => 
     ].join('\n') + '\n', 'utf-8');
     const messages = await parseSession(path);
     expect(messages.map((m) => m.type)).toEqual(['user', 'assistant']);
+  });
+});
+
+describe('readCompactionSettings follows Claude Code 2.1.302 (0.8.1 review)', () => {
+  /** Write ~/.claude/settings.json in the sandbox home. */
+  function userSettings(home: string, settings: Record<string, unknown>): void {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(settings), 'utf-8');
+  }
+
+  test('DISABLE_COMPACT turns auto-compaction off too', () => {
+    withTempHome(() => {
+      expect(readCompactionSettings(undefined, { DISABLE_COMPACT: '1' })).toMatchObject({ autoCompactEnabled: false, idleCompaction: false });
+    });
+  });
+
+  test('the env window is floored at 100K and capped at 1M', () => {
+    withTempHome(() => {
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '50000' }).envAutoCompactWindow).toBe(100_000);
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '5000000' }).envAutoCompactWindow).toBe(1_000_000);
+    });
+  });
+
+  test('settings windows outside 100K-1M (or quoted) are ignored, as Claude Code does', () => {
+    withTempHome((home) => {
+      userSettings(home, { autoCompactWindow: 50_000 });
+      expect(readCompactionSettings(undefined, {}).autoCompactWindow).toBeUndefined();
+      userSettings(home, { autoCompactWindow: '500000' });
+      expect(readCompactionSettings(undefined, {}).autoCompactWindow).toBeUndefined();
+    });
+  });
+
+  test("a higher file's top-level window replaces the per-model windows below it", () => {
+    withTempHome((home) => {
+      userSettings(home, { modelSettings: { 'claude-opus-5-5': { autoCompactWindow: 400_000 } } });
+      const project = join(home, 'proj');
+      mkdirSync(join(project, '.claude'), { recursive: true });
+      writeFileSync(join(project, '.claude', 'settings.json'), JSON.stringify({ autoCompactWindow: 600_000 }), 'utf-8');
+      const s = readCompactionSettings(project, {});
+      expect(s.autoCompactWindow).toBe(600_000);
+      expect(s.modelAutoCompactWindows).toBeUndefined();
+    });
+  });
+
+  test('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is read as a percent', () => {
+    withTempHome(() => {
+      expect(readCompactionSettings(undefined, { CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '50' }).autoCompactPct).toBe(50);
+      expect(readCompactionSettings(undefined, { CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '150' }).autoCompactPct).toBeUndefined();
+    });
+  });
+
+  test("Claude Code's 'Compacted after an hour idle' notice also marks an idle compaction", async () => {
+    const messages = await parseSession(writeFixture([
+      userRecord('q0', 'q0'),
+      assistantRecord('a0', 300_000, 100),
+      boundaryRecord('b1', 300_100),
+      { type: 'system', subtype: 'informational', uuid: 'n2', content: 'Compacted after an hour idle, using a summary written while you were away' },
+      userRecord('q1', 'back'),
+      assistantRecord('a1', 70_000, 100),
+    ]));
+    expect(detectCompactionEvents(messages)[0]!.idle).toBe(true);
   });
 });

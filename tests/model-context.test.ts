@@ -555,3 +555,41 @@ describe('0.8.1 idle compaction needs the one-hour cache', () => {
     expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 400_000, undefined, '1h').idle.applies).toBe(true);
   });
 });
+
+describe('0.8.1 review: compaction model matches Claude Code 2.1.302', () => {
+  const base = { autoCompactEnabled: true, idleCompaction: true, idleCompactMinTokens: 200_000, disable1m: false };
+
+  test('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE fires at that percent of the window less 20K when earlier', () => {
+    // Claude Code: min(floor((1M - 20K) * 50 / 100), 1M - 33K) = 490,000.
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, { ...base, autoCompactPct: 50 }).trigger).toBe(490_000);
+    // A percent past the buffer trigger changes nothing.
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, { ...base, autoCompactPct: 99.9 }).trigger).toBe(967_000);
+  });
+
+  test("a per-model 'auto' window is the model default, even over a top-level window", () => {
+    const m = resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, {
+      ...base, autoCompactWindow: 400_000, modelAutoCompactWindows: { 'claude-opus-5-5': 'auto' },
+    });
+    expect(m.autoCompactWindow).toBe(1_000_000);
+    expect(m.trigger).toBe(967_000);
+  });
+
+  test('idle compaction only applies on a Claude Code version that has it', () => {
+    expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h', '2.1.270').idle.applies).toBe(false);
+    expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h', '2.1.289').idle.applies).toBe(true);
+    expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h').idle.applies).toBe(true);
+  });
+
+  test('a zeroed usage copy still counts as evidence of the window its run reached', () => {
+    const copy = {
+      message: {
+        usage: {
+          input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0,
+          cache_creation: { ephemeral_1h_input_tokens: 821_214, ephemeral_5m_input_tokens: 0 },
+        },
+      },
+    };
+    expect(detectContextLimitFromUsage([copy])).toBe(1_000_000);
+    expect(resolveContextLimitWithSignal('claude-sonnet-4-6', [copy])).toEqual({ limit: 1_000_000, signal: 'usage' });
+  });
+});

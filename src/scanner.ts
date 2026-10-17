@@ -218,8 +218,13 @@ const ANALYZED_RECORD_TYPES: ReadonlySet<string> = new Set(['user', 'assistant',
 /** A JSONL line whose first key is `type`, capturing the type */
 const LEADING_TYPE = /^\{"type":"([^"]+)"/;
 
-/** Start of the notice Claude Code writes after an idle compaction */
-const IDLE_COMPACTION_NOTICE = 'Compacted while idle';
+/**
+ * Starts of the notices Claude Code writes after an idle compaction: the
+ * compaction itself ("Compacted while idle, before the prompt cache
+ * expired") and the variant it shows when a summary written while the
+ * person was away is used ("Compacted after an hour idle, ...").
+ */
+const IDLE_COMPACTION_NOTICES: readonly string[] = ['Compacted while idle', 'Compacted after an hour idle'];
 
 /** Model marker Claude Code writes on placeholder assistant records */
 const SYNTHETIC_MODEL = '<synthetic>';
@@ -337,8 +342,9 @@ export async function parseSession(filePath: string): Promise<SessionMessage[]> 
 
       // An idle compaction is followed by Claude Code's informational notice;
       // mark the boundary it belongs to (the notice itself is not analysed).
+      const content = parsed.content;
       if (parsed.type === 'system' && parsed.subtype === 'informational' && openBoundary
-        && typeof parsed.content === 'string' && parsed.content.startsWith(IDLE_COMPACTION_NOTICE)) {
+        && typeof content === 'string' && IDLE_COMPACTION_NOTICES.some((notice) => content.startsWith(notice))) {
         openBoundary.idleCompaction = true;
         openBoundary = null;
       }
@@ -642,16 +648,25 @@ export function readSettingsModels(projectPath?: string): string[] {
  * settings files' `env` blocks, which is what a standalone `claude-crusts`
  * run sees. Keys read:
  *
- *   - `autoCompactEnabled` / DISABLE_AUTO_COMPACT: auto-compaction on or off
- *     (either one turning it off wins; off also turns idle compaction off)
+ *   - `autoCompactEnabled`, DISABLE_AUTO_COMPACT and DISABLE_COMPACT:
+ *     auto-compaction on or off (any one turning it off wins; off also turns
+ *     idle compaction off)
  *   - `autoCompactWindow` (top level) and `modelSettings.<model>.autoCompactWindow`
- *     (written by `/autocompact`); CLAUDE_CODE_AUTO_COMPACT_WINDOW beats both
+ *     (written by `/autocompact`; "auto" means the model's tuned default),
+ *     layered the way Claude Code 2.1.302 does it: files from user to local,
+ *     a file's top-level window replaces the per-model windows of the files
+ *     below it, and its own per-model entries then apply. Window values follow
+ *     its schema, a whole number from 100,000 to 1,000,000; anything else is
+ *     ignored. CLAUDE_CODE_AUTO_COMPACT_WINDOW beats every setting, floored at
+ *     100,000 and capped at 1,000,000 as Claude Code does
+ *   - CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (1-100): fires auto-compaction at that
+ *     percent of the window less output headroom, when that comes earlier
  *   - `idleCompaction` and CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS (values below
  *     100,000 are raised to 100,000, as Claude Code does)
  *   - CLAUDE_CODE_DISABLE_1M_CONTEXT
  *
- * A window value that is not a positive number (`"auto"`, garbage) counts as
- * unset. Missing or corrupt files are skipped.
+ * The per-launch `--autocompact` flag cannot be seen from a transcript or a
+ * settings file. Missing or corrupt files are skipped.
  *
  * @param projectPath - Optional project directory for project-level settings
  * @param env - Environment to read variables from (defaults to process.env)
@@ -698,32 +713,56 @@ export function readCompactionSettings(
       : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value.trim()) : Number.NaN;
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
   };
+  /** A settings window per Claude Code's schema: an integer in [100K, 1M], else ignored. */
+  const settingsWindow = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 100_000 && value <= 1_000_000
+      ? value
+      : undefined;
   /** An environment flag is set when present and not an explicit false. */
   const flag = (value: string | undefined): boolean =>
     value !== undefined && !/^(0|false|no|off)$/i.test(value);
 
-  const autoCompactEnabled = !flag(variable('DISABLE_AUTO_COMPACT')) && first('autoCompactEnabled') !== false;
+  const autoCompactEnabled = !flag(variable('DISABLE_AUTO_COMPACT')) && !flag(variable('DISABLE_COMPACT'))
+    && first('autoCompactEnabled') !== false;
 
-  // Lowest precedence first, so a higher-precedence file overwrites a model's entry.
-  const modelAutoCompactWindows: Record<string, number> = {};
+  // Lowest precedence first (user, project, local). A file's top-level
+  // window replaces the per-model windows of the files below it; its own
+  // per-model entries then apply.
+  let autoCompactWindow: number | undefined;
+  let modelAutoCompactWindows: Record<string, number | 'auto'> = {};
   for (const record of [...records].reverse()) {
+    const top = settingsWindow(record.autoCompactWindow);
+    if (top !== undefined) {
+      autoCompactWindow = top;
+      modelAutoCompactWindows = {};
+    }
     const modelSettings = record.modelSettings;
     if (!modelSettings || typeof modelSettings !== 'object') continue;
     for (const [model, entry] of Object.entries(modelSettings as Record<string, unknown>)) {
       if (!entry || typeof entry !== 'object') continue;
-      const window = tokens((entry as Record<string, unknown>).autoCompactWindow);
+      const raw = (entry as Record<string, unknown>).autoCompactWindow;
+      if (raw === 'auto') {
+        modelAutoCompactWindows[model] = 'auto';
+        continue;
+      }
+      const window = settingsWindow(raw);
       if (window !== undefined) modelAutoCompactWindows[model] = window;
     }
   }
 
   const idleMin = tokens(variable('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS'));
-  const autoCompactWindow = tokens(first('autoCompactWindow'));
-  const envAutoCompactWindow = tokens(variable('CLAUDE_CODE_AUTO_COMPACT_WINDOW'));
+  const envWindowRaw = tokens(variable('CLAUDE_CODE_AUTO_COMPACT_WINDOW'));
+  const envAutoCompactWindow = envWindowRaw !== undefined
+    ? Math.min(1_000_000, Math.max(100_000, envWindowRaw))
+    : undefined;
+  const pctRaw = Number(variable('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'));
+  const autoCompactPct = Number.isFinite(pctRaw) && pctRaw > 0 && pctRaw <= 100 ? pctRaw : undefined;
   return {
     autoCompactEnabled,
     ...(autoCompactWindow !== undefined ? { autoCompactWindow } : {}),
     ...(Object.keys(modelAutoCompactWindows).length > 0 ? { modelAutoCompactWindows } : {}),
     ...(envAutoCompactWindow !== undefined ? { envAutoCompactWindow } : {}),
+    ...(autoCompactPct !== undefined ? { autoCompactPct } : {}),
     idleCompaction: autoCompactEnabled && first('idleCompaction') !== false,
     idleCompactMinTokens: idleMin !== undefined
       ? Math.max(IDLE_COMPACT_FLOOR_TOKENS, idleMin)

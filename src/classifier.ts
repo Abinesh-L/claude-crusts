@@ -368,26 +368,31 @@ const RENDERED_ATTACHMENTS_SINCE = '2.1.268';
  * each typed User, Project, Local or AutoMem) and their exact sent text in
  * `rendered`. That beats re-reading the files from disk today: the disk copy
  * of MEMORY.md has moved on since the session ran, and ancestor CLAUDE.md
- * files (a parent folder's) were missed. The latest attachment wins; its
- * sent text is split between CLAUDE.md (System) and auto-memory (State) by
- * the files' share of characters.
+ * files (a parent folder's) were missed. Each attachment's sent text is
+ * split between CLAUDE.md (System) and auto-memory (State) by its files'
+ * share of characters.
+ *
+ * Two kinds exist. A full attachment carries every loaded file. A delta
+ * (`changed: true`, written when files changed, e.g. on resume) carries only
+ * the changed files, and sits in the window next to the full one rather
+ * than replacing it. So the latest full attachment sets the baseline and
+ * every later delta adds to it; taking the latest delta alone dropped
+ * CLAUDE.md to 0 after every resume.
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
  * @returns System and memory token costs, or null when no instructions
  *   attachment with sent text exists
  */
 function instructionsOverhead(messages: SessionMessage[]): { systemTokens: number; memoryTokens: number } | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]!;
-    if (msg.type !== 'attachment' || msg.attachment?.type !== 'instructions') continue;
-    if (!Array.isArray(msg.rendered)) continue;
+  /** System and memory tokens of one attachment's sent text. */
+  const split = (msg: SessionMessage): { systemTokens: number; memoryTokens: number } => {
     let sentChars = 0;
-    for (const part of msg.rendered) {
+    for (const part of msg.rendered ?? []) {
       if (part && typeof part.content === 'string') sentChars += part.content.length;
     }
     let memoryChars = 0;
     let otherChars = 0;
-    const files = msg.attachment.files;
+    const files = msg.attachment?.files;
     if (Array.isArray(files)) {
       for (const file of files) {
         if (!file || typeof file !== 'object') continue;
@@ -401,8 +406,28 @@ function instructionsOverhead(messages: SessionMessage[]): { systemTokens: numbe
     const total = sentChars / CHARS_PER_TOKEN_TEXT;
     const memoryTokens = Math.round(total * memoryShare);
     return { systemTokens: Math.round(total) - memoryTokens, memoryTokens };
+  };
+
+  const sent: SessionMessage[] = [];
+  for (const msg of messages) {
+    if (msg.type === 'attachment' && msg.attachment?.type === 'instructions' && Array.isArray(msg.rendered)) {
+      sent.push(msg);
+    }
   }
-  return null;
+  if (sent.length === 0) return null;
+  let start = -1;
+  for (let k = sent.length - 1; k >= 0; k--) {
+    if (sent[k]!.attachment?.changed !== true) { start = k; break; }
+  }
+  // No full attachment recorded (only deltas): the latest delta is all there is.
+  if (start === -1) return split(sent[sent.length - 1]!);
+  const total = { systemTokens: 0, memoryTokens: 0 };
+  for (let k = start; k < sent.length; k++) {
+    const part = split(sent[k]!);
+    total.systemTokens += part.systemTokens;
+    total.memoryTokens += part.memoryTokens;
+  }
+  return total;
 }
 
 /**
@@ -1648,14 +1673,24 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
     let afterIndex = i + 1;
     let firstLiveIndex: number | undefined;
     let scannedTokensAfter = 0;
+    // Only the first response after the boundary can be one that was in
+    // flight when compaction fired, and not if a prompt written after the
+    // boundary came first: that prompt's answer was built from the
+    // compacted window, however big a paste made it.
+    let firstGroup: string | null | undefined;
+    let newerPromptSeen = false;
     for (let j = i + 1; j < messages.length; j++) {
       const m = messages[j]!;
       if (m.type === 'system' && m.subtype === 'compact_boundary') break;
+      if (isPromptAfterBoundary(m, msg)) newerPromptSeen = true;
       if (m.type !== 'assistant' || !m.message?.usage) continue;
       if (m.message.model === '<synthetic>') continue;
       const effective = effectiveInput(m.message.usage);
       if (effective <= 0) continue;
-      if (isPreCompactionCarryover(m, msg)) continue;
+      const group = assistantGroupKey(m) ?? `#${j}`;
+      if (firstGroup === undefined) firstGroup = group;
+      const mayBeInFlight = group === firstGroup && !newerPromptSeen;
+      if (isPreCompactionCarryover(m, msg, mayBeInFlight)) continue;
       afterIndex = j;
       firstLiveIndex = j;
       scannedTokensAfter = effective;
@@ -1663,11 +1698,11 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
     }
 
     // The window right after compaction is the first live turn's effective
-    // input. Claude Code's postTokens counts the compacted messages only
-    // (the fixed context and re-attached files ride on top, about 60K on
-    // real sessions), so it understates the window and overstates the drop;
-    // it stands in only until a live turn exists. classifySession adds its
-    // fixed-context estimate to the last event in that case.
+    // input. Claude Code's postTokens is its own chars/4 estimate of what it
+    // wrote after compacting (the summary, re-attached files, command
+    // records); the fixed context rides on top, so it understates the window
+    // and overstates the drop. It stands in only until a live turn exists;
+    // classifySession then adds its fixed-context estimate on the last event.
     const tokensAfter = firstLiveIndex !== undefined ? scannedTokensAfter : meta?.postTokens ?? 0;
 
     // Resolve preserved-message uuids to pre-boundary indices (first
@@ -1728,21 +1763,30 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
  *
  * @param msg - An assistant record after the boundary
  * @param boundary - The compact_boundary record
+ * @param mayBeInFlight - The record is the first response after the
+ *   boundary and no prompt written after the boundary came before it; only
+ *   then can its size mark it as an in-flight turn
  * @returns True when the record's usage belongs to the pre-compaction window
  */
-function isPreCompactionCarryover(msg: SessionMessage, boundary: SessionMessage): boolean {
+function isPreCompactionCarryover(
+  msg: SessionMessage,
+  boundary: SessionMessage,
+  mayBeInFlight: boolean,
+): boolean {
   const msgTs = msg.timestamp ? Date.parse(msg.timestamp) : Number.NaN;
   const boundaryTs = boundary.timestamp ? Date.parse(boundary.timestamp) : Number.NaN;
   const timed = Number.isFinite(msgTs) && Number.isFinite(boundaryTs);
   if (timed && msgTs < boundaryTs) return true;
+  if (!mayBeInFlight) return false;
   // An in-flight turn finishes within minutes of the boundary; later turns
   // are live whatever their size.
   if (timed && msgTs - boundaryTs > IN_FLIGHT_WINDOW_MS) return false;
   // The size test needs both ends of the compaction (postTokens is recorded
-  // since 2.1.119). postTokens counts messages only, so a live first turn
-  // sits up to about POST_COMPACTION_ALLOWANCE above it; a turn above that
-  // and closer to the old window than to the compacted one was built before
-  // the compaction.
+  // since 2.1.119). postTokens leaves out the fixed context, so a live first
+  // turn sits well above it (about 60K typically, 142K seen with a large
+  // preserved segment); a turn above POST_COMPACTION_ALLOWANCE over it and
+  // closer to the old window than to the compacted one was built before the
+  // compaction.
   const pre = boundary.compactMetadata?.preTokens ?? 0;
   const post = boundary.compactMetadata?.postTokens;
   if (pre <= 0 || post === undefined || post >= pre) return false;
@@ -1755,11 +1799,65 @@ const IN_FLIGHT_WINDOW_MS = 10 * 60_000;
 
 /**
  * Headroom above `postTokens` that a live first post-compaction turn can
- * occupy: the fixed context, re-attached files and the next prompt (the
- * first live turn sat 47K-77K above postTokens on every boundary of three
- * real transcripts).
+ * occupy: the fixed context and the next prompt. Over 38 real boundaries
+ * the first live turn sat 45K-77K above postTokens (median about 59K), and
+ * 142K once when Claude Code preserved a large recent segment; that turn
+ * still read as live because it stayed far below the old window.
  */
 const POST_COMPACTION_ALLOWANCE = 100_000;
+
+/**
+ * The Claude Code version running the session now: the `version` of the
+ * newest record that carries one (a session can outlive several updates;
+ * `detectClaudeCodeVersion` reports the first).
+ *
+ * @param messages - Session messages
+ * @returns The version string, or undefined when no record carries one
+ */
+function latestClaudeCodeVersion(messages: SessionMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const version = messages[i]!.version;
+    if (typeof version === 'string' && version.trim() !== '') return version.trim();
+  }
+  return undefined;
+}
+
+/**
+ * The model named by the latest `model` attachment (`identity.modelId`),
+ * which Claude Code writes at session start and after a model switch.
+ *
+ * @param messages - Session messages
+ * @returns The model ID, or null when no such attachment exists
+ */
+function announcedModel(messages: SessionMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const att = messages[i]!.attachment;
+    if (!att || att.type !== 'model') continue;
+    const identity = att.identity as { modelId?: unknown } | undefined;
+    if (identity && typeof identity.modelId === 'string' && identity.modelId.trim() !== '') {
+      return identity.modelId.trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether a record is a prompt written after a compaction boundary: a user
+ * record (not the compact summary, not a tool result) timestamped after the
+ * boundary. Its answer was built from the compacted window. Untimed records
+ * never count, so fixtures without timestamps keep the size test.
+ *
+ * @param msg - A record after the boundary
+ * @param boundary - The compact_boundary record
+ * @returns True for a prompt newer than the boundary
+ */
+function isPromptAfterBoundary(msg: SessionMessage, boundary: SessionMessage): boolean {
+  if (msg.type !== 'user' || msg.isCompactSummary === true) return false;
+  if (hasToolResultBlocks(msg.message?.content)) return false;
+  const msgTs = msg.timestamp ? Date.parse(msg.timestamp) : Number.NaN;
+  const boundaryTs = boundary.timestamp ? Date.parse(boundary.timestamp) : Number.NaN;
+  return Number.isFinite(msgTs) && Number.isFinite(boundaryTs) && msgTs > boundaryTs;
+}
 
 /**
  * Fallback compaction detection via large drops in cumulative input_tokens.
@@ -2373,7 +2471,11 @@ export function classifySession(
   // A live override (Claude Code's statusline payload — which preserves the
   // `[1m]` variant JSONL strips) takes precedence when supplied.
   const modelHistory = computeModelHistory(effectiveMessages, lineGroups);
-  const model = modelOverride ?? modelHistory.current;
+  // Before the first response there is no assistant model yet, but Claude
+  // Code's `model` attachment already names it (identity.modelId), so a
+  // fresh native-1M session is not sized at the 200K default.
+  const model = modelOverride
+    ?? (modelHistory.current !== 'unknown' ? modelHistory.current : announcedModel(effectiveMessages) ?? 'unknown');
 
   // Window size is a property of the MODEL RUN, not the compaction window:
   // compaction never resizes the window, but a mid-session model switch
@@ -2400,7 +2502,11 @@ export function classifySession(
     const out: SessionMessage[] = [];
     for (const s of modelSpans) {
       if (modelFamily(s.model) !== family) continue;
-      for (let k = s.start; k <= s.end; k++) out.push(effectiveMessages[k]!);
+      // An empty window still yields one span at index 0; skip the hole.
+      for (let k = s.start; k <= s.end; k++) {
+        const record = effectiveMessages[k];
+        if (record) out.push(record);
+      }
     }
     familyMessageCache.set(family, out);
     return out;
@@ -2577,6 +2683,7 @@ export function classifySession(
     currentContext?.total_tokens ?? totalTokens,
     configData.compaction,
     latestCacheTtl(effectiveMessages),
+    latestClaudeCodeVersion(effectiveMessages),
   );
 
   return {
