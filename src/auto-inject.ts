@@ -17,8 +17,8 @@
  */
 
 import { existsSync, appendFileSync, readFileSync, mkdirSync } from 'fs';
-import { basename, join } from 'path';
-import { parseSession } from './scanner.ts';
+import { basename, dirname, join } from 'path';
+import { parseSession, collectObservedMcpServers } from './scanner.ts';
 import { gatherConfigData } from './analyzer.ts';
 import { classifySession, nonHumanPromptKind } from './classifier.ts';
 import { detectWaste } from './waste-detector.ts';
@@ -361,7 +361,15 @@ export async function runAutoInject(): Promise<void> {
     const messages = await parseSession(transcriptPath);
     if (messages.length === 0) return;
 
-    const configData = gatherConfigData();
+    // The session's own project: its CLAUDE.md, memory folder, project
+    // settings (model, auto-compact window, idle compaction) and the MCP
+    // servers the transcript used. A bare gatherConfigData() read only the
+    // user-level files.
+    const configData = gatherConfigData(
+      payload.cwd && existsSync(payload.cwd) ? payload.cwd : undefined,
+      basename(dirname(transcriptPath)),
+      collectObservedMcpServers(messages),
+    );
     const breakdown = classifySession(messages, configData, undefined, payload.model?.id);
 
     const sessionId = payload.session_id ?? basename(transcriptPath).replace(/\.jsonl$/, '');

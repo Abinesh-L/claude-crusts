@@ -175,7 +175,11 @@ program
     console.log(chalk.bold(`\n  Timeline: ${session.id.slice(0, 8)}`));
     console.log(chalk.dim(`  Messages: ${result.messageCount} | Project: ${session.project}`));
 
-    renderTimeline(result.breakdown.messages, result.breakdown.context_limit, result.breakdown.compactionEvents, result.breakdown.compaction);
+    const bd = result.breakdown;
+    renderTimeline(bd.messages, bd.context_limit, bd.compactionEvents, bd.compaction, {
+      totalTokens: bd.currentContext?.total_tokens ?? bd.total_tokens,
+      startIndex: bd.currentContext?.startIndex ?? 0,
+    });
   });
 
 program

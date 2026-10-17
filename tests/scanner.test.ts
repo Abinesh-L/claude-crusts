@@ -180,8 +180,10 @@ describe('parseSession uuid dedupe (M1)', () => {
     const events = detectCompactionEvents(messages);
     expect(events.length).toBe(1);
     expect(events[0]!.tokensBefore).toBe(150_000);
-    // M17: the boundary's recorded postTokens wins over the scanned assistant.
-    expect(events[0]!.tokensAfter).toBe(8_000);
+    // 0.8.1: the first live turn sets the post-compaction size; the
+    // recorded postTokens (messages only) stays on the event.
+    expect(events[0]!.tokensAfter).toBe(30_000);
+    expect(events[0]!.postTokens).toBe(8_000);
 
     const b = classifySession(messages, EMPTY_CONFIG);
     expect(b.compactionEvents.length).toBe(1);
@@ -356,8 +358,10 @@ describe('parseSession system records (M3)', () => {
     const systemCount = b.messages.filter((m) => m.category === 'system').length;
     expect(systemCount).toBe(1);
     expect(b.compactionEvents.length).toBe(1);
-    // M17: the boundary's recorded postTokens (8,000) wins over the scan.
-    expect(b.compactionEvents[0]!.tokensAfter).toBe(8_000);
+    // 0.8.1: the first live turn (a1, 5,000) sets the post-compaction size;
+    // postTokens (8,000) is the messages-only measurement.
+    expect(b.compactionEvents[0]!.tokensAfter).toBe(5_000);
+    expect(b.compactionEvents[0]!.postTokens).toBe(8_000);
   });
 
   test('framing totalTokens is tokensPerMessage times the REAL message count', async () => {
@@ -902,5 +906,54 @@ describe('readCompactionSettings (0.8.1)', () => {
       expect(s.idleCompaction).toBe(true);
       expect(s.autoCompactWindow).toBe(700_000);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.1 — idle compactions and the bookkeeping pre-filter
+// ---------------------------------------------------------------------------
+
+describe('parseSession idle compactions and bookkeeping records (0.8.1)', () => {
+  /** Claude Code's informational notice after an idle compaction. */
+  const idleNotice = (uuid: string): Record<string, unknown> => ({
+    type: 'system',
+    subtype: 'informational',
+    uuid,
+    content: 'Compacted while idle, before the prompt cache expired',
+  });
+
+  test('a boundary followed by the idle notice is marked idle, even when recorded as manual', async () => {
+    const messages = await parseSession(writeFixture([
+      userRecord('q0', 'q0'),
+      assistantRecord('a0', 300_000, 100),
+      boundaryRecord('b1', 300_100),
+      idleNotice('n1'),
+      summaryRecord('s1'),
+      userRecord('q1', 'back'),
+      assistantRecord('a1', 70_000, 100),
+      boundaryRecord('b2', 300_000),
+      userRecord('q2', 'again'),
+      assistantRecord('a2', 60_000, 100),
+    ]));
+    // The notice itself is not analysed.
+    expect(messages.some((m) => m.subtype === 'informational')).toBe(false);
+    const events = detectCompactionEvents(messages);
+    expect(events.length).toBe(2);
+    expect(events[0]!.trigger).toBe('manual');
+    expect(events[0]!.idle).toBe(true);
+    expect(events[1]!.idle).toBeUndefined();
+  });
+
+  test('records that lead with a non-analysed type are skipped without parsing', async () => {
+    // Malformed after the type prefix: parsing it would count a skipped line.
+    const path = join(sandbox, 'bookkeeping.jsonl');
+    writeFileSync(path, [
+      '{"type":"api-request-blob","sessionId":"s","hash":"h","message":{"role":"user","content":"## Context Usage **Tokens:** 1k / 200k"} BROKEN',
+      '{"type":"mode","mode":"normal","sessionId":"s"}',
+      JSON.stringify(userRecord('q0', 'hello')),
+      JSON.stringify(assistantRecord('a0', 1_000, 10)),
+    ].join('\n') + '\n', 'utf-8');
+    const messages = await parseSession(path);
+    expect(messages.map((m) => m.type)).toEqual(['user', 'assistant']);
   });
 });

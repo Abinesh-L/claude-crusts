@@ -2149,3 +2149,57 @@ describe('0.8.1: window evidence from every run of the same model', () => {
     expect(b.context_limit).toBe(200_000);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.1: attachments sized from the exact text Claude Code sent
+// ---------------------------------------------------------------------------
+
+describe('0.8.1: attachments sized from the text Claude Code sent', () => {
+  /** An attachment record with an optional rendered copy and version. */
+  function att(type: string, payload: Record<string, unknown>, extra: Partial<SessionMessage> = {}): SessionMessage {
+    return { type: 'attachment', attachment: { type, ...payload }, ...extra } as SessionMessage;
+  }
+
+  test('a rendered attachment is sized from what was sent, not its payload', () => {
+    // mcp_instructions_delta keeps its text in addedBlocks, which the payload
+    // reader never saw: 0 tokens before.
+    const msg = att('mcp_instructions_delta', { addedBlocks: [{ text: 'x'.repeat(3_000) }] }, {
+      version: '2.1.300',
+      rendered: [{ content: 'y'.repeat(3_889) }],
+    });
+    expect(estimateAttachmentTokens(msg)).toBe(Math.round(3_889 / 4));
+  });
+
+  test('a 2.1.269+ attachment without a rendered copy was never sent and costs nothing', () => {
+    const reminder = att('batching_reminder_sent', { text: 'r'.repeat(400) }, { version: '2.1.289' });
+    expect(estimateAttachmentTokens(reminder)).toBe(0);
+  });
+
+  test('older attachments keep the payload-field estimate', () => {
+    const hook = att('hook_success', { content: 'h'.repeat(800) }, { version: '2.1.250' });
+    expect(estimateAttachmentTokens(hook)).toBe(200);
+    expect(estimateAttachmentTokens(att('hook_success', { content: 'h'.repeat(800) }))).toBe(200);
+  });
+
+  test("the instructions attachment sets CLAUDE.md and memory once, replacing the disk copies", () => {
+    const instructions = att('instructions', {
+      files: [
+        { type: 'User', path: 'C:/u/.claude/CLAUDE.md', content: 'u'.repeat(1_000) },
+        { type: 'Project', path: 'C:/p/CLAUDE.md', content: 'p'.repeat(3_000) },
+        { type: 'AutoMem', path: 'C:/m/MEMORY.md', content: 'm'.repeat(4_000) },
+      ],
+    }, { version: '2.1.300', rendered: [{ content: 'z'.repeat(8_800) }] });
+    expect(estimateAttachmentTokens(instructions)).toBe(0);
+
+    const staleDisk: ConfigData = {
+      ...EMPTY_CONFIG,
+      systemPrompt: { files: [], totalEstimatedTokens: 9_999 },
+      memoryFiles: { files: [], totalEstimatedTokens: 7_777 },
+    };
+    const b = classifySession([instructions, userText('go'), assistantWithCache(2, 40_000)], staleDisk);
+    // 8,800 sent chars = 2,200 tokens, split by file share: half auto-memory.
+    expect(b.buckets.find((x) => x.category === 'state')!.contentTokens).toBe(1_100);
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(1_100);
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownMemory).toBe(1_100);
+  });
+});

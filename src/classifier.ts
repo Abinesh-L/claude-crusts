@@ -42,7 +42,7 @@ import type {
 import { resolveContextLimitWithSignal, resolveCompactionModel, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
-import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName } from './built-in-tools.ts';
+import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName, compareVersions } from './built-in-tools.ts';
 
 /** Whether to print derivation debug info to stderr */
 let verbose = false;
@@ -310,24 +310,93 @@ function estimateContentTokens(msg: SessionMessage): number {
 }
 
 /**
- * Estimate the window cost of an `attachment` record's payload at the
- * plain-text divisor (chars / 4).
+ * Estimate the window cost of an `attachment` record at the plain-text
+ * divisor (chars / 4).
  *
- * Attachment payloads carry their injected text under a handful of field
- * names depending on `attachment.type`: `content` (a string, an array of
- * strings or item objects such as task_reminder's `{subject, description}`
- * entries, or a nested object exposing `content` / `file.content`),
- * `text`, `snippet`, `banner`, `prompt`, `addedLines` (string[]), and
- * `skills[].content`. Every string found under those fields is summed.
+ * From Claude Code 2.1.269 every attachment that reaches the model carries
+ * `rendered: [{content}]`, the exact text sent, and that is what is sized.
+ * A 2.1.269+ attachment without it was never sent (prompt_snapshot,
+ * deferred_tools_record, credential_org, batching_reminder_sent, ...) and
+ * costs 0. On five real transcripts the payload fields under-read the sent
+ * text by 38% (instructions, mcp_instructions_delta, environment and
+ * task_reminder payloads carry it in shapes the field list misses) and
+ * counted 48K tokens of never-sent batching reminders.
  *
- * Returns 0 for non-attachment records or payloads with none of the known
- * fields, so callers can apply it unconditionally.
+ * The `instructions` attachment (CLAUDE.md files and auto-memory) costs 0
+ * here: it is the session's CLAUDE.md + memory component, counted once per
+ * view through the config overhead (see `instructionsOverhead`).
+ *
+ * Older records fall back to the payload fields: `content` (a string, an
+ * array of strings or item objects such as task_reminder's `{subject,
+ * description}` entries, or a nested object exposing `content` /
+ * `file.content`), `text`, `snippet`, `banner`, `prompt`, `addedLines`
+ * (string[]), and `skills[].content`. Every string found is summed.
+ *
+ * Returns 0 for non-attachment records, so callers can apply it
+ * unconditionally.
  *
  * @param msg - The session message (any record type)
  * @returns Estimated token count of the attachment's injected text
  */
 export function estimateAttachmentTokens(msg: SessionMessage): number {
+  if (msg.type !== 'attachment' || !msg.attachment) return 0;
+  if (msg.attachment.type === 'instructions') return 0;
+  if (Array.isArray(msg.rendered)) {
+    let chars = 0;
+    for (const part of msg.rendered) {
+      if (part && typeof part.content === 'string') chars += part.content.length;
+    }
+    return Math.round(chars / CHARS_PER_TOKEN_TEXT);
+  }
+  if (msg.version && compareVersions(msg.version, RENDERED_ATTACHMENTS_SINCE) >= 0) return 0;
   return Math.round(attachmentText(msg).length / CHARS_PER_TOKEN_TEXT);
+}
+
+/** First Claude Code version that records `rendered` on every sent attachment. */
+const RENDERED_ATTACHMENTS_SINCE = '2.1.269';
+
+/**
+ * CLAUDE.md and memory cost from the session's own `instructions` attachment.
+ *
+ * Claude Code 2.1.269+ records the instruction files it loaded (`files[]`,
+ * each typed User, Project, Local or AutoMem) and their exact sent text in
+ * `rendered`. That beats re-reading the files from disk today: the disk copy
+ * of MEMORY.md has moved on since the session ran, and ancestor CLAUDE.md
+ * files (a parent folder's) were missed. The latest attachment wins; its
+ * sent text is split between CLAUDE.md (System) and auto-memory (State) by
+ * the files' share of characters.
+ *
+ * @param messages - Session messages (the classifier's `effectiveMessages`)
+ * @returns System and memory token costs, or null when no instructions
+ *   attachment with sent text exists
+ */
+function instructionsOverhead(messages: SessionMessage[]): { systemTokens: number; memoryTokens: number } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!;
+    if (msg.type !== 'attachment' || msg.attachment?.type !== 'instructions') continue;
+    if (!Array.isArray(msg.rendered)) continue;
+    let sentChars = 0;
+    for (const part of msg.rendered) {
+      if (part && typeof part.content === 'string') sentChars += part.content.length;
+    }
+    let memoryChars = 0;
+    let otherChars = 0;
+    const files = msg.attachment.files;
+    if (Array.isArray(files)) {
+      for (const file of files) {
+        if (!file || typeof file !== 'object') continue;
+        const content = (file as { content?: unknown }).content;
+        const length = typeof content === 'string' ? content.length : 0;
+        if ((file as { type?: unknown }).type === 'AutoMem') memoryChars += length;
+        else otherChars += length;
+      }
+    }
+    const memoryShare = memoryChars + otherChars > 0 ? memoryChars / (memoryChars + otherChars) : 0;
+    const total = sentChars / CHARS_PER_TOKEN_TEXT;
+    const memoryTokens = Math.round(total * memoryShare);
+    return { systemTokens: Math.round(total) - memoryTokens, memoryTokens };
+  }
+  return null;
 }
 
 /**
@@ -903,7 +972,7 @@ export function classifyMessage(
   if (msg.type === 'system') {
     return { category: 'system' };
   }
-  if (isFirstMessage && msg.message?.role === 'user' && hasSystemMarkers(msg)) {
+  if (isFirstMessage && msg.type === 'user' && msg.message?.role === 'user' && hasSystemMarkers(msg)) {
     return { category: 'system' };
   }
 
@@ -1587,9 +1656,13 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       break;
     }
 
-    // Claude Code's own post-compaction measurement is authoritative when
-    // recorded; the scanned assistant is the fallback for older sessions.
-    const tokensAfter = meta?.postTokens ?? scannedTokensAfter;
+    // The window right after compaction is the first live turn's effective
+    // input. Claude Code's postTokens counts the compacted messages only
+    // (the fixed context and re-attached files ride on top, about 60K on
+    // real sessions), so it understates the window and overstates the drop;
+    // it stands in only until a live turn exists. classifySession adds its
+    // fixed-context estimate to the last event in that case.
+    const tokensAfter = firstLiveIndex !== undefined ? scannedTokensAfter : meta?.postTokens ?? 0;
 
     // Resolve preserved-message uuids to pre-boundary indices (first
     // occurrence wins, matching the scanner's resume-replay dedupe).
@@ -1627,6 +1700,7 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       preservedMessageIndices,
       ...(firstLiveIndex !== undefined ? { firstLiveIndex } : {}),
       ...(meta?.postTokens !== undefined ? { postTokens: meta.postTokens } : {}),
+      ...(msg.idleCompaction === true ? { idle: true } : {}),
     });
   }
 
@@ -1653,15 +1727,33 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
 function isPreCompactionCarryover(msg: SessionMessage, boundary: SessionMessage): boolean {
   const msgTs = msg.timestamp ? Date.parse(msg.timestamp) : Number.NaN;
   const boundaryTs = boundary.timestamp ? Date.parse(boundary.timestamp) : Number.NaN;
-  if (Number.isFinite(msgTs) && Number.isFinite(boundaryTs) && msgTs < boundaryTs) return true;
+  const timed = Number.isFinite(msgTs) && Number.isFinite(boundaryTs);
+  if (timed && msgTs < boundaryTs) return true;
+  // An in-flight turn finishes within minutes of the boundary; later turns
+  // are live whatever their size.
+  if (timed && msgTs - boundaryTs > IN_FLIGHT_WINDOW_MS) return false;
   // The size test needs both ends of the compaction (postTokens is recorded
-  // since 2.1.119); a turn closer to the old window than to the compacted
-  // one was built before the compaction.
+  // since 2.1.119). postTokens counts messages only, so a live first turn
+  // sits up to about POST_COMPACTION_ALLOWANCE above it; a turn above that
+  // and closer to the old window than to the compacted one was built before
+  // the compaction.
   const pre = boundary.compactMetadata?.preTokens ?? 0;
   const post = boundary.compactMetadata?.postTokens;
   if (pre <= 0 || post === undefined || post >= pre) return false;
-  return effectiveInput(msg.message?.usage) > (pre + post) / 2;
+  const effective = effectiveInput(msg.message?.usage);
+  return effective > post + POST_COMPACTION_ALLOWANCE && effective > (pre + post) / 2;
 }
+
+/** How long after a boundary an in-flight pre-compaction turn can still finish. */
+const IN_FLIGHT_WINDOW_MS = 10 * 60_000;
+
+/**
+ * Headroom above `postTokens` that a live first post-compaction turn can
+ * occupy: the fixed context, re-attached files and the next prompt (the
+ * first live turn sat 47K-77K above postTokens on every boundary of three
+ * real transcripts).
+ */
+const POST_COMPACTION_ALLOWANCE = 100_000;
 
 /**
  * Fallback compaction detection via large drops in cumulative input_tokens.
@@ -1754,20 +1846,35 @@ function computeEffectiveInputTokens(
  * one, the scan starts at the first live post-compaction turn
  * (`CompactionEvent.firstLiveIndex`): records carried over past the boundary
  * still report the old window, and reading one right after a compaction put
- * a 13K window at 82%. Before the first live turn exists, Claude Code's own
- * post-compaction measurement (`postTokens`) is the window.
+ * a 13K window at 82%. Before the first live turn exists, the window is
+ * Claude Code's `postTokens` (the compacted messages) plus what rides on top
+ * of them: the fixed context (derived system prompt, CLAUDE.md, core tool and
+ * MCP schemas, memory) and the attachments re-sent after the boundary. On
+ * real boundaries the first live turn sat 47K-77K above postTokens.
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
  * @param events - Compaction events detected on the same messages
+ * @param classified - Per-record classification of `messages`
+ * @param fixedContextTokens - The session's fixed-context estimate
  * @returns Live window total in tokens, or null when no usable signal exists
  */
-function liveWindowTokens(messages: SessionMessage[], events: CompactionEvent[]): number | null {
+function liveWindowTokens(
+  messages: SessionMessage[],
+  events: CompactionEvent[],
+  classified: ClassifiedMessage[],
+  fixedContextTokens: number,
+): number | null {
   const last = events[events.length - 1];
   if (!last) return computeEffectiveInputTokens(messages);
   if (last.firstLiveIndex !== undefined) {
     return computeEffectiveInputTokens(messages, last.firstLiveIndex);
   }
-  return last.postTokens ?? null;
+  if (last.postTokens === undefined) return null;
+  let reattached = 0;
+  for (let i = last.beforeIndex + 1; i < classified.length; i++) {
+    if (classified[i]!.isAttachment) reattached += classified[i]!.tokens;
+  }
+  return last.postTokens + fixedContextTokens + reattached;
 }
 
 /**
@@ -2071,12 +2178,19 @@ export function classifySession(
     });
   }
 
-  // Config overhead tokens (added to both lifetime and current context)
+  // Config overhead tokens (added to both lifetime and current context).
+  // The session's own `instructions` attachment (2.1.269+) replaces the disk
+  // copies of CLAUDE.md and memory when it was recorded.
   const configOverhead = computeConfigOverhead(configData, coreSchema.tokens);
+  const recordedInstructions = instructionsOverhead(effectiveMessages);
+  if (recordedInstructions) {
+    configOverhead.systemTokens = recordedInstructions.systemTokens;
+    configOverhead.memoryTokens = recordedInstructions.memoryTokens;
+  }
 
   // Derive overhead values from THIS SESSION's API usage data
   const derivedSystemPrompt = deriveInternalSystemPrompt(
-    effectiveMessages, classifiedMessages, compactionEvents, configData, coreSchema.tokens,
+    effectiveMessages, classifiedMessages, compactionEvents, configData, coreSchema.tokens, configOverhead,
   );
   // Add config overhead to session lifetime totals
   addConfigOverhead(categoryTokens, categoryAccuracy, configOverhead);
@@ -2127,8 +2241,20 @@ export function classifySession(
   // usage (see `liveWindowTokens`). Falls back to the content sum when no
   // usable usage data exists (fresh sessions, synthetic-only sessions, or
   // fixtures without `usage` fields).
-  const effectiveInputTokens = liveWindowTokens(effectiveMessages, compactionEvents);
+  const fixedContextTokens = (derivedSystemPrompt?.tokens ?? 0) + configOverhead.systemTokens
+    + configOverhead.toolTokens + configOverhead.mcpTokens + configOverhead.memoryTokens;
+  const effectiveInputTokens = liveWindowTokens(
+    effectiveMessages, compactionEvents, classifiedMessages, fixedContextTokens,
+  );
   const totalTokens = effectiveInputTokens ?? contentSumTokens;
+  // Before the first live turn, the last event's post-compaction size is the
+  // same estimate (postTokens alone is messages only).
+  const lastEvent = compactionEvents[compactionEvents.length - 1];
+  if (lastEvent && lastEvent.detection === 'marker' && lastEvent.firstLiveIndex === undefined
+    && effectiveInputTokens !== null) {
+    lastEvent.tokensAfter = effectiveInputTokens;
+    lastEvent.tokensDropped = lastEvent.tokensBefore - effectiveInputTokens;
+  }
 
   // Reconcile lifetime buckets to the API window total ONLY when the session
   // never compacted (lifetime === current window). In compacted sessions the
@@ -2512,6 +2638,8 @@ export function classifySession(
  * @param compactionEvents - Compaction events detected on `messages`
  * @param configData - Config data from scanner
  * @param coreSchemaTokens - Resolved core tool schema cost for this session
+ * @param overhead - The session's config overhead (CLAUDE.md and memory from
+ *   its own instructions attachment when recorded, else from disk)
  * @returns Derivation result or null if insufficient data
  */
 function deriveInternalSystemPrompt(
@@ -2520,6 +2648,7 @@ function deriveInternalSystemPrompt(
   compactionEvents: CompactionEvent[],
   configData: ConfigData,
   coreSchemaTokens: number,
+  overhead: ConfigOverhead,
 ): DerivedOverhead['internalSystemPrompt'] {
   /** A real API turn with usage. On current Claude Code the first turn's
    * input_tokens is typically 2 with the real context in cache_creation /
@@ -2561,11 +2690,12 @@ function deriveInternalSystemPrompt(
     });
   }
 
-  // Known components carried by every request
-  const knownClaudeMd = configData.systemPrompt.totalEstimatedTokens;
+  // Known components carried by every request (the same CLAUDE.md and
+  // memory figures the views add as config overhead)
+  const knownClaudeMd = overhead.systemTokens;
   // Core schema cost resolved per session (calibration > version > legacy)
   const knownToolSchemas = coreSchemaTokens;
-  const knownMemory = configData.memoryFiles.totalEstimatedTokens;
+  const knownMemory = overhead.memoryTokens;
   const discoveredSkillTokens = configData.skills.totalEstimatedTokens;
 
   for (const candidate of candidates) {

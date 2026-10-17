@@ -381,8 +381,10 @@ function recommendSessionHabit(
   breakdown: CrustsBreakdown,
   waste: WasteItem[],
 ): Recommendation[] {
+  // Idle compactions (Claude Code's own, while the session sat unused) are
+  // not a habit problem; the idle-compaction recommendation covers them.
   const autoCompactionCount = breakdown.compactionEvents
-    .filter((e) => e.trigger === 'auto').length;
+    .filter((e) => e.trigger === 'auto' && e.idle !== true).length;
   const dupeCount = waste.filter((w) => w.type === 'duplicate_read').length;
   const toolBucket = breakdown.buckets.find((b) => b.category === 'tools');
   const toolPct = toolBucket?.percentage ?? 0;

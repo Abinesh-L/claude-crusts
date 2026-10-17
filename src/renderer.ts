@@ -340,12 +340,15 @@ function formatDuration(seconds: number | null): string | null {
  * @param compaction - The classifier's compaction model (auto-compact window
  *   settings, idle compaction); without it the trigger is the window minus
  *   the buffer
+ * @param live - The live window's total and first index (the breakdown's
+ *   current context); without it the prediction uses the lifetime column
  */
 export function renderTimeline(
   classified: ClassifiedMessage[],
   contextLimit: number,
   compactionEvents: CompactionEvent[] = [],
   compaction?: CompactionModel,
+  live?: { totalTokens: number; startIndex: number },
 ): void {
   console.log();
 
@@ -407,8 +410,9 @@ export function renderTimeline(
     // Insert compaction marker row before the post-compaction message
     if (compactionAfterIndices.has(msg.index)) {
       const event = compactionMap.get(msg.index)!;
+      const kind = event.idle ? ' (idle)' : '';
       table.push([
-        { colSpan: 5, content: chalk.yellow(`  ── COMPACTION: ${event.tokensBefore.toLocaleString()} → ${event.tokensAfter.toLocaleString()} (−${event.tokensDropped.toLocaleString()} tokens) ──`) },
+        { colSpan: 5, content: chalk.yellow(`  ── COMPACTION${kind}: ${event.tokensBefore.toLocaleString()} → ${event.tokensAfter.toLocaleString()} (−${event.tokensDropped.toLocaleString()} tokens) ──`) },
       ]);
     }
 
@@ -436,20 +440,28 @@ export function renderTimeline(
   if (compactionTokens === null) {
     console.log(chalk.dim('\n  Auto-compaction is off: the session stops with a context-limit error at the window instead.'));
   } else if (classified.length > 0) {
+    // Predict from the LIVE window: the cumulative column is a lifetime
+    // content sum that never resets at a compaction, so a compacted session
+    // at 12% used to read "already past the auto-compact trigger".
     const last = classified[classified.length - 1]!;
-    if (last.cumulativeTokens < compactionTokens) {
+    const liveTotal = live?.totalTokens ?? last.cumulativeTokens;
+    const liveRows = live ? classified.filter((m) => m.index >= live.startIndex) : classified;
+    if (liveTotal < compactionTokens) {
       // Per-message average over analyzed (non-attachment) rows only:
       // attachment rows are injected context, not messages, and counting
       // them diluted the average and overstated the remaining runway.
-      const analyzedCount = countAnalyzedMessages(classified);
-      const avgPerMsg = analyzedCount > 0 ? last.cumulativeTokens / analyzedCount : 0;
+      const analyzedCount = countAnalyzedMessages(liveRows);
+      const avgPerMsg = analyzedCount > 0 ? liveTotal / analyzedCount : 0;
       if (avgPerMsg > 0) {
-        const remaining = Math.floor((compactionTokens - last.cumulativeTokens) / avgPerMsg);
+        const remaining = Math.floor((compactionTokens - liveTotal) / avgPerMsg);
         console.log(chalk.dim(`\n  Compaction predicted at message ~${classified.length + remaining} (auto-compact trigger = ${compactionTokens.toLocaleString()} tokens)`));
       }
     } else {
       console.log(chalk.red(`\n  Context already past the auto-compact trigger (${compactionTokens.toLocaleString()} tokens)`));
     }
+  }
+  if (compaction?.idle.applies) {
+    console.log(chalk.yellow(`  Idle compaction: Claude Code compacts this session if it sits idle ~${compaction.idle.afterMinutes} min (window over ${compaction.idle.minTokens.toLocaleString()} tokens)`));
   }
   console.log();
 }

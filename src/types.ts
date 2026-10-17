@@ -143,6 +143,13 @@ export interface SessionMessage {
     type: string;
     [key: string]: unknown;
   };
+  /**
+   * The exact text Claude Code sent for an attachment (2.1.269+). Every
+   * attachment that reaches the model carries it; bookkeeping attachments
+   * that are never sent (prompt_snapshot, deferred_tools_record,
+   * batching_reminder_sent, ...) do not.
+   */
+  rendered?: Array<{ content?: string }>;
   /** On user records that carry a tool's follow-up content (e.g. Skill bodies): the originating tool_use id */
   sourceToolUseID?: string;
   /**
@@ -186,7 +193,12 @@ export interface SessionMessage {
     trigger: 'auto' | 'manual';
     preTokens: number;
     preCompactDiscoveredTools?: string[];
-    /** Window size right after compaction, as measured by Claude Code */
+    /**
+     * Claude Code's post-compaction measurement. It counts the compacted
+     * MESSAGES only: the first live turn after a boundary is consistently
+     * about 50K-75K larger (system prompt, tool schemas, memory, skills and
+     * re-attached files ride on top), so it is not the window size.
+     */
     postTokens?: number;
     /** Wall-clock duration of the compaction in ms */
     durationMs?: number;
@@ -198,6 +210,13 @@ export interface SessionMessage {
       uuids: string[];
     };
   };
+  /**
+   * Set by parseSession on a compact_boundary that Claude Code's "Compacted
+   * while idle, before the prompt cache expired" notice follows: an idle
+   * compaction (2.1.299+), which 2.1.286-2.1.289 recorded with trigger
+   * 'manual'. Not a Claude Code field.
+   */
+  idleCompaction?: boolean;
   /**
    * True on API error placeholder assistants ("API Error: ...").
    * These carry all-zero usage and are dropped at parse time. The model
@@ -530,11 +549,11 @@ export interface CompactionEvent {
   /** Cumulative input_tokens before compaction */
   tokensBefore: number;
   /**
-   * Window size right after compaction. Claude Code's own measurement
-   * (`compactMetadata.postTokens`, recorded since 2.1.119) when present;
-   * otherwise the effective input of the first real assistant after the
-   * boundary (which additionally includes the re-injected fixed context,
-   * so the two quantities are NOT interchangeable).
+   * Window size right after compaction: the effective input of the first
+   * live assistant turn after the boundary (see `firstLiveIndex`). Before
+   * one exists it is Claude Code's `postTokens`, which counts the compacted
+   * messages only; classifySession then adds its fixed-context estimate on
+   * the last event.
    */
   tokensAfter: number;
   /** Size of the drop */
@@ -546,11 +565,16 @@ export interface CompactionEvent {
   /** Estimated tokens in the compaction summary */
   summaryTokens?: number;
   /**
-   * What fired the compaction: 'auto' (the headroom buffer) or 'manual'
-   * (a deliberate /compact). Marker detection only; the heuristic cannot
-   * tell the two apart, so heuristic events leave this undefined.
+   * What fired the compaction as Claude Code recorded it: 'auto' (the
+   * auto-compact window, and idle compaction from 2.1.290) or 'manual'
+   * (a /compact, and idle compaction on 2.1.286-2.1.289). Marker detection
+   * only; the heuristic cannot tell the two apart, so heuristic events
+   * leave this undefined. See `idle` for idle compactions.
    */
   trigger?: 'auto' | 'manual';
+  /** Claude Code compacted the session while it sat idle (its "Compacted
+   * while idle" notice followed the boundary), whatever `trigger` says. */
+  idle?: boolean;
   /** Running total of tokens dropped by every compaction so far, as
    * recorded by Claude Code (compactMetadata.cumulativeDroppedTokens). */
   cumulativeDroppedTokens?: number;
@@ -569,8 +593,8 @@ export interface CompactionEvent {
    * exists, e.g. on the prompt right after a compaction.
    */
   firstLiveIndex?: number;
-  /** Claude Code's own post-compaction window measurement
-   * (`compactMetadata.postTokens`), when recorded. */
+  /** Claude Code's post-compaction measurement (`compactMetadata.postTokens`),
+   * when recorded. Messages only, not the window size. */
   postTokens?: number;
   /**
    * Window size in effect for the window that ENDED at this boundary,

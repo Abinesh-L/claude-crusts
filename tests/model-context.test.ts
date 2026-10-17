@@ -493,3 +493,13 @@ describe('0.8.1 resolveCompactionModel', () => {
     expect(m.bufferTokens).toBe(50_000);
   });
 });
+
+describe('0.8.1 request copies are not user records', () => {
+  test("a 2.1.300 api-request-blob carrying a /context dump does not count as one", () => {
+    const blob = {
+      type: 'api-request-blob',
+      message: { role: 'user', content: '## Context Usage\n\n**Model:** claude-opus-5-5\n**Tokens:** 50k / 200k (25%)' },
+    };
+    expect(detectContextCommandWindow([blob])).toBeNull();
+  });
+});

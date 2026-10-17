@@ -215,6 +215,12 @@ export function readClaudeCodeVersion(filePath: string): string | undefined {
 /** Record types that carry conversation the model actually receives */
 const ANALYZED_RECORD_TYPES: ReadonlySet<string> = new Set(['user', 'assistant', 'system', 'attachment']);
 
+/** A JSONL line whose first key is `type`, capturing the type */
+const LEADING_TYPE = /^\{"type":"([^"]+)"/;
+
+/** Start of the notice Claude Code writes after an idle compaction */
+const IDLE_COMPACTION_NOTICE = 'Compacted while idle';
+
 /** Model marker Claude Code writes on placeholder assistant records */
 const SYNTHETIC_MODEL = '<synthetic>';
 
@@ -298,6 +304,8 @@ export async function parseSession(filePath: string): Promise<SessionMessage[]> 
   const seenUuids = new Set<string>();
   let lineNumber = 0;
   let skippedLines = 0;
+  // The latest compaction boundary still waiting for its idle notice, if any.
+  let openBoundary: SessionMessage | null = null;
 
   const stream = createReadStream(filePath, {
     encoding: 'utf-8',
@@ -309,6 +317,14 @@ export async function parseSession(filePath: string): Promise<SessionMessage[]> 
     lineNumber++;
     if (!line.trim()) continue;
 
+    // Bookkeeping records that lead with their type (2.1.300's api-request,
+    // api-request-blob and api-request-shape copies of every request, plus
+    // mode, title and snapshot records) are never analysed. Skipping them
+    // before JSON.parse keeps the hook fast on transcripts that now carry a
+    // copy of every request; none of them has a uuid.
+    const leadingType = LEADING_TYPE.exec(line);
+    if (leadingType && !ANALYZED_RECORD_TYPES.has(leadingType[1]!)) continue;
+
     try {
       const parsed = JSON.parse(line) as Record<string, unknown>;
 
@@ -319,9 +335,19 @@ export async function parseSession(filePath: string): Promise<SessionMessage[]> 
         seenUuids.add(uuid);
       }
 
+      // An idle compaction is followed by Claude Code's informational notice;
+      // mark the boundary it belongs to (the notice itself is not analysed).
+      if (parsed.type === 'system' && parsed.subtype === 'informational' && openBoundary
+        && typeof parsed.content === 'string' && parsed.content.startsWith(IDLE_COMPACTION_NOTICE)) {
+        openBoundary.idleCompaction = true;
+        openBoundary = null;
+      }
+
       if (!isAnalyzedRecord(parsed)) continue;
 
-      messages.push(parsed as unknown as SessionMessage);
+      const message = parsed as unknown as SessionMessage;
+      if (message.type === 'system' && message.subtype === 'compact_boundary') openBoundary = message;
+      messages.push(message);
     } catch {
       skippedLines++;
     }

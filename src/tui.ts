@@ -336,6 +336,10 @@ export async function executeCommand(input: string, state: TuiState): Promise<bo
         r.breakdown.context_limit,
         r.breakdown.compactionEvents,
         r.breakdown.compaction,
+        {
+          totalTokens: r.breakdown.currentContext?.total_tokens ?? r.breakdown.total_tokens,
+          startIndex: r.breakdown.currentContext?.startIndex ?? 0,
+        },
       );
       return true;
     }

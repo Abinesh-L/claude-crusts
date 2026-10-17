@@ -403,7 +403,10 @@ export function detectContextCommandWindow(messages: UsageMessage[], modelId?: s
   const family = modelId ? modelFamily(modelId) : '';
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.type !== 'user' && m.message?.role !== 'user') continue;
+    // A typed record must be a user record: 2.1.300's api-request-blob copies
+    // carry message.role 'user' too, and library callers may pass raw
+    // records. Untyped fragments fall back to the role.
+    if (m.type !== undefined ? m.type !== 'user' : m.message?.role !== 'user') continue;
     const text = contentText(m.message?.content);
     if (!text.trimStart().startsWith(CONTEXT_COMMAND_MARKER)) continue;
     if (family) {
