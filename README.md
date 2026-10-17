@@ -99,7 +99,8 @@ Three commands cover 90% of day-to-day use. You can stop reading right there if 
 ```bash
 # 1. SELF-HEAL — install the hook. Your context silently self-heals from
 #    now on: when usage crosses the threshold, CRUSTS writes the perfect
-#    /compact focus command and surfaces it in Claude's reply. You paste.
+#    /compact focus command, shows you a one-line notice with it, and
+#    Claude surfaces it in its reply. You run it.
 claude-crusts hooks auto-inject enable
 
 # 2. ACTIVE FIX — write .claudeignore + CLAUDE.md rules for you.
@@ -768,11 +769,11 @@ Not everyone wants context info after every response — this is strictly opt-in
 
 ### `claude-crusts hooks auto-inject <subcommand>`
 
-**CRUSTS writes your next `/compact` for you.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every prompt, crusts silently analyses the session; if the live window is close to Claude Code's auto-compaction trigger (the trigger sits about 33K tokens below the auto-compact window, which is the context window unless you set one with `/autocompact` or `autoCompactWindow`; the default gate fires within max(20K, 10% of the limit) of it) and the last injection was more than `minGapMs` ago (default 5 min), it prepends a targeted advisory to Claude's context — including a `/compact focus "..."` tuned to the top waste items in **this** session. Setting an explicit `threshold` (a usage percent) in config replaces the headroom gate.
+**CRUSTS writes your next `/compact` for you.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every prompt, crusts silently analyses the session; if the live window is close to Claude Code's auto-compaction trigger (the trigger sits about 33K tokens below the auto-compact window, which is the context window unless you set one with `/autocompact` or `autoCompactWindow`; the default gate fires within max(20K, 10% of the auto-compact window) of it) and this session's last advisory was more than `minGapMs` ago (default 5 min), it adds a targeted advisory to Claude's context, including a `/compact focus "..."` tuned to the top waste items in **this** session. Setting an explicit `threshold` (a usage percent) in config replaces the headroom gate, as long as that percent comes before the trigger.
 
-You see a one-line notice with the usage and the command, and Claude surfaces the command in its reply. You run it. CRUSTS never executes `/compact` directly; that stays your call. Claude Code also fires the hook for background-task reports and `/loop` iterations, so the advisory can arrive on those turns too. Every fire is logged to `~/.claude-crusts/auto-inject.log` so you can audit exactly when the hook fired and what advisory it generated.
+You see a one-line notice with the usage and the command, and Claude surfaces the command in its reply. You run it. CRUSTS never executes `/compact` directly; that stays your call. Claude Code also fires the hook for background-task reports and `/loop` iterations, so the advisory can arrive on those turns too. A prompt that is itself `/compact` or `/clear` (or `/reset`, `/new`) never gets one. Every fire is logged to `~/.claude-crusts/auto-inject.log` so you can audit exactly when the hook fired and what advisory it generated.
 
-**Idle compaction.** Since Claude Code 2.1.299, a conversation over 200K tokens that sits idle about 54 minutes can be compacted before its one-hour prompt cache expires. On a 1M window that usually happens long before any percentage threshold, so `analyze` warns when it applies, and the advisory says so. To keep compaction under your control, set `"idleCompaction": false` in `~/.claude/settings.json` (or use `/config`); your next message after a long break then re-reads the whole conversation from scratch.
+**Idle compaction.** From Claude Code 2.1.286 (announced in 2.1.299, rolled out in stages), a conversation over 200K tokens that sits idle about 54 minutes can be compacted before its one-hour prompt cache expires. On a 1M window that usually happens long before any percentage threshold, so `analyze` warns when it applies, and the advisory says so. To keep compaction under your control, set `"idleCompaction": false` in `~/.claude/settings.json` (or use the Idle compaction row in `/config`, 2.1.302+); your next message after a long break then re-reads the whole conversation from scratch.
 
 ```bash
 claude-crusts hooks auto-inject enable       # opt in, installs UserPromptSubmit hook
@@ -782,7 +783,7 @@ claude-crusts hooks auto-inject log          # view injection history (newest fi
 claude-crusts hooks auto-inject log --limit 5 --verbose  # last 5 fires with full advisory text
 ```
 
-Tune via `~/.claude-crusts/config.json` (`threshold` is optional; when present it replaces the default headroom gate with a flat usage-percent gate):
+Tune via `~/.claude-crusts/config.json` (`threshold` is optional; when present it replaces the default headroom gate with a flat usage-percent gate, unless that percent sits past the auto-compact trigger):
 
 ```json
 {
@@ -911,7 +912,7 @@ CRUSTS reads Claude Code's session files directly from disk. **No API calls. No 
 
 **Past sessions work.** Claude Code forgets everything when a session ends. The JSONL files remain on disk permanently. CRUSTS can analyze sessions from days or weeks ago — useful for understanding why a past session hit compaction unexpectedly or consumed more tokens than expected.
 
-**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from the first assistant message's API token count minus all known components (CLAUDE.md, core tool schemas, memory, skills, the first user message, and any attachment records injected before the first response). Skills are read from the session's own skill listing when present, falling back to `~/.claude/skills/` and installed plugins. Different sessions with different setups produce different derived values.
+**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from an anchor turn, the first turn whose whole window the transcript records (the session's first response, or for a continued session the first response after the compaction it opens with), as that turn's API token count minus all known components (CLAUDE.md, core tool schemas, memory, skills, and every recorded message and attachment before it). The result is capped by the smallest window the session ever sent, since every request carries it. Skills are read from the session's own skill listing when present, falling back to `~/.claude/skills/` and installed plugins. Different sessions with different setups produce different derived values.
 
 **Token estimation** uses `output_tokens` from the API response (exact for assistant messages) and character-based heuristics for everything else (empirically calibrated). Use `claude-crusts calibrate` with `/context` output to measure estimation accuracy for your sessions.
 
@@ -1053,7 +1054,7 @@ All of these are generated from patterns in your session data — no LLM, no API
 CRUSTS produces estimates — like `/context` itself, which Claude Code labels "Estimated usage by category."
 
 **What is exact** (verified against raw JSONL data):
-- The TOTAL line — the latest API response's own token accounting (input + cache), not a sum of guesses
+- The TOTAL line — the latest API response's own token accounting (input + cache), not a sum of guesses. The exception is the moment between a compaction and the first response after it: there TOTAL is estimated from Claude Code's post-compaction size plus the fixed context (typically within about -17% to +19% of the next request, about a third low at the first prompt of a continued session)
 - Duplicate file counts — every file, every read, every message number
 - Unused tool detection — loaded vs invoked, exact set difference
 - Cache overhead ratio — direct calculation from API usage fields
@@ -1061,10 +1062,10 @@ CRUSTS produces estimates — like `/context` itself, which Claude Code labels "
 - Assistant output tokens — `output_tokens` from the API, counted once per API message even when Claude Code splits one response across several JSONL lines
 
 **What is estimated:**
-- Per-message token counts — uses chars/3.3 for code, chars/4.0 for English text (empirically measured from session data)
+- Per-message token counts — uses chars/3.3 for code, chars/4.0 for English text. Dense tool output measures closer to 2.3-2.7 chars per token on current models, so raw content estimates run low there; the buckets are scaled to the exact API total, but the split between them inherits the bias
 - Category bucket values — content estimates, reconciled so they sum to the exact API window total (the raw pre-reconciliation values are kept as `contentTokens` in the JSON output)
-- System prompt size — derived from first API response minus known components
-- Compaction prediction — based on average token growth rate
+- System prompt size — derived from an anchor API response minus known components
+- Compaction prediction — based on the live window's growth per message since it started (no projection until 4 messages)
 
 **Known limitations:**
 - Memory file detection may undercount (conservative approach — reads MEMORY.md + linked files only)

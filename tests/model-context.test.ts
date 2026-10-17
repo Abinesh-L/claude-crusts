@@ -574,6 +574,18 @@ describe('0.8.1 review: compaction model matches Claude Code 2.1.302', () => {
     expect(m.trigger).toBe(967_000);
   });
 
+  test('a per-model window matches the model\'s dated and provider-specific IDs', () => {
+    const settings = { ...base, modelAutoCompactWindows: { 'claude-haiku-4-5': 150_000 } };
+    for (const id of [
+      'claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-haiku-4-5@20251001',
+      'us.anthropic.claude-haiku-4-5-20251001-v1:0', 'claude-haiku-4-5[1m]',
+    ]) {
+      expect(resolveCompactionModel(200_000, id, 0, settings)).toMatchObject({ autoCompactWindow: 150_000, trigger: 117_000 });
+    }
+    // Another version of the family keeps its own window.
+    expect(resolveCompactionModel(200_000, 'claude-haiku-4-6', 0, settings).autoCompactWindow).toBe(200_000);
+  });
+
   test('idle compaction only applies on a Claude Code version that has it', () => {
     expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h', '2.1.270').idle.applies).toBe(false);
     expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h', '2.1.289').idle.applies).toBe(true);

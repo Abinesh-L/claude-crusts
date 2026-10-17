@@ -693,10 +693,14 @@ export function readCompactionSettings(
     }
     return undefined;
   };
-  /** A variable from the process environment, else a settings `env` block. */
+  /**
+   * A variable from a settings `env` block, else the process environment.
+   * Claude Code copies `env` blocks into its environment over the shell's
+   * values, so a standalone run must let them win too; inside the hook the
+   * two agree, and a variable removed from the file mid-session is still
+   * read from the inherited environment, as Claude Code keeps it.
+   */
   const variable = (name: string): string | undefined => {
-    const live = env[name];
-    if (typeof live === 'string' && live.trim() !== '') return live.trim();
     for (const record of records) {
       const block = record.env;
       if (!block || typeof block !== 'object') continue;
@@ -704,6 +708,8 @@ export function readCompactionSettings(
       if (typeof value === 'string' && value.trim() !== '') return value.trim();
       if (typeof value === 'number' && Number.isFinite(value)) return String(value);
     }
+    const live = env[name];
+    if (typeof live === 'string' && live.trim() !== '') return live.trim();
     return undefined;
   };
   /** A positive whole token count, or undefined. */

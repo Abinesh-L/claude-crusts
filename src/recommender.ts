@@ -321,7 +321,7 @@ function recommendCompactionPrediction(breakdown: CrustsBreakdown): Recommendati
 /**
  * Warn that Claude Code will compact this session if it is left idle.
  *
- * Since Claude Code 2.1.299, a conversation at or above the idle threshold
+ * From Claude Code 2.1.286, a conversation at or above the idle threshold
  * (200K by default) that sits idle about 54 minutes is compacted before its
  * one-hour prompt cache expires. A 1M window rarely reaches a percentage
  * advisory before a break, so this is usually the compaction that comes
@@ -346,7 +346,7 @@ function recommendIdleCompaction(breakdown: CrustsBreakdown, waste: WasteItem[])
     priority: 2,
     action: `Idle ~${idle.afterMinutes} min and Claude Code may compact this session`,
     impact: 0,
-    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes can end in a generic summary. Before a break, run ${command} to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or /config).`,
+    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes can end in a generic summary. Before a break, run ${command} to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or the Idle compaction row in /config on Claude Code 2.1.302+).`,
   }];
 }
 

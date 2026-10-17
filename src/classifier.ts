@@ -1613,17 +1613,16 @@ function computeModelSpans(messages: SessionMessage[], history: ModelHistory): M
  *   - Boundaries are deduplicated by `uuid`. The scanner already drops
  *     resume replays at parse time; this is the belt for callers that build
  *     message arrays themselves. Boundaries without a uuid are never merged.
- *   - `tokensAfter` prefers Claude Code's own post-compaction measurement
- *     (`compactMetadata.postTokens`, recorded since 2.1.119). The first
- *     assistant after the boundary can belong to an in-flight
- *     PRE-compaction turn (observed: effective input 676,916 against
- *     postTokens 12,867), so the recorded number wins whenever present.
- *   - Without `postTokens`, the fallback scan finds the first REAL
- *     assistant after the boundary: `<synthetic>` placeholders and
- *     zero-usage records are skipped, and the scan runs to the end of the
- *     session rather than a 10-record window ("user > user > user > ..."
- *     tails after a boundary previously fell off the window and reported
- *     tokensAfter = 0, i.e. tokensDropped = preTokens).
+ *   - `tokensAfter` is the first LIVE assistant after the boundary
+ *     (`firstLiveIndex`): `<synthetic>` placeholders, zero-usage records and
+ *     records carried over from the old window (a continuation file's
+ *     copied turns, an in-flight turn: see `isPreCompactionCarryover`) are
+ *     skipped, and the scan stops at the next boundary rather than a
+ *     10-record window ("user > user > user > ..." tails after a boundary
+ *     previously fell off the window and reported tokensAfter = 0). Until a
+ *     live turn exists it is Claude Code's `postTokens` (its chars/4 count of
+ *     what it wrote after compacting; classifySession adds the fixed
+ *     context on the last event).
  *   - `trigger` and `cumulativeDroppedTokens` are copied from
  *     `compactMetadata` so downstream rules can tell deliberate /compact
  *     runs from auto-compactions.
@@ -1951,10 +1950,14 @@ function computeEffectiveInputTokens(
  * (`CompactionEvent.firstLiveIndex`): records carried over past the boundary
  * still report the old window, and reading one right after a compaction put
  * a 13K window at 82%. Before the first live turn exists, the window is
- * Claude Code's `postTokens` (the compacted messages) plus what rides on top
- * of them: the fixed context (derived system prompt, CLAUDE.md, core tool and
- * MCP schemas, memory) and the attachments re-sent after the boundary. On
- * real boundaries the first live turn sat 47K-77K above postTokens.
+ * estimated as Claude Code's `postTokens` plus the fixed context (derived
+ * system prompt, CLAUDE.md, core tool and MCP schemas, memory) and the
+ * attachments re-sent after the boundary. postTokens is Claude Code's
+ * chars/4 count of the summary and those attachments, which runs well below
+ * their real token count, so adding the attachments again lands closer: on real
+ * boundaries the estimate came within about -17% to +19% of the next
+ * request (about a third low at the first prompt of a continuation file,
+ * where no fixed-context anchor exists yet).
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
  * @param events - Compaction events detected on the same messages
@@ -2480,9 +2483,9 @@ export function classifySession(
   // Window size is a property of the MODEL RUN, not the compaction window:
   // compaction never resizes the window, but a mid-session model switch
   // can. Partition the session into contiguous same-model spans and
-  // resolve each compaction event's limit from the signals inside the
-  // span its window ran on, so pre-switch 200K events keep their own
-  // limit instead of inheriting the current model's window.
+  // resolve each compaction event's limit from the signals of every span
+  // of the model its window ran on, so pre-switch 200K events keep their
+  // own limit instead of inheriting the current model's window.
   const modelSpans = computeModelSpans(effectiveMessages, modelHistory);
   const lastSpan = modelSpans[modelSpans.length - 1]!;
   // Evidence for one model's window is not confined to one contiguous run:

@@ -80,7 +80,8 @@ export interface AutoInjectConfig {
   enabled: boolean;
   /**
    * Usage-percentage threshold (0-100) above which injection fires.
-   * Honoured only when the user explicitly set it in config.json (see
+   * Honoured only when the user explicitly set it in config.json and that
+   * point comes before the auto-compaction trigger (see
    * `thresholdExplicit`); otherwise the gate is headroom-based: inject when
    * the window is within `max(20K, 10% of the auto-compact window)` tokens of
    * the auto-compaction trigger (`breakdown.compaction`, see

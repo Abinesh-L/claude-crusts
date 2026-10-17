@@ -116,7 +116,7 @@ function versionAtLeast(version: string, floor: string): boolean {
  * about 967K on a 1M window and 167K on 200K; a configured window is
  * assumed to keep the same buffer. Null when auto-compaction is off.
  *
- * Idle compaction (Claude Code 2.1.299+): a conversation at or above the
+ * Idle compaction (Claude Code 2.1.286+): a conversation at or above the
  * idle threshold (200K by default) left idle about 54 minutes is compacted
  * before its one-hour prompt cache expires. It is off when `idleCompaction`
  * is false or auto-compaction is off. Hand-built breakdowns and fixtures
@@ -164,7 +164,7 @@ export function resolveCompactionModel(
   } else {
     const perModel = modelId && settings?.modelAutoCompactWindows
       ? Object.entries(settings.modelAutoCompactWindows)
-        .find(([key]) => modelFamily(key) === modelFamily(modelId))?.[1]
+        .find(([key]) => canonicalModelName(key) === canonicalModelName(modelId))?.[1]
       : undefined;
     if (perModel === 'auto') {
       // The model's tuned default, even over a top-level window.
@@ -337,6 +337,27 @@ export function getNativeContextLimit(modelId: string | undefined): number | nul
  */
 export function modelFamily(modelId: string): string {
   return modelId.trim().replace(/\[[^\]]*\]\s*$/, '').replace(/-1m$/i, '').toLowerCase();
+}
+
+/**
+ * The canonical name Claude Code files a model's `modelSettings` entry under
+ * (`claude-opus-5-5`). Claude Code matches the model's date-suffixed, `[1m]`
+ * and provider-specific IDs to the same entry, so a window `/autocompact`
+ * saved for `claude-haiku-4-5` applies to a session recorded as
+ * `claude-haiku-4-5-20251001`. Aliases such as `opus` point at whichever
+ * model Claude Code maps them to at the time and are not resolved here.
+ *
+ * @param modelId - A model ID or settings key
+ * @returns The canonical name, lowercased
+ */
+export function canonicalModelName(modelId: string): string {
+  let id = modelFamily(modelId);
+  const claudeAt = id.indexOf('claude-');
+  if (claudeAt > 0) id = id.slice(claudeAt); // Bedrock: us.anthropic.claude-...
+  return id
+    .replace(/@.*$/, '') // Vertex: claude-...@20250514
+    .replace(/-v\d+(?::\d+)?$/, '') // Bedrock: ...-v1:0
+    .replace(/-\d{8}$/, ''); // dated snapshot
 }
 
 /**

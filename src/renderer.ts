@@ -412,8 +412,12 @@ export function renderTimeline(
     if (compactionAfterIndices.has(msg.index)) {
       const event = compactionMap.get(msg.index)!;
       const kind = event.idle ? ' (idle)' : '';
+      // Until the first response after a boundary, its size is crusts'
+      // estimate, not an API measurement.
+      const estimated = event.detection === 'marker' && event.firstLiveIndex === undefined;
+      const after = `${estimated ? '~' : ''}${event.tokensAfter.toLocaleString()}`;
       table.push([
-        { colSpan: 5, content: chalk.yellow(`  ── COMPACTION${kind}: ${event.tokensBefore.toLocaleString()} → ${event.tokensAfter.toLocaleString()} (−${event.tokensDropped.toLocaleString()} tokens) ──`) },
+        { colSpan: 5, content: chalk.yellow(`  ── COMPACTION${kind}: ${event.tokensBefore.toLocaleString()} → ${after} (−${event.tokensDropped.toLocaleString()} tokens${estimated ? ', estimated until the next response' : ''}) ──`) },
       ]);
     }
 

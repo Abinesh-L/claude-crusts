@@ -879,13 +879,16 @@ describe('readCompactionSettings (0.8.1)', () => {
     });
   });
 
-  test('variables come from a settings env block when the process does not set them', () => {
+  test('variables come from a settings env block, which wins over the shell as in Claude Code', () => {
     withTempHome((home) => {
       userSettings(home, { env: { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '150000', CLAUDE_CODE_DISABLE_1M_CONTEXT: '1' } });
       expect(readCompactionSettings(undefined, {})).toMatchObject({ idleCompactMinTokens: 150_000, disable1m: true });
-      // The process environment wins over the settings block.
+      // Claude Code copies the settings block over the shell's value.
       expect(readCompactionSettings(undefined, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '600000' }).idleCompactMinTokens)
-        .toBe(600_000);
+        .toBe(150_000);
+      // A variable only the shell sets still counts.
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '500000' }).envAutoCompactWindow)
+        .toBe(500_000);
     });
   });
 

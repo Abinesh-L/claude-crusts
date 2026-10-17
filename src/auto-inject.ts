@@ -2,15 +2,17 @@
  * Hook-triggered auto-injection — "your context self-heals when it gets hot."
  *
  * When installed, crusts runs on every Claude Code `UserPromptSubmit`
- * event. It classifies the live session; if the window is close enough to
- * Claude Code's auto-compaction trigger (within `max(20K, 10% of limit)`
- * tokens of `autocompactTrigger(limit)`; or, when the user explicitly set
- * `autoInject.threshold` in config.json, past that usage percentage) and
- * the last injection was more than `minGapMs` ago (default 5 min), it
- * emits a `UserPromptSubmit` hook response with an `additionalContext`
- * field. Claude Code prepends that text to the prompt Claude sees — so
- * the model receives a specific `/compact focus` recommendation tuned to
- * THIS session's actual waste, without the user having to paste anything.
+ * event (typed prompts, background-task reports, `/loop` iterations). It
+ * classifies the live session; if the window is close enough to Claude
+ * Code's auto-compaction trigger (within `max(20K, 10% of the auto-compact
+ * window)` tokens of `breakdown.compaction.trigger`; or, when the user
+ * explicitly set `autoInject.threshold` in config.json, past that usage
+ * percentage while it comes before the trigger) and this session's last
+ * injection was more than `minGapMs` ago (default 5 min), it emits a
+ * `UserPromptSubmit` hook response: `additionalContext` that Claude Code
+ * adds to what Claude sees (a specific `/compact focus` recommendation
+ * tuned to THIS session's actual waste), and a `systemMessage` notice shown
+ * to the person.
  *
  * The hook is fire-and-forget: on any error, it exits silently with
  * code 0 so a bug in crusts never blocks the user's prompt.

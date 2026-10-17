@@ -194,10 +194,11 @@ export interface SessionMessage {
     preTokens: number;
     preCompactDiscoveredTools?: string[];
     /**
-     * Claude Code's post-compaction measurement. It counts the compacted
-     * MESSAGES only: the first live turn after a boundary is consistently
-     * about 50K-75K larger (system prompt, tool schemas, memory, skills and
-     * re-attached files ride on top), so it is not the window size.
+     * Claude Code's post-compaction measurement: its chars/4 count of what
+     * it wrote after compacting (the summary, re-attached files, command
+     * records). The fixed context is not in it: the first live turn after a
+     * boundary sat 45K-77K above it on real sessions (median about 59K), and
+     * 142K once with a large preserved segment, so it is not the window size.
      */
     postTokens?: number;
     /** Wall-clock duration of the compaction in ms */
@@ -213,7 +214,7 @@ export interface SessionMessage {
   /**
    * Set by parseSession on a compact_boundary that Claude Code's "Compacted
    * while idle, before the prompt cache expired" notice follows: an idle
-   * compaction (2.1.299+), which 2.1.286-2.1.289 recorded with trigger
+   * compaction (2.1.286+), which 2.1.289 recorded with trigger
    * 'manual'. Not a Claude Code field.
    */
   idleCompaction?: boolean;
@@ -561,9 +562,9 @@ export interface CompactionEvent {
   /**
    * Window size right after compaction: the effective input of the first
    * live assistant turn after the boundary (see `firstLiveIndex`). Before
-   * one exists it is Claude Code's `postTokens`, which counts the compacted
-   * messages only; classifySession then adds its fixed-context estimate on
-   * the last event.
+   * one exists it is Claude Code's `postTokens` (its chars/4 count of what
+   * it wrote after compacting, without the fixed context); classifySession
+   * then turns the last event's value into the live-window estimate.
    */
   tokensAfter: number;
   /** Size of the drop */
@@ -576,8 +577,8 @@ export interface CompactionEvent {
   summaryTokens?: number;
   /**
    * What fired the compaction as Claude Code recorded it: 'auto' (the
-   * auto-compact window, and idle compaction from 2.1.290) or 'manual'
-   * (a /compact, and idle compaction on 2.1.286-2.1.289). Marker detection
+   * auto-compact window, and idle compactions on later versions) or 'manual'
+   * (a /compact, and the idle compactions 2.1.289 recorded). Marker detection
    * only; the heuristic cannot tell the two apart, so heuristic events
    * leave this undefined. See `idle` for idle compactions.
    */
@@ -604,12 +605,13 @@ export interface CompactionEvent {
    */
   firstLiveIndex?: number;
   /** Claude Code's post-compaction measurement (`compactMetadata.postTokens`),
-   * when recorded. Messages only, not the window size. */
+   * when recorded: a chars/4 count without the fixed context, not the
+   * window size. */
   postTokens?: number;
   /**
    * Window size in effect for the window that ENDED at this boundary,
-   * resolved from the signals inside that window's contiguous same-model
-   * span (compaction never resizes the window; a model switch can).
+   * resolved from the signals of every span that ran the same model family
+   * (compaction never resizes the window; a model switch can).
    * Set by classifySession; undefined when events are detected standalone.
    */
   contextLimit?: number;
