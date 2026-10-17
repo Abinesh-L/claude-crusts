@@ -39,7 +39,7 @@ import type {
   ModelHistory,
   ModelSegment,
 } from './types.ts';
-import { resolveContextLimitWithSignal, resolveCompactionModel, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
+import { resolveContextLimitWithSignal, resolveCompactionModel, latestCacheTtl, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
 import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName, compareVersions } from './built-in-tools.ts';
@@ -313,9 +313,9 @@ function estimateContentTokens(msg: SessionMessage): number {
  * Estimate the window cost of an `attachment` record at the plain-text
  * divisor (chars / 4).
  *
- * From Claude Code 2.1.269 every attachment that reaches the model carries
+ * From Claude Code 2.1.268 every attachment that reaches the model carries
  * `rendered: [{content}]`, the exact text sent, and that is what is sized.
- * A 2.1.269+ attachment without it was never sent (prompt_snapshot,
+ * A 2.1.268+ attachment without it was never sent (prompt_snapshot,
  * deferred_tools_record, credential_org, batching_reminder_sent, ...) and
  * costs 0. On five real transcripts the payload fields under-read the sent
  * text by 38% (instructions, mcp_instructions_delta, environment and
@@ -352,13 +352,19 @@ export function estimateAttachmentTokens(msg: SessionMessage): number {
   return Math.round(attachmentText(msg).length / CHARS_PER_TOKEN_TEXT);
 }
 
-/** First Claude Code version that records `rendered` on every sent attachment. */
-const RENDERED_ATTACHMENTS_SINCE = '2.1.269';
+/**
+ * First Claude Code version that records `rendered` on every sent
+ * attachment. On 2.1.268 transcripts the only attachments without it are
+ * bookkeeping (prompt_snapshot, batching_reminder_sent, structured_output,
+ * deferred_tools_record, hook_system_message); 2.1.265 has a single
+ * rendered record, so earlier versions keep the payload estimate.
+ */
+const RENDERED_ATTACHMENTS_SINCE = '2.1.268';
 
 /**
  * CLAUDE.md and memory cost from the session's own `instructions` attachment.
  *
- * Claude Code 2.1.269+ records the instruction files it loaded (`files[]`,
+ * Claude Code 2.1.268+ records the instruction files it loaded (`files[]`,
  * each typed User, Project, Local or AutoMem) and their exact sent text in
  * `rendered`. That beats re-reading the files from disk today: the disk copy
  * of MEMORY.md has moved on since the session ran, and ancestor CLAUDE.md
@@ -2179,7 +2185,7 @@ export function classifySession(
   }
 
   // Config overhead tokens (added to both lifetime and current context).
-  // The session's own `instructions` attachment (2.1.269+) replaces the disk
+  // The session's own `instructions` attachment (2.1.268+) replaces the disk
   // copies of CLAUDE.md and memory when it was recorded.
   const configOverhead = computeConfigOverhead(configData, coreSchema.tokens);
   const recordedInstructions = instructionsOverhead(effectiveMessages);
@@ -2570,6 +2576,7 @@ export function classifySession(
     model,
     currentContext?.total_tokens ?? totalTokens,
     configData.compaction,
+    latestCacheTtl(effectiveMessages),
   );
 
   return {

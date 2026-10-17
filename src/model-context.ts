@@ -88,10 +88,17 @@ export const IDLE_COMPACT_AFTER_MINUTES = 54;
  * is false or auto-compaction is off. Hand-built breakdowns and fixtures
  * pass no settings and get Claude Code's defaults.
  *
+ * Idle compaction also needs the one-hour prompt cache: a session whose
+ * latest cache write used the 5-minute TTL (a usage-credits plan, or a TTL
+ * override) does not qualify. Claude Code rolls the feature out in stages,
+ * so "applies" means "may happen", never "will".
+ *
  * @param limit - Resolved context window in tokens
  * @param modelId - Session model, for a per-model `/autocompact` window
  * @param liveTokens - Live window size, for whether idle compaction applies
  * @param settings - Claude Code compaction settings (see `readCompactionSettings`)
+ * @param cacheTtl - TTL of the session's latest cache write ('unknown' when
+ *   the usage records do not say)
  * @returns The compaction model
  */
 export function resolveCompactionModel(
@@ -99,6 +106,7 @@ export function resolveCompactionModel(
   modelId: string | undefined,
   liveTokens: number,
   settings?: CompactionSettings,
+  cacheTtl: '1h' | '5m' | 'unknown' = 'unknown',
 ): CompactionModel {
   const bufferTokens = settings?.bufferTokens && settings.bufferTokens > 0
     ? settings.bufferTokens
@@ -136,9 +144,33 @@ export function resolveCompactionModel(
       enabled: idleEnabled,
       minTokens: idleMin,
       afterMinutes: IDLE_COMPACT_AFTER_MINUTES,
-      applies: idleEnabled && liveTokens >= idleMin,
+      cacheTtl,
+      applies: idleEnabled && cacheTtl !== '5m' && liveTokens >= idleMin,
     },
   };
+}
+
+/**
+ * TTL of the session's latest prompt-cache write.
+ *
+ * Reads the nested `cache_creation` breakdown of the newest real turn that
+ * wrote cache: ephemeral_1h tokens mean the one-hour TTL (what idle
+ * compaction needs), ephemeral_5m only means five minutes. Zeroed copies
+ * and turns that only read cache are skipped.
+ *
+ * @param messages - Session messages
+ * @returns '1h', '5m', or 'unknown' when no turn records the breakdown
+ */
+export function latestCacheTtl(messages: UsageMessage[]): '1h' | '5m' | 'unknown' {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const usage = messages[i]!.message?.usage;
+    if (!usage || isZeroedUsageCopy(usage)) continue;
+    const oneHour = usageField(usage.cache_creation?.ephemeral_1h_input_tokens);
+    const fiveMinutes = usageField(usage.cache_creation?.ephemeral_5m_input_tokens);
+    if (oneHour > 0) return '1h';
+    if (fiveMinutes > 0) return '5m';
+  }
+  return 'unknown';
 }
 
 /**
@@ -260,6 +292,7 @@ export function modelFamily(modelId: string): string {
  */
 export interface UsageLike {
   input_tokens?: number;
+  output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation?: {
@@ -300,19 +333,38 @@ function usageField(value: number | undefined): number {
  *
  * Claude Code >= 2.1.1xx writes both `cache_creation_input_tokens` and a
  * nested `cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}`
- * breakdown. They usually agree, but 18 real records disagree (one turn:
- * flat 0 vs nested 815,917). The larger of the two is the one the API
- * actually billed and the one that bounds the window, so that is returned.
+ * breakdown, and they agree on real turns; the larger of the two is
+ * returned for the shapes that carry only one of them.
+ *
+ * The disagreements seen on real transcripts (flat 0 vs nested 821,214) are
+ * all zeroed copies: a continuation file repeats the previous conversation's
+ * last turns with input, cache_creation_input, cache_read and output all set
+ * to 0 while the nested breakdown keeps the old window. Such a record
+ * describes no request (no real turn has zero input and zero output), so it
+ * contributes nothing; reading its nested figure as a live window was the
+ * root of the 790K "fixed context".
  *
  * @param usage - Usage object from an assistant record (or undefined)
  * @returns Cache-creation tokens, 0 when no usage is present
  */
 export function cacheCreationTokens(usage: UsageLike | undefined): number {
-  if (!usage) return 0;
+  if (!usage || isZeroedUsageCopy(usage)) return 0;
   const flat = usageField(usage.cache_creation_input_tokens);
   const nested = usageField(usage.cache_creation?.ephemeral_5m_input_tokens)
     + usageField(usage.cache_creation?.ephemeral_1h_input_tokens);
   return Math.max(flat, nested);
+}
+
+/**
+ * Whether a usage object is a zeroed copy: input, cache_creation_input,
+ * cache_read and output all present and exactly 0.
+ *
+ * @param usage - Usage object from an assistant record
+ * @returns True for the zeroed copies Claude Code writes into continuation files
+ */
+export function isZeroedUsageCopy(usage: UsageLike): boolean {
+  return usage.input_tokens === 0 && usage.cache_creation_input_tokens === 0
+    && usage.cache_read_input_tokens === 0 && usage.output_tokens === 0;
 }
 
 /**

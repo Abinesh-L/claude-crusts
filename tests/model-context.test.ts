@@ -6,11 +6,13 @@ import {
   resolveContextLimitWithSignal,
   effectiveInput,
   cacheCreationTokens,
+  isZeroedUsageCopy,
   DEFAULT_CONTEXT_LIMIT,
   MODEL_CONTEXT_LIMITS,
   getNativeContextLimit,
   parseClaudeModelId,
   resolveCompactionModel,
+  latestCacheTtl,
   modelFamily,
   detectContextCommandWindow,
   detectSettingsContextLimit,
@@ -449,7 +451,7 @@ describe('0.8.1 resolveCompactionModel', () => {
     expect(m.autoCompactWindow).toBe(1_000_000);
     expect(m.windowSource).toBe('default');
     expect(m.bufferTokens).toBe(33_000);
-    expect(m.idle).toEqual({ enabled: true, minTokens: 200_000, afterMinutes: 54, applies: true });
+    expect(m.idle).toEqual({ enabled: true, minTokens: 200_000, afterMinutes: 54, cacheTtl: 'unknown', applies: true });
     expect(resolveCompactionModel(200_000, 'claude-opus-4-6', 50_000).trigger).toBe(167_000);
   });
 
@@ -501,5 +503,55 @@ describe('0.8.1 request copies are not user records', () => {
       message: { role: 'user', content: '## Context Usage\n\n**Model:** claude-opus-5-5\n**Tokens:** 50k / 200k (25%)' },
     };
     expect(detectContextCommandWindow([blob])).toBeNull();
+  });
+});
+
+describe('0.8.1 zeroed usage copies describe no request', () => {
+  test('all flat fields 0 with a nested old window counts as nothing', () => {
+    // A continuation file repeats the previous conversation's last turns
+    // like this (seen on a real 2.1.261 file).
+    const copy = {
+      input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0,
+      cache_creation: { ephemeral_1h_input_tokens: 821_214, ephemeral_5m_input_tokens: 0 },
+    };
+    expect(isZeroedUsageCopy(copy)).toBe(true);
+    expect(cacheCreationTokens(copy)).toBe(0);
+    expect(effectiveInput(copy)).toBe(0);
+  });
+
+  test('a real turn whose flat cache field is 0 still reads the nested breakdown', () => {
+    const real = {
+      input_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 447,
+      cache_creation: { ephemeral_1h_input_tokens: 30_000, ephemeral_5m_input_tokens: 0 },
+    };
+    expect(isZeroedUsageCopy(real)).toBe(false);
+    expect(effectiveInput(real)).toBe(30_002);
+  });
+});
+
+describe('0.8.1 idle compaction needs the one-hour cache', () => {
+  /** A turn whose cache write used the given TTL. */
+  const wrote = (ttl: '1h' | '5m') => ({
+    message: {
+      usage: {
+        input_tokens: 2, output_tokens: 100, cache_read_input_tokens: 300_000,
+        cache_creation_input_tokens: 5_000,
+        cache_creation: ttl === '1h'
+          ? { ephemeral_1h_input_tokens: 5_000, ephemeral_5m_input_tokens: 0 }
+          : { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 5_000 },
+      },
+    },
+  });
+  const readOnly = { message: { usage: { input_tokens: 2, output_tokens: 50, cache_read_input_tokens: 305_000, cache_creation_input_tokens: 0 } } };
+
+  test('latestCacheTtl reads the newest cache write, skipping read-only turns', () => {
+    expect(latestCacheTtl([wrote('1h'), readOnly])).toBe('1h');
+    expect(latestCacheTtl([wrote('1h'), wrote('5m'), readOnly])).toBe('5m');
+    expect(latestCacheTtl([readOnly])).toBe('unknown');
+  });
+
+  test('a session on the 5-minute cache does not qualify for idle compaction', () => {
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 400_000, undefined, '5m').idle.applies).toBe(false);
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 400_000, undefined, '1h').idle.applies).toBe(true);
   });
 });

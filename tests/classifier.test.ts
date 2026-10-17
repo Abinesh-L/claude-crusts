@@ -2170,7 +2170,7 @@ describe('0.8.1: attachments sized from the text Claude Code sent', () => {
     expect(estimateAttachmentTokens(msg)).toBe(Math.round(3_889 / 4));
   });
 
-  test('a 2.1.269+ attachment without a rendered copy was never sent and costs nothing', () => {
+  test('a 2.1.268+ attachment without a rendered copy was never sent and costs nothing', () => {
     const reminder = att('batching_reminder_sent', { text: 'r'.repeat(400) }, { version: '2.1.289' });
     expect(estimateAttachmentTokens(reminder)).toBe(0);
   });

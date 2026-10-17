@@ -322,9 +322,9 @@ function recommendIdleCompaction(breakdown: CrustsBreakdown): Recommendation[] {
   // the top three actions.
   return [{
     priority: 2,
-    action: `If left idle ~${idle.afterMinutes} min, Claude Code compacts this session`,
+    action: `Idle ~${idle.afterMinutes} min and Claude Code may compact this session`,
     impact: 0,
-    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes ends in a generic summary. Before a break, run the /compact focus command above to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or /config).`,
+    reason: `${total.toLocaleString()} tokens is over the ${idle.minTokens.toLocaleString()}-token idle-compaction threshold, so a break of about ${idle.afterMinutes} minutes can end in a generic summary. Before a break, run the /compact focus command above to choose what stays, or turn idle compaction off ("idleCompaction": false in settings.json, or /config).`,
   }];
 }
 
@@ -515,15 +515,17 @@ function recommendTopConsumers(
     detail: `CLAUDE.md ${claudeMdTokens.toLocaleString()} + internal ${derivedPrompt.toLocaleString()}`,
   });
 
-  // 4. Compaction summary (if present)
-  for (const event of breakdown.compactionEvents) {
+  // 4. Compaction summary (if present): the most recent one is the summary
+  // in the live window, so walk newest first.
+  for (let e = breakdown.compactionEvents.length - 1; e >= 0; e--) {
+    const event = breakdown.compactionEvents[e]!;
     if (event.summaryTokens && event.summaryTokens > 0) {
       consumers.push({
         name: 'Compaction summary',
         tokens: event.summaryTokens,
         detail: `compressed context from ${event.tokensBefore.toLocaleString()} tokens`,
       });
-      break; // Only show the most recent one
+      break;
     }
   }
 

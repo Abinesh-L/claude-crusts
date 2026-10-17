@@ -25,7 +25,7 @@
  * missing keys. Writers merge — never replace the whole file.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { CRUSTS_DIR } from './calibrator.ts';
 import { AUTOCOMPACT_BUFFER_TOKENS } from './model-context.ts';
@@ -146,13 +146,27 @@ export function loadConfig(): Record<string, unknown> {
  *
  * Guarantees sibling keys are preserved — e.g. writing
  * `{ hooksEnabled: false }` won't erase `wasteThresholds`.
+ *
+ * The write is atomic (a temp file in the same folder, then a rename over
+ * config.json), so a reader never sees a half-written file. Two sessions'
+ * hooks can record an injection within the same second; a torn read
+ * returned {} and the next write kept only the injection timestamp,
+ * dropping `enabled` and `threshold` and silently switching auto-inject off.
  */
 export function saveConfig(updates: Record<string, unknown>): void {
   const current = loadConfig();
   const merged = { ...current, ...updates };
   const dir = configDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(crustsConfigPath(), JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+  const target = crustsConfigPath();
+  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+  try {
+    renameSync(temp, target);
+  } catch (err) {
+    try { unlinkSync(temp); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 /**

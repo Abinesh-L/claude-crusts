@@ -135,15 +135,17 @@ export async function readAutoInjectPayload(): Promise<AutoInjectPayload | null>
 /**
  * Why a submitted prompt must not carry an advisory, or null when it may.
  *
- * Claude Code fires UserPromptSubmit for machine-written turns too: a
- * background task finishing submits a `<task-notification>` turn, and
- * slash-command wrappers arrive as `<command-name>` text. An advisory
- * attached to one of those lands in a turn the person is not reading, and
- * the per-session min-gap it consumes then holds back the advisory on their
- * next real prompt (observed: injected into a task notification at 81.5%,
- * then suppressed four minutes later when they typed at 81.9%). `/compact`
- * and `/clear` are typed by the person, but advising a compaction on the
- * command that compacts or clears the window is noise.
+ * `/compact` and `/clear` are skipped: advising a compaction on the command
+ * that compacts or clears the window is noise. Slash-command wrappers
+ * (`<command-name>`, local command output) and interrupt stubs are not
+ * prompts to advise on either.
+ *
+ * Background-task reports (`<task-notification>`), `/loop` iterations and
+ * cross-session messages also fire UserPromptSubmit, and they DO carry the
+ * advisory: in long autonomous runs they are most of the turns, Claude
+ * relayed every advisory it received on one (7 of 7 on a real transcript),
+ * and the advisory's `systemMessage` line reaches the person directly
+ * whichever turn it rides on.
  *
  * Payloads without a `prompt` field are not skipped (older Claude Code).
  *
@@ -153,7 +155,7 @@ export async function readAutoInjectPayload(): Promise<AutoInjectPayload | null>
 export function promptSkipReason(prompt: string | undefined): string | null {
   if (typeof prompt !== 'string') return null;
   const kind = nonHumanPromptKind(prompt);
-  if (kind) return `machine-written prompt (${kind})`;
+  if (kind === 'local-command' || kind === 'interrupt') return `not a prompt (${kind})`;
   if (/^\/(compact|clear)(\s|$)/.test(prompt.trimStart())) return 'compaction command';
   return null;
 }
@@ -241,24 +243,8 @@ export function buildInjectionText(
   waste: WasteItem[],
   usagePercent: number,
 ): string {
-  const targets: string[] = [];
   const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
-  for (const item of top) {
-    if (item.type === 'duplicate_read') {
-      const m = /"([^"]+)"/.exec(item.description);
-      if (m) targets.push(`keep only latest read of ${m[1]}`);
-    } else if (item.type === 'stale_read') {
-      const m = /"([^"]+)"/.exec(item.description);
-      if (m) targets.push(`drop stale read of ${m[1]}`);
-    } else if (item.type === 'resolved_exchange' && item.message_range) {
-      targets.push(`drop resolved exchange at messages #${item.message_range[0]}-${item.message_range[1]}`);
-    }
-  }
-
-  const compactLine = targets.length > 0
-    ? `/compact focus "${targets.join('; ')}"`
-    : '/compact';
-
+  const compactLine = compactCommandFor(waste);
   const saveable = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
   // Read the live window's buckets: post-compaction sessions keep lifetime
@@ -288,6 +274,31 @@ export function buildInjectionText(
 }
 
 /**
+ * The `/compact` command an advisory recommends: a `focus` line built from
+ * the top three high- or medium-severity waste items, or a bare `/compact`
+ * when none of them names a target.
+ *
+ * @param waste - Detected waste items
+ * @returns The command to run
+ */
+export function compactCommandFor(waste: WasteItem[]): string {
+  const targets: string[] = [];
+  const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
+  for (const item of top) {
+    if (item.type === 'duplicate_read') {
+      const m = /"([^"]+)"/.exec(item.description);
+      if (m) targets.push(`keep only latest read of ${m[1]}`);
+    } else if (item.type === 'stale_read') {
+      const m = /"([^"]+)"/.exec(item.description);
+      if (m) targets.push(`drop stale read of ${m[1]}`);
+    } else if (item.type === 'resolved_exchange' && item.message_range) {
+      targets.push(`drop resolved exchange at messages #${item.message_range[0]}-${item.message_range[1]}`);
+    }
+  }
+  return targets.length > 0 ? `/compact focus "${targets.join('; ')}"` : '/compact';
+}
+
+/**
  * One or two sentences on when Claude Code will compact this session.
  *
  * Uses the classifier's compaction model: the token trigger (from the
@@ -312,27 +323,47 @@ function describeCompactionTiming(breakdown: CrustsBreakdown): string {
     sentences.push(`Claude Code auto-compacts this session at about ${k(compaction.trigger)} tokens (${pct}% of the ${k(limit)} window, ${k(compaction.bufferTokens)} of headroom kept free).`);
   }
   if (compaction.idle.applies) {
-    sentences.push(`It also compacts it if the session sits idle about ${compaction.idle.afterMinutes} minutes, since the window is over ${k(compaction.idle.minTokens)} tokens.`);
+    sentences.push(`It may also compact it if the session sits idle about ${compaction.idle.afterMinutes} minutes, since the window is over ${k(compaction.idle.minTokens)} tokens.`);
   }
   return sentences.join(' ');
 }
 
 /**
- * Emit a UserPromptSubmit hook response that prepends text to Claude's context.
+ * Emit a UserPromptSubmit hook response: the advisory for Claude, and a
+ * one-line notice for the person.
  *
- * Claude Code's hook protocol reads JSON on stdout. When the event is
- * UserPromptSubmit and the payload includes
- * `hookSpecificOutput.additionalContext`, the text is added to what the
- * model sees for this turn.
+ * Claude Code's hook protocol reads JSON on stdout. `hookSpecificOutput.
+ * additionalContext` is added to what the model sees for this turn, but it
+ * never shows in the transcript, so the person only learns of it if Claude
+ * relays it (on a real transcript 3 advisories never were). `systemMessage`
+ * is shown to the person directly, whichever turn the advisory rides on.
+ *
+ * @param additionalContext - The full advisory for Claude
+ * @param systemMessage - The one-line notice for the person
  */
-function emitHookResponse(additionalContext: string): void {
+function emitHookResponse(additionalContext: string, systemMessage: string): void {
   const payload = {
+    systemMessage,
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
       additionalContext,
     },
   };
   process.stdout.write(JSON.stringify(payload));
+}
+
+/**
+ * The person-facing line shown with an advisory.
+ *
+ * @param breakdown - Live session breakdown
+ * @param usagePercent - The usage the gate measured
+ * @param compactLine - The `/compact` command the advisory recommends
+ * @returns One line: usage, window and the command to run
+ */
+export function buildUserNotice(breakdown: CrustsBreakdown, usagePercent: number, compactLine: string): string {
+  const live = (breakdown.currentContext ?? breakdown).total_tokens;
+  const k = (tokens: number): string => `${Math.round(tokens / 1000).toLocaleString()}K`;
+  return `claude-crusts: context at ${usagePercent.toFixed(1)}% (${k(live)} of ${k(breakdown.context_limit)}). Run ${compactLine} to choose what stays before Claude Code compacts it.`;
 }
 
 /**
@@ -381,7 +412,7 @@ export async function runAutoInject(): Promise<void> {
     const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
     const reclaimableTokens = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
-    emitHookResponse(text);
+    emitHookResponse(text, buildUserNotice(breakdown, decision.usagePercent, compactCommandFor(waste)));
     recordInjection(sessionId);
     writeInjectionLog({
       ts: new Date().toISOString(),

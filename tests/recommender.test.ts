@@ -345,14 +345,14 @@ describe('0.8.1 compaction model in recommendations', () => {
       autoCompactWindow: 1_000_000,
       windowSource: trigger === null ? 'disabled' : 'default',
       bufferTokens: 33_000,
-      idle: { enabled: idleApplies, minTokens: 200_000, afterMinutes: 54, applies: idleApplies },
+      idle: { enabled: idleApplies, minTokens: 200_000, afterMinutes: 54, cacheTtl: '1h', applies: idleApplies },
     };
     return bd;
   }
 
   test('an idle-compaction warning appears when it applies to the live window', () => {
     const report = generateRecommendations(withModel(350_000, true), [], emptyConfig(), []);
-    const idle = report.recommendations.find((r) => r.action.includes('idle'));
+    const idle = report.recommendations.find((r) => /idle/i.test(r.action));
     expect(idle).toBeDefined();
     expect(idle!.action).toContain('~54 min');
     expect(idle!.reason).toContain('200,000-token idle-compaction threshold');
@@ -361,7 +361,7 @@ describe('0.8.1 compaction model in recommendations', () => {
 
   test('no idle-compaction warning when it is off or under the threshold', () => {
     const report = generateRecommendations(withModel(350_000, false), [], emptyConfig(), []);
-    expect(report.recommendations.some((r) => r.action.includes('idle'))).toBe(false);
+    expect(report.recommendations.some((r) => /idle/i.test(r.action))).toBe(false);
   });
 
   test("the classifier's trigger drives the prediction, and auto-compaction off means no countdown", () => {

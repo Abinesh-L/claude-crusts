@@ -461,7 +461,7 @@ export function renderTimeline(
     }
   }
   if (compaction?.idle.applies) {
-    console.log(chalk.yellow(`  Idle compaction: Claude Code compacts this session if it sits idle ~${compaction.idle.afterMinutes} min (window over ${compaction.idle.minTokens.toLocaleString()} tokens)`));
+    console.log(chalk.yellow(`  Idle compaction: Claude Code may compact this session if it sits idle ~${compaction.idle.afterMinutes} min (window over ${compaction.idle.minTokens.toLocaleString()} tokens)`));
   }
   console.log();
 }

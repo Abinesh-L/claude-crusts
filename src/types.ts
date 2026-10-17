@@ -144,7 +144,7 @@ export interface SessionMessage {
     [key: string]: unknown;
   };
   /**
-   * The exact text Claude Code sent for an attachment (2.1.269+). Every
+   * The exact text Claude Code sent for an attachment (2.1.268+). Every
    * attachment that reaches the model carries it; bookkeeping attachments
    * that are never sent (prompt_snapshot, deferred_tools_record,
    * batching_reminder_sent, ...) do not.
@@ -394,7 +394,11 @@ export interface CompactionModel {
     minTokens: number;
     /** Approximate idle minutes before it fires (shortly before the 1h prompt cache expires) */
     afterMinutes: number;
-    /** Enabled and the live window is at or above the threshold */
+    /** TTL of the session's latest cache write; idle compaction needs '1h' */
+    cacheTtl: '1h' | '5m' | 'unknown';
+    /** Enabled, not on the 5-minute cache, and the live window is at or
+     * above the threshold: a long enough pause MAY compact it (Claude Code
+     * rolls the feature out in stages) */
     applies: boolean;
   };
 }

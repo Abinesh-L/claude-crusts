@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { shouldInject, buildInjectionText, writeInjectionLog, readInjectionLog, promptSkipReason } from '../src/auto-inject.ts';
+import { shouldInject, buildInjectionText, writeInjectionLog, readInjectionLog, promptSkipReason, buildUserNotice, compactCommandFor } from '../src/auto-inject.ts';
 import type { CrustsBreakdown, WasteItem } from '../src/types.ts';
 import { DEFAULT_AUTO_INJECT } from '../src/config.ts';
 
@@ -252,9 +252,9 @@ describe('promptSkipReason', () => {
     expect(promptSkipReason(undefined)).toBeNull();
   });
 
-  test('background task notifications are skipped', () => {
+  test('background task notifications may carry an advisory (Claude relays it; the notice reaches the person)', () => {
     const text = '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>';
-    expect(promptSkipReason(text)).toBe('machine-written prompt (task-notification)');
+    expect(promptSkipReason(text)).toBeNull();
   });
 
   test('slash-command wrappers and interrupts are skipped', () => {
@@ -378,7 +378,7 @@ describe('0.8.1 advisory timing names the compaction that comes first', () => {
         autoCompactWindow: 1_000_000,
         windowSource: trigger === null ? 'disabled' : 'default',
         bufferTokens: 33_000,
-        idle: { enabled: idleApplies, minTokens: 200_000, afterMinutes: 54, applies: idleApplies },
+        idle: { enabled: idleApplies, minTokens: 200_000, afterMinutes: 54, cacheTtl: '1h', applies: idleApplies },
       },
     });
   }
@@ -391,7 +391,7 @@ describe('0.8.1 advisory timing names the compaction that comes first', () => {
 
   test('adds idle compaction when it applies', () => {
     const text = buildInjectionText(onModel(82, true), [], 82);
-    expect(text).toContain('if the session sits idle about 54 minutes, since the window is over 200K tokens');
+    expect(text).toContain('It may also compact it if the session sits idle about 54 minutes, since the window is over 200K tokens');
   });
 
   test('says so when auto-compaction is off', () => {
@@ -409,5 +409,21 @@ describe('0.8.1 advisory timing names the compaction that comes first', () => {
     const wide = onModel(40, false, 967_000);
     wide.total_tokens = 400_000;
     expect(shouldInject(wide, cfg, 'sid').inject).toBe(false);
+  });
+});
+
+describe('0.8.1 the person sees every advisory', () => {
+  test('the notice names the usage, the window and the command to run', () => {
+    const bd = breakdownAt(82, { context_limit: 1_000_000, total_tokens: 824_000 });
+    const waste: WasteItem[] = [{
+      type: 'duplicate_read', severity: 'high', estimated_tokens: 9_000,
+      description: 'File "src/app.ts" read 3 times', recommendation: '', message_range: [1, 9],
+    } as WasteItem];
+    const notice = buildUserNotice(bd, 82.4, compactCommandFor(waste));
+    expect(notice).toBe('claude-crusts: context at 82.4% (824K of 1,000K). Run /compact focus "keep only latest read of src/app.ts" to choose what stays before Claude Code compacts it.');
+  });
+
+  test('without waste targets the notice suggests a bare /compact', () => {
+    expect(compactCommandFor([])).toBe('/compact');
   });
 });
