@@ -500,6 +500,17 @@ export interface CompactionEvent {
    */
   preservedMessageIndices?: number[];
   /**
+   * Index of the first assistant turn whose request was built from the
+   * compacted window. Records carried over past the boundary (a continued
+   * session's previous turns, an in-flight pre-compaction turn) are skipped:
+   * their usage still describes the old window. Undefined until such a turn
+   * exists, e.g. on the prompt right after a compaction.
+   */
+  firstLiveIndex?: number;
+  /** Claude Code's own post-compaction window measurement
+   * (`compactMetadata.postTokens`), when recorded. */
+  postTokens?: number;
+  /**
    * Window size in effect for the window that ENDED at this boundary,
    * resolved from the signals inside that window's contiguous same-model
    * span (compaction never resizes the window; a model switch can).
@@ -516,21 +527,30 @@ export interface CompactionEvent {
 export interface DerivedOverhead {
   /**
    * Claude Code fixed context not present in the JSONL (internal system
-   * prompt + injected instructions), derived as the first assistant
-   * turn's effective input minus every known component.
+   * prompt + injected instructions), derived from the first turn whose whole
+   * window the file records (the anchor) as its effective input minus every
+   * known component.
    */
   internalSystemPrompt: {
     tokens: number;
     /** Breakdown of the derivation for transparency */
     derivation: {
+      /** Effective input of the anchor turn */
       firstAssistantInputTokens: number;
       knownClaudeMd: number;
       knownToolSchemas: number;
       knownMemory: number;
       knownSkills: number;
+      /** User-role records in the anchor's window before the anchor turn
+       * (typed prompt, skill bodies, slash-command wrappers) */
       knownFirstUserMessage: number;
-      /** Attachment records injected before the first assistant turn */
+      /** Attachment records in the anchor's window before the anchor turn */
       knownAttachments: number;
+      /** Compact summary and messages carried across the boundary, when the
+       * anchor window opens at a compaction (0 for a fresh session) */
+      knownCarriedOver?: number;
+      /** Index of the anchor turn */
+      anchorIndex?: number;
       totalKnown: number;
     };
   } | null;

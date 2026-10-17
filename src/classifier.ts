@@ -1565,18 +1565,24 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       }
     }
 
-    // Find the first REAL assistant message after the boundary. The scan
-    // is uncapped: long runs of user records or attachments after a
-    // boundary are stepped over until an assistant with usage appears.
+    // Find the first REAL assistant message after the boundary: the first
+    // turn whose request was built from the compacted window. The scan
+    // steps over long runs of user records or attachments, skips records
+    // carried over from before the compaction (their usage still describes
+    // the old window), and stops at the next boundary.
     let afterIndex = i + 1;
+    let firstLiveIndex: number | undefined;
     let scannedTokensAfter = 0;
     for (let j = i + 1; j < messages.length; j++) {
       const m = messages[j]!;
+      if (m.type === 'system' && m.subtype === 'compact_boundary') break;
       if (m.type !== 'assistant' || !m.message?.usage) continue;
       if (m.message.model === '<synthetic>') continue;
       const effective = effectiveInput(m.message.usage);
       if (effective <= 0) continue;
+      if (isPreCompactionCarryover(m, msg)) continue;
       afterIndex = j;
+      firstLiveIndex = j;
       scannedTokensAfter = effective;
       break;
     }
@@ -1619,10 +1625,42 @@ function detectViaMarkers(messages: SessionMessage[]): CompactionEvent[] {
       trigger: meta?.trigger,
       cumulativeDroppedTokens: meta?.cumulativeDroppedTokens,
       preservedMessageIndices,
+      ...(firstLiveIndex !== undefined ? { firstLiveIndex } : {}),
+      ...(meta?.postTokens !== undefined ? { postTokens: meta.postTokens } : {}),
     });
   }
 
   return events;
+}
+
+/**
+ * Whether an assistant record written after a compaction boundary still
+ * describes the PRE-compaction window.
+ *
+ * Two kinds land past the boundary in the JSONL. A continued session's file
+ * opens with the previous conversation's boundary followed by its last
+ * turns, timestamped before the boundary (observed: two records at 821,214
+ * effective input right after a boundary whose postTokens was 12,536). And a
+ * turn already in flight when compaction fired finishes after it (observed:
+ * 676,916 against postTokens 12,867). Either one's usage is the old window,
+ * so it must not stand in for the live window, anchor the fixed-context
+ * derivation, or mark the post-compaction size.
+ *
+ * @param msg - An assistant record after the boundary
+ * @param boundary - The compact_boundary record
+ * @returns True when the record's usage belongs to the pre-compaction window
+ */
+function isPreCompactionCarryover(msg: SessionMessage, boundary: SessionMessage): boolean {
+  const msgTs = msg.timestamp ? Date.parse(msg.timestamp) : Number.NaN;
+  const boundaryTs = boundary.timestamp ? Date.parse(boundary.timestamp) : Number.NaN;
+  if (Number.isFinite(msgTs) && Number.isFinite(boundaryTs) && msgTs < boundaryTs) return true;
+  // The size test needs both ends of the compaction (postTokens is recorded
+  // since 2.1.119); a turn closer to the old window than to the compacted
+  // one was built before the compaction.
+  const pre = boundary.compactMetadata?.preTokens ?? 0;
+  const post = boundary.compactMetadata?.postTokens;
+  if (pre <= 0 || post === undefined || post >= pre) return false;
+  return effectiveInput(msg.message?.usage) > (pre + post) / 2;
 }
 
 /**
@@ -1651,6 +1689,7 @@ function detectViaHeuristic(messages: SessionMessage[]): CompactionEvent[] {
         tokensAfter: inputTokens,
         tokensDropped: prevInputTokens - inputTokens,
         detection: 'heuristic',
+        firstLiveIndex: i,
       });
     }
 
@@ -1705,6 +1744,30 @@ function computeEffectiveInputTokens(
     if (effective > 0) return effective + (usage.output_tokens ?? 0);
   }
   return null;
+}
+
+/**
+ * Size of the live window: the latest real turn's effective input plus its
+ * output, read only from turns built on the CURRENT window.
+ *
+ * Without a compaction that is simply the session's last real turn. After
+ * one, the scan starts at the first live post-compaction turn
+ * (`CompactionEvent.firstLiveIndex`): records carried over past the boundary
+ * still report the old window, and reading one right after a compaction put
+ * a 13K window at 82%. Before the first live turn exists, Claude Code's own
+ * post-compaction measurement (`postTokens`) is the window.
+ *
+ * @param messages - Session messages (the classifier's `effectiveMessages`)
+ * @param events - Compaction events detected on the same messages
+ * @returns Live window total in tokens, or null when no usable signal exists
+ */
+function liveWindowTokens(messages: SessionMessage[], events: CompactionEvent[]): number | null {
+  const last = events[events.length - 1];
+  if (!last) return computeEffectiveInputTokens(messages);
+  if (last.firstLiveIndex !== undefined) {
+    return computeEffectiveInputTokens(messages, last.firstLiveIndex);
+  }
+  return last.postTokens ?? null;
 }
 
 /**
@@ -2012,7 +2075,9 @@ export function classifySession(
   const configOverhead = computeConfigOverhead(configData, coreSchema.tokens);
 
   // Derive overhead values from THIS SESSION's API usage data
-  const derivedSystemPrompt = deriveInternalSystemPrompt(effectiveMessages, configData, coreSchema.tokens);
+  const derivedSystemPrompt = deriveInternalSystemPrompt(
+    effectiveMessages, classifiedMessages, compactionEvents, configData, coreSchema.tokens,
+  );
   // Add config overhead to session lifetime totals
   addConfigOverhead(categoryTokens, categoryAccuracy, configOverhead);
 
@@ -2058,10 +2123,11 @@ export function classifySession(
   // kept around for --verbose diagnostics. NOT the authoritative window size;
   // see `computeEffectiveInputTokens` for the canonical per-turn total.
   const contentSumTokens = Object.values(categoryTokens).reduce((a, b) => a + b, 0);
-  // Authoritative window size from the latest assistant turn's API usage.
-  // Falls back to the content sum when no usable usage data exists (fresh
-  // sessions, synthetic-only sessions, or fixtures without `usage` fields).
-  const effectiveInputTokens = computeEffectiveInputTokens(effectiveMessages);
+  // Authoritative window size from the latest live assistant turn's API
+  // usage (see `liveWindowTokens`). Falls back to the content sum when no
+  // usable usage data exists (fresh sessions, synthetic-only sessions, or
+  // fixtures without `usage` fields).
+  const effectiveInputTokens = liveWindowTokens(effectiveMessages, compactionEvents);
   const totalTokens = effectiveInputTokens ?? contentSumTokens;
 
   // Reconcile lifetime buckets to the API window total ONLY when the session
@@ -2313,7 +2379,9 @@ export function classifySession(
     const currentContentSum = Object.values(currentCategoryTokens).reduce((a, b) => a + b, 0);
     // Same API-first rule for the post-compaction slice — without this, heavy
     // multi-compact sessions display content-sum > context_limit (Bug #9).
-    const currentEffective = computeEffectiveInputTokens(effectiveMessages, startIndex);
+    // The live-window total already reads only post-compaction turns (or
+    // the recorded postTokens before the first one).
+    const currentEffective = effectiveInputTokens;
     const currentTotal = currentEffective ?? currentContentSum;
     // The current-context slice IS the live window, so reconciliation to the
     // API total is always attempted here (the guard band still applies).
@@ -2372,136 +2440,187 @@ export function classifySession(
 
 /**
  * Derive Claude Code's fixed context (the part not present in the JSONL)
- * from the first assistant message.
+ * from an ANCHOR turn: the first API turn whose whole window this file
+ * records.
  *
- * The first assistant message's effective input represents the TOTAL
- * context sent to the API before any conversation happened. Subtracting
- * every known component (CLAUDE.md, core tool schemas, memory, skills,
- * the first user message, and attachment records injected before the first
- * assistant turn) leaves the residual: the internal system prompt plus the
- * injected instructions that never appear in the session file.
+ * In a fresh session the anchor is the first assistant turn. Its effective
+ * input is the fixed context plus everything recorded before it: user-role
+ * records (the typed prompt, skill bodies, slash-command wrappers) and
+ * attachment records. When a compaction boundary precedes the first turn
+ * that was built from it (a continued session's file opens with the
+ * previous conversation's compaction followed by carried-over turns), the
+ * fresh view does not exist; the anchor is then the first live turn after a
+ * boundary, and its window opens at that boundary (compact summary,
+ * preserved and carried-over messages, re-injected attachments, the prompt).
+ * Anchoring on a carried-over record attributed a whole previous
+ * conversation to the fixed context (790,912 tokens).
  *
- * The residual is accepted when `1,000 <= derived <= totalInput`. There is
- * no absolute ceiling any more: the fixed context grew well past the old
- * 15K cap on current Claude Code versions (observed ~43K on 2.1.239), and
- * an absolute cap silently discarded the whole System component.
+ *   derived = anchor input - (CLAUDE.md + core tool schemas + memory
+ *             + skills + every recorded window record before the anchor)
+ *
+ * Accepted when `1,000 <= derived <= smallest live-turn input`: every live
+ * turn carries the fixed context, so it can never exceed the smallest live
+ * window (carried-over records are not live). Candidates are tried in order
+ * (the fresh window, then each compaction window) and the first accepted
+ * one wins. There is no absolute ceiling: the fixed context grew well past
+ * the old 15K cap on current Claude Code versions (observed ~43K on
+ * 2.1.239), and an absolute cap silently discarded the whole System
+ * component.
  *
  * Different sessions will produce different values depending on model,
  * system prompt version, and tool configuration at the time.
  *
  * @param messages - Parsed session messages
+ * @param classifiedMessages - Per-record classification of `messages`
+ * @param compactionEvents - Compaction events detected on `messages`
  * @param configData - Config data from scanner
  * @param coreSchemaTokens - Resolved core tool schema cost for this session
  * @returns Derivation result or null if insufficient data
  */
 function deriveInternalSystemPrompt(
   messages: SessionMessage[],
+  classifiedMessages: ClassifiedMessage[],
+  compactionEvents: CompactionEvent[],
   configData: ConfigData,
   coreSchemaTokens: number,
 ): DerivedOverhead['internalSystemPrompt'] {
-  // Find the first assistant message with non-zero effective input. On
-  // current Claude Code the first turn's input_tokens is typically 2 with
-  // the real context in cache_creation / cache_read, so the sum is what
-  // matters.
-  const firstAssistantIndex = messages.findIndex(
-    (m) => m.type === 'assistant' && effectiveInput(m.message?.usage) > 0,
-  );
-  if (firstAssistantIndex === -1) return null;
-  const firstAssistant = messages[firstAssistantIndex]!;
-  if (!firstAssistant.message?.usage) return null;
+  /** A real API turn with usage. On current Claude Code the first turn's
+   * input_tokens is typically 2 with the real context in cache_creation /
+   * cache_read, so the effective sum is what matters. */
+  const isUsageTurn = (m: SessionMessage): boolean =>
+    m.type === 'assistant' && m.message?.model !== '<synthetic>' && effectiveInput(m.message?.usage) > 0;
 
-  const totalInput = effectiveInput(firstAssistant.message.usage);
+  const firstUsageIndex = messages.findIndex(isUsageTurn);
+  if (firstUsageIndex === -1) return null;
 
-  // Known components
+  // Turns past a boundary but before its first live turn are carried over
+  // from the old window; they are neither anchors nor bound evidence.
+  const markerEvents = compactionEvents.filter((e) => e.detection === 'marker');
+  const carriedOver = new Set<number>();
+  for (let n = 0; n < markerEvents.length; n++) {
+    const e = markerEvents[n]!;
+    const end = e.firstLiveIndex ?? markerEvents[n + 1]?.beforeIndex ?? messages.length;
+    for (let j = e.beforeIndex + 1; j < end; j++) {
+      if (isUsageTurn(messages[j]!)) carriedOver.add(j);
+    }
+  }
+  let smallestLiveInput = Number.POSITIVE_INFINITY;
+  for (let k = 0; k < messages.length; k++) {
+    if (carriedOver.has(k) || !isUsageTurn(messages[k]!)) continue;
+    smallestLiveInput = Math.min(smallestLiveInput, effectiveInput(messages[k]!.message!.usage));
+  }
+
+  const candidates: Array<{ start: number; anchor: number; preserved: number[] }> = [];
+  const firstMarker = markerEvents[0];
+  if (!firstMarker || firstMarker.beforeIndex > firstUsageIndex) {
+    candidates.push({ start: 0, anchor: firstUsageIndex, preserved: [] });
+  }
+  for (const e of markerEvents) {
+    if (e.firstLiveIndex === undefined) continue;
+    candidates.push({
+      start: e.beforeIndex + 1,
+      anchor: e.firstLiveIndex,
+      preserved: (e.preservedMessageIndices ?? []).filter((p) => p < e.beforeIndex),
+    });
+  }
+
+  // Known components carried by every request
   const knownClaudeMd = configData.systemPrompt.totalEstimatedTokens;
   // Core schema cost resolved per session (calibration > version > legacy)
   const knownToolSchemas = coreSchemaTokens;
   const knownMemory = configData.memoryFiles.totalEstimatedTokens;
-
-  // Attachment records injected before the first assistant turn are part
-  // of its input but are classified (and counted) in their own right, so
-  // they are subtracted here to keep them out of the residual. A
-  // `skill_listing` attachment is the session's own record of the skills
-  // block and is preferred over the scanner's discovery estimate; it is
-  // counted as the skills component below, not again as a generic
-  // attachment. Sessions parsed without attachment records simply
-  // contribute 0 here.
-  let skillListingTokens = 0;
-  let knownAttachments = 0;
-  for (let i = 0; i < firstAssistantIndex; i++) {
-    const msg = messages[i]!;
-    if (msg.type !== 'attachment' || !msg.attachment) continue;
-    const tokens = estimateAttachmentTokens(msg);
-    if (msg.attachment.type === 'skill_listing' && skillListingTokens === 0) {
-      skillListingTokens = tokens;
-    } else {
-      knownAttachments += tokens;
-    }
-  }
-
-  // Skills: the session's skill_listing attachment when present, else the
-  // sum of discovered skills' estimated cost. Falls back to 476 (the
-  // historical /context ground-truth observation) when no skills are
-  // discovered, so sessions on machines without skills configured keep
-  // their prior derivation.
   const discoveredSkillTokens = configData.skills.totalEstimatedTokens;
-  const knownSkills = skillListingTokens > 0
-    ? skillListingTokens
-    : discoveredSkillTokens > 0 ? discoveredSkillTokens : 476;
 
-  // Estimate first user message tokens
-  let knownFirstUserMessage = 0;
-  const firstUser = messages.find(
-    (m) => m.type === 'user' && m.message?.role === 'user',
-  );
-  if (firstUser) {
-    const { tokens } = estimateMessageTokens(firstUser);
-    knownFirstUserMessage = tokens;
-  }
+  for (const candidate of candidates) {
+    const totalInput = effectiveInput(messages[candidate.anchor]!.message!.usage);
 
-  const totalKnown = knownClaudeMd + knownToolSchemas + knownMemory + knownSkills
-    + knownFirstUserMessage + knownAttachments;
-  const derived = totalInput - totalKnown;
+    // Window records before the anchor are part of its input but are
+    // classified (and counted) in their own right, so they are subtracted
+    // to keep them out of the residual. A `skill_listing` attachment is the
+    // session's own record of the skills block and is preferred over the
+    // scanner's discovery estimate; it is counted as the skills component,
+    // not again as a generic attachment.
+    let skillListingTokens = 0;
+    let knownAttachments = 0;
+    let knownFirstUserMessage = 0;
+    let knownCarriedOver = 0;
+    const windowIndices = [...candidate.preserved];
+    for (let k = candidate.start; k < candidate.anchor; k++) windowIndices.push(k);
+    for (const k of windowIndices) {
+      const msg = messages[k]!;
+      const tokens = classifiedMessages[k]?.tokens ?? 0;
+      if (msg.type === 'attachment') {
+        if (msg.attachment?.type === 'skill_listing' && skillListingTokens === 0) {
+          skillListingTokens = tokens;
+        } else {
+          knownAttachments += tokens;
+        }
+      } else if (msg.type === 'user' && msg.isCompactSummary !== true) {
+        knownFirstUserMessage += tokens;
+      } else {
+        knownCarriedOver += tokens;
+      }
+    }
 
-  // Sanity check: the fixed context must be at least 1K (anything smaller
-  // is estimation noise) and can never exceed the first turn's own input.
-  if (derived < 1000 || derived > totalInput) {
+    // Skills: the window's skill_listing attachment when present, else the
+    // sum of discovered skills' estimated cost. Falls back to 476 (the
+    // historical /context ground-truth observation) when no skills are
+    // discovered, so sessions on machines without skills configured keep
+    // their prior derivation.
+    const knownSkills = skillListingTokens > 0
+      ? skillListingTokens
+      : discoveredSkillTokens > 0 ? discoveredSkillTokens : 476;
+
+    const totalKnown = knownClaudeMd + knownToolSchemas + knownMemory + knownSkills
+      + knownFirstUserMessage + knownAttachments + knownCarriedOver;
+    const derived = totalInput - totalKnown;
+
+    // Sanity check: at least 1K (anything smaller is estimation noise) and
+    // never more than the smallest live window, which carries it too.
+    const ceiling = Math.min(totalInput, smallestLiveInput);
+    if (derived < 1000 || derived > ceiling) {
+      if (verbose) {
+        console.error(
+          `[CRUSTS debug] Fixed-context derivation out of range at turn ${candidate.anchor}: ${derived}`
+          + ` (anchor_input=${totalInput}, known=${totalKnown}, ceiling=${ceiling}). Skipping.`,
+        );
+      }
+      continue;
+    }
+
     if (verbose) {
       console.error(
-        `[CRUSTS debug] Fixed-context derivation out of range: ${derived}`
-        + ` (total_input=${totalInput}, known=${totalKnown}). Skipping.`,
+        `[CRUSTS derived] Claude Code fixed context: ${derived} tokens`
+        + ` (anchor_turn=${candidate.anchor}`
+        + `, anchor_input=${totalInput}`
+        + `, claude_md=${knownClaudeMd}`
+        + `, tool_schemas=${knownToolSchemas}`
+        + `, memory=${knownMemory}`
+        + `, skills=${knownSkills}`
+        + `, user_records=${knownFirstUserMessage}`
+        + `, attachments=${knownAttachments}`
+        + `, carried_over=${knownCarriedOver}`
+        + `, total_known=${totalKnown})`,
       );
     }
-    return null;
-  }
 
-  if (verbose) {
-    console.error(
-      `[CRUSTS derived] Claude Code fixed context: ${derived} tokens`
-      + ` (first_assistant_input=${totalInput}`
-      + `, claude_md=${knownClaudeMd}`
-      + `, tool_schemas=${knownToolSchemas}`
-      + `, memory=${knownMemory}`
-      + `, skills=${knownSkills}`
-      + `, first_user_msg=${knownFirstUserMessage}`
-      + `, attachments=${knownAttachments}`
-      + `, total_known=${totalKnown})`,
-    );
+    return {
+      tokens: derived,
+      derivation: {
+        firstAssistantInputTokens: totalInput,
+        knownClaudeMd,
+        knownToolSchemas,
+        knownMemory,
+        knownSkills,
+        knownFirstUserMessage,
+        knownAttachments,
+        knownCarriedOver,
+        anchorIndex: candidate.anchor,
+        totalKnown,
+      },
+    };
   }
-
-  return {
-    tokens: derived,
-    derivation: {
-      firstAssistantInputTokens: totalInput,
-      knownClaudeMd,
-      knownToolSchemas,
-      knownMemory,
-      knownSkills,
-      knownFirstUserMessage,
-      knownAttachments,
-      totalKnown,
-    },
-  };
+  return null;
 }
 
 /**

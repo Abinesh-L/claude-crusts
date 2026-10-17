@@ -767,7 +767,9 @@ describe('M6 core schema cost: calibration override > version table > legacy bas
     const b = classifySession(msgs, EMPTY_CONFIG);
     expect(b.compactionEvents.length).toBe(1);
     const currentTools = b.currentContext!.buckets.find((x) => x.category === 'tools')!;
-    expect(currentTools.tokens).toBe(20_500);
+    // Raw content basis: the version-keyed core cost lands unchanged (the
+    // reconciled `tokens` may be scaled to the 30K window).
+    expect(currentTools.contentTokens).toBe(20_500);
   });
 });
 
@@ -1548,9 +1550,27 @@ describe('M17 compaction event fidelity', () => {
     expect(events.length).toBe(1);
     expect(events[0]!.tokensAfter).toBe(12_867);
     expect(events[0]!.tokensDropped).toBe(843_784 - 12_867);
-    // afterIndex (the start of the new window slice) still comes from the scan.
-    expect(events[0]!.afterIndex).toBe(6);
+    expect(events[0]!.postTokens).toBe(12_867);
+    // The in-flight turn is not a live post-compaction turn: no live turn
+    // exists yet, so afterIndex keeps its fallback (the record after the
+    // boundary) and firstLiveIndex stays unset.
+    expect(events[0]!.firstLiveIndex).toBeUndefined();
+    expect(events[0]!.afterIndex).toBe(2);
     expect(events[0]!.trigger).toBe('auto');
+  });
+
+  test('the first live turn after an in-flight one becomes afterIndex', () => {
+    const msgs: SessionMessage[] = [
+      assistant(120_000),
+      boundaryWithMeta({ trigger: 'auto', preTokens: 843_784, postTokens: 12_867 }, 'b1'),
+      userText('u1'),
+      assistant(676_916), // in flight when compaction fired
+      userText('u2'),
+      assistant(14_000), // first turn built from the compacted window
+    ];
+    const events = detectCompactionEvents(msgs);
+    expect(events[0]!.firstLiveIndex).toBe(5);
+    expect(events[0]!.afterIndex).toBe(5);
   });
 
   test('the forward scan for tokensAfter has no 10-record cap', () => {
@@ -1948,5 +1968,127 @@ describe('review fix: framing derivation on split-line (thinking+text) turns', (
     const framing = b.derivedOverhead!.messageFraming;
     expect(framing).not.toBeNull();
     expect(framing!.tokensPerMessage).toBe(30);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.1: records carried over past a compaction boundary
+// ---------------------------------------------------------------------------
+
+describe('0.8.1: records carried over past a compaction boundary', () => {
+  /** Assistant turn whose whole effective input sits in cache_read. */
+  function turn(effective: number, ts: string, output = 200): SessionMessage {
+    return {
+      type: 'assistant',
+      timestamp: ts,
+      message: {
+        role: 'assistant',
+        model: 'claude-fable-5-1',
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: effective, output_tokens: output },
+      },
+    } as SessionMessage;
+  }
+  /** Manual compaction boundary with both recorded sizes. */
+  function boundary(pre: number, post: number, ts: string): SessionMessage {
+    return {
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: ts,
+      uuid: `b-${ts}`,
+      compactMetadata: { trigger: 'manual', preTokens: pre, postTokens: post },
+    } as SessionMessage;
+  }
+  /** A typed prompt with a timestamp. */
+  function typed(text: string, ts: string): SessionMessage {
+    return { type: 'user', timestamp: ts, message: { role: 'user', content: text } } as SessionMessage;
+  }
+
+  /**
+   * The shape of a continued session's file (seen on a real 2.1.261
+   * transcript): it opens with the previous conversation's compaction, then
+   * that conversation's last two turns (timestamped before the boundary,
+   * still carrying the old 821K window), then the first live turn.
+   */
+  function continued(): SessionMessage[] {
+    return [
+      boundary(855_909, 12_536, '2026-09-05T05:12:51.000Z'),
+      {
+        type: 'user',
+        timestamp: '2026-09-05T05:12:50.000Z',
+        isCompactSummary: true,
+        message: { role: 'user', content: 'This session is being continued from a previous conversation. ' + 's'.repeat(4_000) },
+      } as SessionMessage,
+      turn(821_214, '2026-09-05T05:09:45.000Z'),
+      turn(821_214, '2026-09-05T05:09:58.000Z'),
+      typed('next step please', '2026-09-05T05:13:00.000Z'),
+      turn(67_160, '2026-09-05T05:13:18.000Z'),
+    ];
+  }
+
+  test('the fixed-context derivation anchors on the first live turn, not a carried-over one', () => {
+    const b = classifySession(continued(), EMPTY_CONFIG);
+    const derived = b.derivedOverhead!.internalSystemPrompt;
+    expect(derived).not.toBeNull();
+    expect(derived!.derivation.anchorIndex).toBe(5);
+    expect(derived!.derivation.firstAssistantInputTokens).toBe(67_160);
+    // The summary and the carried-over turns are recorded content.
+    expect(derived!.derivation.knownCarriedOver).toBeGreaterThan(1_000);
+    expect(derived!.tokens).toBe(67_160 - derived!.derivation.totalKnown);
+    // Before the fix the 821K carried-over turn anchored it: ~820K of "fixed context".
+    expect(derived!.tokens).toBeLessThan(67_160);
+  });
+
+  test('the live window reads the first live turn, not the carried-over usage', () => {
+    const b = classifySession(continued(), EMPTY_CONFIG);
+    expect(b.compactionEvents[0]!.firstLiveIndex).toBe(5);
+    expect(b.compactionEvents[0]!.afterIndex).toBe(5);
+    expect(b.currentContext!.total_tokens).toBe(67_160 + 200);
+    expect(b.total_tokens).toBe(67_160 + 200);
+  });
+
+  test('before the first live turn the window is the recorded postTokens', () => {
+    // The prompt that fires the hook right after a compaction sees this shape.
+    const msgs = continued().slice(0, 5);
+    const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
+    expect(b.compactionEvents[0]!.firstLiveIndex).toBeUndefined();
+    expect(b.currentContext!.total_tokens).toBe(12_536);
+    expect(b.total_tokens).toBe(12_536);
+    expect(b.currentContext!.usage_percentage).toBeCloseTo((12_536 / b.context_limit) * 100, 6);
+    // No live turn means no anchor yet, so nothing is derived.
+    expect(b.derivedOverhead!.internalSystemPrompt).toBeNull();
+  });
+
+  test('a fresh session subtracts every user-role record before the first turn', () => {
+    // A slash command run before the first prompt and a skill body loaded
+    // with it travel in the first request too; counting only the first
+    // user record left them inside the fixed context.
+    const msgs: SessionMessage[] = [
+      machineUser('<command-name>/model</command-name>'),
+      machineUser('<local-command-stdout>Set model to Opus 5.5</local-command-stdout>'),
+      typed('w'.repeat(400), '2026-10-17T04:49:00.000Z'),
+      machineUser('k'.repeat(32_000), { isMeta: true }),
+      turn(60_000, '2026-10-17T04:49:30.000Z'),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    const derived = b.derivedOverhead!.internalSystemPrompt;
+    expect(derived).not.toBeNull();
+    expect(derived!.derivation.anchorIndex).toBe(4);
+    expect(derived!.derivation.knownFirstUserMessage).toBeGreaterThanOrEqual(8_100);
+    expect(derived!.tokens).toBe(60_000 - derived!.derivation.totalKnown);
+  });
+
+  test('a derivation larger than the smallest live window is rejected', () => {
+    // A first turn of 150K with almost nothing recorded would mean ~150K of
+    // fixed context, yet a later live window is 30K. The fixed context rides
+    // on every turn, so the derivation cannot be right.
+    const msgs: SessionMessage[] = [
+      typed('hi', '2026-10-17T01:00:00.000Z'),
+      turn(150_000, '2026-10-17T01:00:10.000Z'),
+      typed('again', '2026-10-17T01:01:00.000Z'),
+      turn(30_000, '2026-10-17T01:01:10.000Z'),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.derivedOverhead!.internalSystemPrompt).toBeNull();
   });
 });
