@@ -161,7 +161,7 @@ The category buckets are reconciled to the API's own window total, so they sum t
 Fully offline. Zero API calls. Zero token cost.
 
 **Core capabilities:**
-- **Auto-inject** — `hooks auto-inject enable` installs a hook that writes a session-specific `/compact focus` command and surfaces it in Claude's next reply when the window nears Claude Code's auto-compaction trigger (or your configured threshold). You paste, Claude runs it, context drops. Every fire logged to `~/.claude-crusts/auto-inject.log` for audit.
+- **Auto-inject** — `hooks auto-inject enable` installs a hook that writes a session-specific `/compact focus` command when the window nears Claude Code's auto-compaction trigger (or your configured threshold). You see a one-line notice with the command, and Claude surfaces it in its next reply. You run it, context drops. Every fire logged to `~/.claude-crusts/auto-inject.log` for audit.
 - **Active optimization** — `optimize --apply` writes `.claudeignore` and CLAUDE.md rules for you, with confirmation prompts and backups under `~/.claude-crusts/backups/`.
 - **6-category context breakdown** — Conversation, Retrieved, User, System, Tools, State/Memory. See exactly where your tokens are going.
 - **Waste detection** — duplicate file reads, unused tool schemas, stale content, resolved exchanges, cache overhead, unused tool results.
@@ -768,9 +768,11 @@ Not everyone wants context info after every response — this is strictly opt-in
 
 ### `claude-crusts hooks auto-inject <subcommand>`
 
-**CRUSTS writes your next `/compact` for you.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every user prompt, crusts silently analyses the session; if the live window is close to Claude Code's auto-compaction trigger (the trigger sits about 33K tokens below the window limit; the default gate fires within max(20K, 10% of the limit) of it) and the last injection was more than `minGapMs` ago (default 5 min), it prepends a targeted advisory to Claude's context — including a `/compact focus "..."` tuned to the top waste items in **this** session. Setting an explicit `threshold` (a usage percent) in config replaces the headroom gate.
+**CRUSTS writes your next `/compact` for you.** When enabled, crusts installs a `UserPromptSubmit` hook on Claude Code. Before every prompt, crusts silently analyses the session; if the live window is close to Claude Code's auto-compaction trigger (the trigger sits about 33K tokens below the auto-compact window, which is the context window unless you set one with `/autocompact` or `autoCompactWindow`; the default gate fires within max(20K, 10% of the limit) of it) and the last injection was more than `minGapMs` ago (default 5 min), it prepends a targeted advisory to Claude's context — including a `/compact focus "..."` tuned to the top waste items in **this** session. Setting an explicit `threshold` (a usage percent) in config replaces the headroom gate.
 
-Claude reads the advisory and surfaces the `/compact focus` command in its reply — you paste and run it. CRUSTS never executes `/compact` directly; that stays your call. Every fire is logged to `~/.claude-crusts/auto-inject.log` so you can audit exactly when the hook fired and what advisory it generated.
+You see a one-line notice with the usage and the command, and Claude surfaces the command in its reply. You run it. CRUSTS never executes `/compact` directly; that stays your call. Claude Code also fires the hook for background-task reports and `/loop` iterations, so the advisory can arrive on those turns too. Every fire is logged to `~/.claude-crusts/auto-inject.log` so you can audit exactly when the hook fired and what advisory it generated.
+
+**Idle compaction.** Since Claude Code 2.1.299, a conversation over 200K tokens that sits idle about 54 minutes can be compacted before its one-hour prompt cache expires. On a 1M window that usually happens long before any percentage threshold, so `analyze` warns when it applies, and the advisory says so. To keep compaction under your control, set `"idleCompaction": false` in `~/.claude/settings.json` (or use `/config`); your next message after a long break then re-reads the whole conversation from scratch.
 
 ```bash
 claude-crusts hooks auto-inject enable       # opt in, installs UserPromptSubmit hook
@@ -961,7 +963,7 @@ CRUSTS doesn't replace `/context` — it complements it. Use `/context` for a qu
 CRUSTS answers the question behind the number — not just "how full is my context?" but **"so what?"**
 
 - **"I'm at 75% context — but what's eating it?"** → CRUSTS breakdown shows Tools at 65%, Retrieved at 25%, Conversation at 5%. The problem isn't your chat — it's tool schemas and redundant file reads.
-- **"Why does auto-compaction keep surprising me?"** → CRUSTS models the trigger the way Claude Code actually behaves: auto-compaction fires when about 33K tokens of headroom remain (83.5% of a 200K window, 96.7% of 1M), not at a flat 80%. "Auto-compaction in ~48 messages." (Note: the check lands on turn boundaries — a heavy turn with multiple file reads can overshoot the trigger before it fires.)
+- **"Why does auto-compaction keep surprising me?"** → CRUSTS models the trigger the way Claude Code actually behaves: auto-compaction fires when about 33K tokens of headroom remain below the auto-compact window (83.5% of a 200K window, 96.7% of 1M, earlier if you set a smaller window with `/autocompact`), not at a flat 80%. It also tells you when idle compaction can strike: a 200K+ conversation left idle about 54 minutes. "Auto-compaction in ~48 messages." (Note: the check lands on turn boundaries — a heavy turn with multiple file reads can overshoot the trigger before it fires.)
 - **"Why is my quota depleting so fast?"** → CRUSTS flags cache overhead: when cache re-reads exceed 60% of input tokens, most of your quota is re-sending the same content every message — even at the 90% cache discount.
 - **"What can I actually DO about it?"** → Run `claude-crusts fix` — it generates three pasteable blocks: one to paste into your current session (tells Claude which files to stop re-reading), one to add to your CLAUDE.md (prevents the same waste next time), and one /compact command with a content-based focus hint describing what to preserve.
 
