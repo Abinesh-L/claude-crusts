@@ -14,7 +14,7 @@ import chalk from 'chalk';
 import Table from 'cli-table3';
 import { discoverSessions, parseSession } from './scanner.ts';
 import { analyzeSession, gatherConfigData } from './analyzer.ts';
-import { setVerbose, classifySession, countAnalyzedMessages } from './classifier.ts';
+import { setVerbose, classifySession } from './classifier.ts';
 import { runCalibration, renderCalibrationComparison } from './calibrator.ts';
 import { compareSessions } from './comparator.ts';
 import { generateSessionReport, generateComparisonReport } from './html-report.ts';
@@ -22,7 +22,16 @@ import { generateSessionReportMd, generateComparisonReportMd } from './md-report
 import { analyzeLostContent } from './lost-detector.ts';
 import { startWatch } from './watcher.ts';
 import { startTui } from './tui.ts';
-import { enableHooks, disableHooks, hooksStatus, enableAutoInject, disableAutoInject, autoInjectStatus } from './hooks.ts';
+import {
+  enableHooks,
+  disableHooks,
+  hooksStatus,
+  enableAutoInject,
+  disableAutoInject,
+  autoInjectStatus,
+  buildStatusSummary,
+  runStatusHook,
+} from './hooks.ts';
 import { runAutoInject, readInjectionLog } from './auto-inject.ts';
 import type { InjectionLogEntry } from './auto-inject.ts';
 import {
@@ -535,31 +544,27 @@ program
 
 program
   .command('status [session-id]')
-  .description('One-line context health summary (used by hooks)')
-  .action(async (sessionId: string | undefined, _options: unknown, cmd: Command) => {
+  .description('One-line context health summary (used by the Stop hook)')
+  .option('--hook', 'Run as the Claude Code Stop hook: read the hook payload on stdin, print {"systemMessage": "<status>"} or nothing')
+  .action(async (sessionId: string | undefined, options: { hook?: boolean }, cmd: Command) => {
     const globals = cmd.optsWithGlobals();
+    if (options.hook) {
+      await runStatusHook({ sessionId, basePath: globals.path, project: globals.project });
+      return;
+    }
+
     const session = resolveSession(sessionId, globals.path, globals.project);
     if (!session) return;
 
-    const messages = await parseSession(session.path);
-    if (messages.length === 0) return;
+    const summary = await buildStatusSummary(session.path);
+    if (!summary) return;
 
-    const configData = gatherConfigData();
-    const breakdown = classifySession(messages, configData);
-
-    const view = breakdown.currentContext ?? {
-      usage_percentage: breakdown.usage_percentage,
-    };
-    const pct = view.usage_percentage;
-    // Analyzed (non-attachment) rows only, so the hook-facing one-liner
-    // agrees with `analyze` on the same session (M11 exclusion rule).
-    const msgCount = countAnalyzedMessages(breakdown.messages);
-    const compCount = breakdown.compactionEvents.length;
-
-    const healthLabel = pct < 50 ? 'healthy' : pct < 70 ? 'warming' : pct < 85 ? 'hot' : 'critical';
-    const color = pct < 50 ? chalk.green : pct < 70 ? chalk.yellow : pct < 85 ? chalk.red : chalk.bgRed.white;
-
-    console.log(color(`CRUSTS: ${pct.toFixed(1)}% (${healthLabel}) | ${msgCount} msgs | ${compCount} compaction${compCount === 1 ? '' : 's'}`));
+    const color =
+      summary.health === 'healthy' ? chalk.green :
+      summary.health === 'warming' ? chalk.yellow :
+      summary.health === 'hot' ? chalk.red :
+      chalk.bgRed.white;
+    console.log(color(summary.line));
   });
 
 const hooksCmd = program
@@ -568,17 +573,17 @@ const hooksCmd = program
 
 hooksCmd
   .command('enable')
-  .description('Enable CRUSTS after-response hook in Claude Code')
+  .description('Install the Stop hook that shows context health after each Claude Code response')
   .action(() => enableHooks());
 
 hooksCmd
   .command('disable')
-  .description('Disable CRUSTS after-response hook')
+  .description('Remove the CRUSTS status hook (and the old Notification one) from Claude Code settings')
   .action(() => disableHooks());
 
 hooksCmd
   .command('status')
-  .description('Show whether CRUSTS hooks are installed')
+  .description('Show whether the CRUSTS status hook is installed, and any old Notification one')
   .action(() => hooksStatus());
 
 const autoInjectCmd = hooksCmd

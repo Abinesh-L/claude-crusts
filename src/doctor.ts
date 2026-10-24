@@ -21,6 +21,7 @@ import { discoverSessions, readLatestClaudeCodeVersion } from './scanner.ts';
 import { compareVersions } from './built-in-tools.ts';
 import { crustsSessionsDir } from './config.ts';
 import { loadSessionSummaries } from './session-summary.ts';
+import { detectStatusHooks } from './hooks.ts';
 import { VERSION } from './version.ts';
 import type { SessionInfo } from './types.ts';
 
@@ -216,27 +217,39 @@ function checkSettings(): DoctorCheck {
   return { name: 'Claude Code settings', status: 'pass', detail: 'settings.json parses cleanly.' };
 }
 
-/** Report hooks status based on settings + CRUSTS config cross-reference. */
+/** Report the status hook's install state from ~/.claude/settings.json. */
 function checkHooks(): DoctorCheck {
-  const settings = readSettings();
-  if (!settings) return { name: 'Hook integration', status: 'warn', detail: 'No settings.json — hook status unknown.' };
+  return checkHookIntegration(readSettings());
+}
 
-  const hooks = settings.hooks as Record<string, unknown[]> | undefined;
-  let installed = false;
-  if (hooks && typeof hooks === 'object') {
-    for (const entries of Object.values(hooks)) {
-      if (!Array.isArray(entries)) continue;
-      for (const entry of entries) {
-        const group = entry as { hooks?: { command?: string }[] };
-        if (!Array.isArray(group.hooks)) continue;
-        if (group.hooks.some((h) => h.command === 'claude-crusts status')) installed = true;
-      }
-    }
+/**
+ * The 'Hook integration' check for parsed settings.
+ *
+ * Passes with the Stop hook installed or with none (it is optional). Warns
+ * when the 0.8.1-and-earlier entry on the Notification event is still there:
+ * Claude Code discards that hook's output, so it shows nothing.
+ *
+ * @param settings - Parsed settings.json, or null when missing or unreadable
+ * @returns The check result
+ */
+export function checkHookIntegration(settings: Record<string, unknown> | null): DoctorCheck {
+  const name = 'Hook integration';
+  if (!settings) return { name, status: 'warn', detail: 'settings.json is missing or unreadable, so the hook state is unknown.' };
+
+  const { installed, legacy } = detectStatusHooks(settings);
+  if (legacy) {
+    return {
+      name,
+      status: 'warn',
+      detail: 'Old CRUSTS hook on the Notification event shows nothing (Claude Code discards its output). Run `claude-crusts hooks enable` to move it to Stop.',
+    };
   }
   return {
-    name: 'Hook integration',
+    name,
     status: 'pass',
-    detail: installed ? 'CRUSTS hook installed (after-response status).' : 'Not installed (optional). Run `claude-crusts hooks enable` to enable.',
+    detail: installed
+      ? 'CRUSTS Stop hook installed (context health after each response).'
+      : 'Not installed (optional). Run `claude-crusts hooks enable` to enable.',
   };
 }
 

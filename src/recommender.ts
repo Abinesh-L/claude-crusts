@@ -59,7 +59,7 @@ const HEALTH_THRESHOLDS = {
  * @param usagePercent - Current context usage as a percentage
  * @returns Context health classification
  */
-function getContextHealth(usagePercent: number): ContextHealth {
+export function getContextHealth(usagePercent: number): ContextHealth {
   if (usagePercent < HEALTH_THRESHOLDS.healthy) return 'healthy';
   if (usagePercent < HEALTH_THRESHOLDS.warming) return 'warming';
   if (usagePercent < HEALTH_THRESHOLDS.hot) return 'hot';
