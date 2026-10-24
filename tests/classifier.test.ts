@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { classifySession, countAnalyzedMessages, detectCompactionEvents, estimateAttachmentTokens, isHumanUserText, IMAGE_BLOCK_TOKENS } from '../src/classifier.ts';
 import { detectWaste } from '../src/waste-detector.ts';
 import type { SessionMessage, ConfigData, TokenUsage, ContentBlock, CrustsCategory } from '../src/types.ts';
+import { NEWER_TOKENIZER_FACTOR } from '../src/model-context.ts';
 
 function assistant(inputTokens: number): SessionMessage {
   return {
@@ -220,7 +221,7 @@ describe('Bug #9 — total_tokens uses API effective input', () => {
  */
 function currentShapeAssistant(
   usageOverrides: Partial<TokenUsage> = {},
-  extra: { version?: string; content?: ContentBlock[] } = {},
+  extra: { version?: string; content?: ContentBlock[]; model?: string } = {},
 ): SessionMessage {
   const usage: TokenUsage = {
     input_tokens: 2,
@@ -248,7 +249,7 @@ function currentShapeAssistant(
     message: {
       id: 'msg_011CeHBPHcNZYmmfxHse6wBd',
       role: 'assistant',
-      model: 'claude-fable-5',
+      model: extra.model ?? 'claude-fable-5',
       content: extra.content ?? [{ type: 'text', text: 'ok' }],
       usage,
     },
@@ -351,8 +352,8 @@ describe('M4 block estimation: signatures, images, documents', () => {
       { content: [{ type: 'thinking', thinking: 'plain words '.repeat(100), signature: 'E'.repeat(14_000) }] },
     );
     const b = classifySession([userText('hi'), withText], EMPTY_CONFIG);
-    // 1,200 chars of prose at 4.0 chars/token
-    expect(b.messages[1]!.tokens).toBe(300);
+    // 1,200 chars of prose at 4.0 chars/token, scaled for Fable 5's newer tokenizer
+    expect(b.messages[1]!.tokens).toBe(Math.round(300 * NEWER_TOKENIZER_FACTOR));
   });
 
   test('image block nested in a tool_result costs a flat IMAGE_BLOCK_TOKENS', () => {
@@ -1191,6 +1192,9 @@ describe('M10: derived fixed context', () => {
     builtInTools: { tools: [], totalEstimatedTokens: 9_055 },
     skills: { items: [], totalEstimatedTokens: 0 },
   };
+  /** A model from before Claude 4.7, as 2.1.92-era sessions ran on: its tokenizer keeps
+   * the base divisors, so the derivation arithmetic below is in plain estimates. */
+  const LEGACY_MODEL = 'claude-sonnet-4-5';
 
   test('fixed context of 43,352 (above the old 15K cap) is accepted and lands in System', () => {
     // First assistant effective input 2 + 18,938 + 35,299 = 54,239; known =
@@ -1198,7 +1202,7 @@ describe('M10: derived fixed context', () => {
     // first user 62 = 10,887. The old absolute 15K ceiling rejected this.
     const b = classifySession([
       userText('w'.repeat(248)),
-      currentShapeAssistant({}, { version: '2.1.92' }),
+      currentShapeAssistant({}, { version: '2.1.92', model: LEGACY_MODEL }),
     ], LEGACY_CONFIG);
     const derived = b.derivedOverhead!.internalSystemPrompt;
     expect(derived).not.toBeNull();
@@ -1224,7 +1228,7 @@ describe('M10: derived fixed context', () => {
         cache_creation_input_tokens: 500,
         cache_read_input_tokens: 0,
         cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 500 },
-      }, { version: '2.1.92' }),
+      }, { version: '2.1.92', model: LEGACY_MODEL }),
     ], LEGACY_CONFIG);
     expect(b.derivedOverhead!.internalSystemPrompt).toBeNull();
   });
@@ -1237,7 +1241,7 @@ describe('M10: derived fixed context', () => {
     const b = classifySession([
       skillListing,
       userText('w'.repeat(248)),
-      currentShapeAssistant({}, { version: '2.1.92' }),
+      currentShapeAssistant({}, { version: '2.1.92', model: LEGACY_MODEL }),
     ], LEGACY_CONFIG);
     const derived = b.derivedOverhead!.internalSystemPrompt;
     expect(derived).not.toBeNull();
@@ -1257,7 +1261,7 @@ describe('M10: derived fixed context', () => {
     const b = classifySession([
       hook(400),
       userText('w'.repeat(248)),
-      currentShapeAssistant({}, { version: '2.1.92' }),
+      currentShapeAssistant({}, { version: '2.1.92', model: LEGACY_MODEL }),
       hook(8_000),
     ], LEGACY_CONFIG);
     const derived = b.derivedOverhead!.internalSystemPrompt;
@@ -1890,10 +1894,12 @@ describe('review fix: currentContext slice starts right after the boundary recor
     expect(b.compactionEvents[0]!.afterIndex).toBe(7);
 
     const byCat = (cat: CrustsCategory) => cc.buckets.find((x) => x.category === cat)!;
-    // Raw content accounting: every skipped-before record now counts.
-    expect(byCat('system').contentTokens).toBe(10_000);   // the compact summary itself
-    expect(byCat('retrieved').contentTokens).toBe(2_000); // re-sent file attachment
-    expect(byCat('tools').contentTokens).toBe(3_010);     // task-notification
+    // Raw content accounting: every skipped-before record now counts (each
+    // estimate scaled for Opus 4.7's newer tokenizer).
+    const f = NEWER_TOKENIZER_FACTOR;
+    expect(byCat('system').contentTokens).toBe(Math.round(10_000 * f));   // the compact summary itself
+    expect(byCat('retrieved').contentTokens).toBe(Math.round(2_000 * f)); // re-sent file attachment
+    expect(byCat('tools').contentTokens).toBe(Math.round(3_010 * f));     // task-notification
     expect(byCat('user').contentTokens).toBe(1);
     expect(byCat('conversation').contentTokens).toBe(100);
   });
@@ -1901,12 +1907,14 @@ describe('review fix: currentContext slice starts right after the boundary recor
   test('including the interstitial records keeps the scale in band: basis api and buckets sum EXACTLY to total_tokens', () => {
     const b = classifySession(compactedWithInterstitials(), EMPTY_CONFIG);
     const cc = b.currentContext!;
-    // API window: 15,900 effective input + 100 output. Content sum 15,111
-    // -> scale ~1.05. With the old afterIndex slice the content sum was
-    // 100 (just the assistant), scale 160 -> out of band, reconciliation
-    // skipped, and the dashboard rows did not sum to TOTAL.
+    // API window: 15,900 effective input + 100 output. Content sum 19,614
+    // (15,111 at the base divisors, the estimates scaled 1.3x for Opus 4.7's
+    // tokenizer, the 100 exact output tokens not) -> scale ~0.82. With the old
+    // afterIndex slice the content sum was 100 (just the assistant), scale 160
+    // -> out of band, reconciliation skipped, and the dashboard rows did not
+    // sum to TOTAL.
     expect(cc.total_tokens).toBe(16_000);
-    expect(cc.contentSumTokens).toBe(15_111);
+    expect(cc.contentSumTokens).toBe(19_614);
     expect(cc.reconciliation!.basis).toBe('api');
     expect(cc.buckets.reduce((s, x) => s + x.tokens, 0)).toBe(cc.total_tokens);
   });
@@ -2197,10 +2205,11 @@ describe('0.8.1: attachments sized from the text Claude Code sent', () => {
       memoryFiles: { files: [], totalEstimatedTokens: 7_777 },
     };
     const b = classifySession([instructions, userText('go'), assistantWithCache(2, 40_000)], staleDisk);
-    // 8,800 sent chars = 2,200 tokens, split by file share: half auto-memory.
-    expect(b.buckets.find((x) => x.category === 'state')!.contentTokens).toBe(1_100);
-    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(1_100);
-    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownMemory).toBe(1_100);
+    // 8,800 sent chars = 2,200 tokens (2,860 on Opus 4.7's tokenizer), split by
+    // file share: half auto-memory.
+    expect(b.buckets.find((x) => x.category === 'state')!.contentTokens).toBe(Math.round(1_100 * NEWER_TOKENIZER_FACTOR));
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(Math.round(1_100 * NEWER_TOKENIZER_FACTOR));
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownMemory).toBe(Math.round(1_100 * NEWER_TOKENIZER_FACTOR));
   });
 });
 
@@ -2281,8 +2290,144 @@ describe('0.8.1 review fixes', () => {
       rendered: [{ content: 'y'.repeat(2_400) }],
     } as SessionMessage;
     const b = classifySession([full, userText('go'), assistantWithCache(2, 40_000), delta, userText('more'), assistantWithCache(2, 41_000)], EMPTY_CONFIG);
-    // Full: 1,000 tokens, half memory; delta: 600 tokens, all memory.
-    expect(b.buckets.find((x) => x.category === 'state')!.contentTokens).toBe(500 + 600);
-    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(500);
+    // Full: 1,000 tokens, half memory; delta: 600 tokens, all memory (each
+    // scaled for Opus 4.7's tokenizer).
+    const f = NEWER_TOKENIZER_FACTOR;
+    expect(b.buckets.find((x) => x.category === 'state')!.contentTokens).toBe(Math.round(500 * f) + Math.round(600 * f));
+    expect(b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(Math.round(500 * f));
+  });
+});
+
+describe('0.8.2: the recorded system prompt sizes the System bucket', () => {
+  /** A 2.1.300 prompt_snapshot attachment: never sent, so it costs 0 as an attachment. */
+  function snapshot(systemPrompt: unknown, ts: string): SessionMessage {
+    return {
+      type: 'attachment',
+      timestamp: ts,
+      version: '2.1.300',
+      attachment: { type: 'prompt_snapshot', systemPrompt, cliPrefix: 'You are Claude Code.' },
+    } as unknown as SessionMessage;
+  }
+  /** Assistant turn whose whole effective input sits in cache_read. */
+  function turn(effective: number, ts: string, output = 200): SessionMessage {
+    return {
+      type: 'assistant',
+      timestamp: ts,
+      version: '2.1.300',
+      message: {
+        role: 'assistant',
+        model: 'claude-fable-5-1',
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: effective, output_tokens: output },
+      },
+    } as SessionMessage;
+  }
+  function typed(text: string, ts: string): SessionMessage {
+    return { type: 'user', timestamp: ts, version: '2.1.300', message: { role: 'user', content: text } } as SessionMessage;
+  }
+  function boundary(pre: number, post: number, ts: string): SessionMessage {
+    return {
+      type: 'system', subtype: 'compact_boundary', timestamp: ts, uuid: `b-${ts}`, version: '2.1.300',
+      compactMetadata: { trigger: 'manual', preTokens: pre, postTokens: post },
+    } as SessionMessage;
+  }
+  /** A fresh session; the snapshot's cliPrefix (20 chars) + 7,980 chars = 8,000 chars = 2,000
+   * tokens at the text divisor, 2,600 on Fable 5.1's tokenizer. */
+  function session(withSnapshot: boolean): SessionMessage[] {
+    return [
+      ...(withSnapshot ? [snapshot(['a'.repeat(7_980)], '2026-10-20T10:00:00.000Z')] : []),
+      typed('p'.repeat(400), '2026-10-20T10:00:01.000Z'),
+      turn(40_000, '2026-10-20T10:00:05.000Z'),
+      typed('second prompt', '2026-10-20T10:01:00.000Z'),
+      turn(41_000, '2026-10-20T10:01:05.000Z'),
+    ];
+  }
+  const systemContent = (b: ReturnType<typeof classifySession>, current = false): number =>
+    (current ? b.currentContext!.buckets : b.buckets).find((x) => x.category === 'system')!.contentTokens ?? 0;
+
+  test('a recorded prompt replaces the derived residual in the System bucket', () => {
+    const plain = classifySession(session(false), EMPTY_CONFIG);
+    const recorded = classifySession(session(true), EMPTY_CONFIG);
+    const promptTokens = Math.round(2_000 * NEWER_TOKENIZER_FACTOR);
+    expect(recorded.derivedOverhead!.recordedSystemPrompt).toEqual({ tokens: promptTokens, chars: 8_000, index: 0 });
+    expect(plain.derivedOverhead!.recordedSystemPrompt).toBeNull();
+    // The derivation is unchanged: the snapshot is never sent, so it is not window content.
+    const derived = plain.derivedOverhead!.internalSystemPrompt!.tokens;
+    expect(recorded.derivedOverhead!.internalSystemPrompt!.tokens).toBe(derived);
+    expect(systemContent(plain) - systemContent(recorded)).toBe(derived - promptTokens);
+    // The window total is the API's either way.
+    expect(recorded.total_tokens).toBe(plain.total_tokens);
+  });
+
+  test('the post-compaction view carries the recorded prompt, and the pre-live estimate is unchanged', () => {
+    const tail = [
+      boundary(41_000, 9_000, '2026-10-20T11:00:00.000Z'),
+      { type: 'user', timestamp: '2026-10-20T11:00:01.000Z', version: '2.1.300', isCompactSummary: true,
+        message: { role: 'user', content: 's'.repeat(8_000) } } as SessionMessage,
+      typed('after the compaction', '2026-10-20T11:00:10.000Z'),
+    ];
+    const plain = classifySession([...session(false), ...tail], EMPTY_CONFIG);
+    const recorded = classifySession([...session(true), ...tail], EMPTY_CONFIG);
+    const derived = plain.derivedOverhead!.internalSystemPrompt!.tokens;
+    const promptTokens = recorded.derivedOverhead!.recordedSystemPrompt!.tokens;
+    expect(systemContent(plain, true) - systemContent(recorded, true)).toBe(derived - promptTokens);
+    // Before the first live turn the window is postTokens + the derived fixed
+    // context + re-attached files, with or without a recorded prompt.
+    expect(recorded.currentContext!.total_tokens).toBe(plain.currentContext!.total_tokens);
+  });
+
+  test('the latest snapshot wins, and text blocks are read too', () => {
+    const msgs = [
+      ...session(true),
+      snapshot([{ type: 'text', text: 'b'.repeat(3_980) }], '2026-10-20T10:02:00.000Z'),
+    ];
+    const b = classifySession(msgs, EMPTY_CONFIG);
+    expect(b.derivedOverhead!.recordedSystemPrompt).toEqual({ tokens: Math.round(1_000 * NEWER_TOKENIZER_FACTOR), chars: 4_000, index: 5 });
+  });
+});
+
+describe('0.8.2: estimates follow the tokenizer of the model each message ran on', () => {
+  const CONFIG: ConfigData = {
+    ...EMPTY_CONFIG,
+    systemPrompt: { files: [], totalEstimatedTokens: 1_000 },
+    builtInTools: { tools: [], totalEstimatedTokens: 9_055 },
+  };
+  /** A turn on `model` with an exact 50-token output and a cached 30K window. */
+  function turnOn(model: string, ts: string): SessionMessage {
+    return {
+      type: 'assistant',
+      timestamp: ts,
+      message: {
+        role: 'assistant',
+        model,
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 30_000, output_tokens: 50 },
+      },
+    } as SessionMessage;
+  }
+  /** 4,000 chars of prose: 1,000 tokens at the text divisor. */
+  const prompt = (): SessionMessage => userText('w'.repeat(4_000));
+
+  test('estimates scale 1.3x on Claude 4.7+, exact output tokens and the tool table do not', () => {
+    const older = classifySession([prompt(), turnOn('claude-opus-4-6', '2026-10-20T10:00:00.000Z')], CONFIG);
+    const newer = classifySession([prompt(), turnOn('claude-opus-4-7', '2026-10-20T10:00:00.000Z')], CONFIG);
+    expect(older.messages[0]!.tokens).toBe(1_000);
+    expect(newer.messages[0]!.tokens).toBe(Math.round(1_000 * NEWER_TOKENIZER_FACTOR));
+    expect(older.messages[1]!.tokens).toBe(50);
+    expect(newer.messages[1]!.tokens).toBe(50);
+    // The CLAUDE.md disk estimate scales with the session's model; the core tool table does not.
+    expect(older.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(1_000);
+    expect(newer.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd).toBe(Math.round(1_000 * NEWER_TOKENIZER_FACTOR));
+    expect(newer.derivedOverhead!.internalSystemPrompt!.derivation.knownToolSchemas)
+      .toBe(older.derivedOverhead!.internalSystemPrompt!.derivation.knownToolSchemas);
+  });
+
+  test('a model switch changes the scale from the switch on', () => {
+    const b = classifySession([
+      prompt(), turnOn('claude-opus-4-6', '2026-10-20T10:00:00.000Z'),
+      prompt(), turnOn('claude-opus-4-7', '2026-10-20T10:05:00.000Z'),
+    ], CONFIG);
+    expect(b.messages[0]!.tokens).toBe(1_000);
+    expect(b.messages[2]!.tokens).toBe(Math.round(1_000 * NEWER_TOKENIZER_FACTOR));
   });
 });

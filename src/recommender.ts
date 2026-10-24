@@ -528,16 +528,19 @@ function recommendTopConsumers(
     detail: `${tb.loadedTools.length} loaded, ${tb.usedTools.length} used`,
   });
 
-  // 3. System prompt (CLAUDE.md + derived internal). CLAUDE.md and memory
-  // use the figures the classifier used (the session's own instructions
-  // record when Claude Code wrote one), so this list and the buckets agree.
+  // 3. System prompt (CLAUDE.md + Claude Code's own prompt). Every figure is
+  // the one the classifier used: CLAUDE.md and memory from the session's own
+  // instructions record when Claude Code wrote one, and the recorded system
+  // prompt when there is one (else the derived figure), so this list and the
+  // buckets agree.
   const derivation = breakdown.derivedOverhead?.internalSystemPrompt?.derivation;
   const claudeMdTokens = derivation?.knownClaudeMd ?? configData.systemPrompt.totalEstimatedTokens;
-  const derivedPrompt = breakdown.derivedOverhead?.internalSystemPrompt?.tokens ?? 0;
+  const promptTokens = breakdown.derivedOverhead?.recordedSystemPrompt?.tokens
+    ?? breakdown.derivedOverhead?.internalSystemPrompt?.tokens ?? 0;
   consumers.push({
     name: 'System prompt',
-    tokens: claudeMdTokens + derivedPrompt,
-    detail: `CLAUDE.md ${claudeMdTokens.toLocaleString()} + internal ${derivedPrompt.toLocaleString()}`,
+    tokens: claudeMdTokens + promptTokens,
+    detail: `CLAUDE.md ${claudeMdTokens.toLocaleString()} + Claude Code ${promptTokens.toLocaleString()}`,
   });
 
   // 4. Compaction summary (if present): the most recent one is the summary

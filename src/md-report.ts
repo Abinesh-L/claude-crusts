@@ -182,10 +182,12 @@ export function generateSessionReportMd(result: AnalysisResult, fix: FixPrompts)
 
   // Derived overhead
   const derived = bd.derivedOverhead;
-  if (derived?.internalSystemPrompt || derived?.messageFraming) {
+  if (derived?.internalSystemPrompt || derived?.recordedSystemPrompt || derived?.messageFraming) {
     lines.push(`## Derived Overhead`);
     lines.push('');
-    if (derived.internalSystemPrompt) {
+    if (derived.recordedSystemPrompt) {
+      lines.push(`- Claude Code system prompt: ~${fmt(derived.recordedSystemPrompt.tokens)} tokens (recorded)`);
+    } else if (derived.internalSystemPrompt) {
       lines.push(`- Internal system prompt: ~${fmt(derived.internalSystemPrompt.tokens)} tokens`);
     }
     if (derived.messageFraming) {

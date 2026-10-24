@@ -362,9 +362,13 @@ export interface CompactionSettings {
   /** Per-model windows saved by `/autocompact` under `modelSettings`, keyed by
    * model ID; 'auto' means the model's tuned default */
   modelAutoCompactWindows?: Record<string, number | 'auto'>;
-  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW (floored at 100K, capped at 1M), which
-   * takes precedence over every setting */
+  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW (floored at 100K, capped at 1M) as
+   * Claude Code 2.1.304+ reads it (`k`/`M` suffixes accepted), which takes
+   * precedence over every setting */
   envAutoCompactWindow?: number;
+  /** The same variable as Claude Code before 2.1.304 read it (leading digits
+   * only, so `200k` meant the 100K floor); set only when the readings differ */
+  envAutoCompactWindowLegacy?: number;
   /** CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (1-100) */
   autoCompactPct?: number;
   /** False when `idleCompaction` is false or auto-compaction is off */
@@ -651,6 +655,21 @@ export interface DerivedOverhead {
       anchorIndex?: number;
       totalKnown: number;
     };
+  } | null;
+  /**
+   * Claude Code's own system prompt as the session recorded it (the latest
+   * `prompt_snapshot` attachment, 2.1.269+), sized at the text divisor. When
+   * present, the System bucket carries this instead of `internalSystemPrompt`:
+   * the derived figure is everything the anchor turn held beyond the
+   * estimated components, so it also holds their shortfall (24.0K against
+   * `/context`'s 3K on a 2.1.300 session). Absent on hand-built breakdowns.
+   */
+  recordedSystemPrompt?: {
+    tokens: number;
+    /** Characters of the recorded prompt (cliPrefix and every text block) */
+    chars: number;
+    /** Index of the prompt_snapshot record */
+    index: number;
   } | null;
   /** Per-message framing overhead derived from input_token deltas */
   messageFraming: {

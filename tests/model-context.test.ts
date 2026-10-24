@@ -16,6 +16,8 @@ import {
   modelFamily,
   detectContextCommandWindow,
   detectSettingsContextLimit,
+  tokenizerFactor,
+  NEWER_TOKENIZER_FACTOR,
 } from '../src/model-context.ts';
 
 function msg(input: number, cacheCreation = 0, cacheRead = 0) {
@@ -586,6 +588,16 @@ describe('0.8.1 review: compaction model matches Claude Code 2.1.302', () => {
     expect(resolveCompactionModel(200_000, 'claude-haiku-4-6', 0, settings).autoCompactWindow).toBe(200_000);
   });
 
+  test('a suffixed CLAUDE_CODE_AUTO_COMPACT_WINDOW means what the session\'s Claude Code read', () => {
+    // "200k": 200K from 2.1.304; earlier versions read 200 and raised it to the 100K floor.
+    const settings = { ...base, envAutoCompactWindow: 200_000, envAutoCompactWindowLegacy: 100_000 };
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, settings, '1h', '2.1.310'))
+      .toMatchObject({ autoCompactWindow: 200_000, windowSource: 'env', trigger: 167_000 });
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, settings, '1h', '2.1.303'))
+      .toMatchObject({ autoCompactWindow: 100_000, windowSource: 'env', trigger: 67_000 });
+    expect(resolveCompactionModel(1_000_000, 'claude-opus-5-5', 0, settings).autoCompactWindow).toBe(200_000);
+  });
+
   test('idle compaction only applies on a Claude Code version that has it', () => {
     expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h', '2.1.270').idle.applies).toBe(false);
     expect(resolveCompactionModel(1_000_000, 'claude-fable-5-1', 300_000, base, '1h', '2.1.289').idle.applies).toBe(true);
@@ -603,5 +615,21 @@ describe('0.8.1 review: compaction model matches Claude Code 2.1.302', () => {
     };
     expect(detectContextLimitFromUsage([copy])).toBe(1_000_000);
     expect(resolveContextLimitWithSignal('claude-sonnet-4-6', [copy])).toEqual({ limit: 1_000_000, signal: 'usage' });
+  });
+});
+
+describe('0.8.2 tokenizerFactor: Claude 4.7 and later count about 30% more tokens', () => {
+  test('models from Claude 4.7 on, and every Fable and Mythos, use the newer tokenizer', () => {
+    for (const id of ['claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-5-5', 'claude-sonnet-5', 'claude-haiku-5-5',
+      'claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5', 'claude-opus-4-7-20260101', 'claude-opus-4-7[1m]']) {
+      expect(tokenizerFactor(id)).toBe(NEWER_TOKENIZER_FACTOR);
+    }
+  });
+
+  test('earlier models and IDs that do not parse keep the base divisors', () => {
+    for (const id of ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5-20251001',
+      '<synthetic>', 'unknown', 'gpt-5', undefined]) {
+      expect(tokenizerFactor(id)).toBe(1);
+    }
   });
 });

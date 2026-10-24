@@ -84,6 +84,13 @@ export const IDLE_COMPACTION_SINCE = '2.1.286';
 const PCT_OUTPUT_HEADROOM_TOKENS = 20_000;
 
 /**
+ * First Claude Code version that reads `k` and `M` suffixes in
+ * CLAUDE_CODE_AUTO_COMPACT_WINDOW; earlier versions read `200k` as 200 and
+ * raised it to the 100K floor (see `parseAutoCompactWindowVariable`).
+ */
+export const AUTO_COMPACT_WINDOW_SUFFIXES_SINCE = '2.1.304';
+
+/**
  * Whether a dotted version is at or above another (numeric parts compared
  * in order; a missing part counts as 0).
  *
@@ -158,8 +165,14 @@ export function resolveCompactionModel(
 
   let window = limit;
   let windowSource: CompactionModel['windowSource'] = 'default';
-  if (settings?.envAutoCompactWindow) {
-    window = settings.envAutoCompactWindow;
+  // A suffixed CLAUDE_CODE_AUTO_COMPACT_WINDOW ("200k") means what the
+  // session's Claude Code made of it: 200K from 2.1.304, the 100K floor before.
+  const envWindow = settings?.envAutoCompactWindowLegacy !== undefined && claudeCodeVersion !== undefined
+    && !versionAtLeast(claudeCodeVersion, AUTO_COMPACT_WINDOW_SUFFIXES_SINCE)
+    ? settings.envAutoCompactWindowLegacy
+    : settings?.envAutoCompactWindow;
+  if (envWindow) {
+    window = envWindow;
     windowSource = 'env';
   } else {
     const perModel = modelId && settings?.modelAutoCompactWindows
@@ -324,6 +337,31 @@ export function getNativeContextLimit(modelId: string | undefined): number | nul
     return atLeast ? 1_000_000 : null;
   }
   return null;
+}
+
+/**
+ * How many more tokens Claude's newer tokenizer counts for the same text.
+ * Anthropic's token-counting docs: "Claude 4.7 and later models and Claude
+ * Mythos Preview use a newer tokenizer. The same input text produces
+ * approximately 30 percent more tokens than on earlier models", and Fable 5,
+ * Fable 5.1, Mythos 5 and Mythos 5.1 share it. crusts' character divisors
+ * (4.0 for text, 3.3 for code) were measured on the older tokenizer.
+ */
+export const NEWER_TOKENIZER_FACTOR = 1.3;
+
+/**
+ * Multiplier that turns crusts' character-based estimates into a model's
+ * tokens: NEWER_TOKENIZER_FACTOR for Claude 4.7 and later (every Fable and
+ * Mythos), 1 for earlier models and for IDs that do not parse.
+ *
+ * @param modelId - Model identifier (`claude-opus-5-5`, `claude-sonnet-4-6`)
+ * @returns The estimate multiplier
+ */
+export function tokenizerFactor(modelId: string | undefined): number {
+  const parsed = parseClaudeModelId(modelId);
+  if (!parsed) return 1;
+  if (parsed.family === 'fable' || parsed.family === 'mythos') return NEWER_TOKENIZER_FACTOR;
+  return parsed.major > 4 || (parsed.major === 4 && parsed.minor >= 7) ? NEWER_TOKENIZER_FACTOR : 1;
 }
 
 /**

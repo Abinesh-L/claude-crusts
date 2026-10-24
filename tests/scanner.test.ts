@@ -29,6 +29,7 @@ import {
   readSettingsModels,
   readCompactionSettings,
   collectObservedMcpServers,
+  parseAutoCompactWindowVariable,
 } from '../src/scanner.ts';
 import { classifySession, detectCompactionEvents } from '../src/classifier.ts';
 import { detectWaste } from '../src/waste-detector.ts';
@@ -978,6 +979,26 @@ describe('readCompactionSettings follows Claude Code 2.1.302 (0.8.1 review)', ()
     withTempHome(() => {
       expect(readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '50000' }).envAutoCompactWindow).toBe(100_000);
       expect(readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '5000000' }).envAutoCompactWindow).toBe(1_000_000);
+    });
+  });
+
+  test('the env window takes k and M suffixes (2.1.304+) and keeps the older reading', () => {
+    // Claude Code before 2.1.304 read only the leading digits: "200k" was 200, raised to 100K.
+    expect(parseAutoCompactWindowVariable('200k')).toEqual({ current: 200_000, legacy: 100_000 });
+    expect(parseAutoCompactWindowVariable('1M')).toEqual({ current: 1_000_000, legacy: 100_000 });
+    expect(parseAutoCompactWindowVariable('1.5m')).toEqual({ current: 1_000_000, legacy: 100_000 });
+    expect(parseAutoCompactWindowVariable(' 500000 ')).toEqual({ current: 500_000, legacy: 500_000 });
+    expect(parseAutoCompactWindowVariable('200kb')).toEqual({ legacy: 100_000 });
+    expect(parseAutoCompactWindowVariable('lots')).toEqual({});
+    expect(parseAutoCompactWindowVariable('0')).toEqual({});
+    expect(parseAutoCompactWindowVariable(undefined)).toEqual({});
+    withTempHome(() => {
+      const s = readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '200k' });
+      expect(s.envAutoCompactWindow).toBe(200_000);
+      expect(s.envAutoCompactWindowLegacy).toBe(100_000);
+      // Plain digits read the same on every version: no legacy reading kept.
+      expect(readCompactionSettings(undefined, { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '300000' }).envAutoCompactWindowLegacy)
+        .toBeUndefined();
     });
   });
 

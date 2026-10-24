@@ -757,23 +757,53 @@ export function readCompactionSettings(
   }
 
   const idleMin = tokens(variable('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS'));
-  const envWindowRaw = tokens(variable('CLAUDE_CODE_AUTO_COMPACT_WINDOW'));
-  const envAutoCompactWindow = envWindowRaw !== undefined
-    ? Math.min(1_000_000, Math.max(100_000, envWindowRaw))
-    : undefined;
+  const envWindow = parseAutoCompactWindowVariable(variable('CLAUDE_CODE_AUTO_COMPACT_WINDOW'));
   const pctRaw = Number(variable('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'));
   const autoCompactPct = Number.isFinite(pctRaw) && pctRaw > 0 && pctRaw <= 100 ? pctRaw : undefined;
   return {
     autoCompactEnabled,
     ...(autoCompactWindow !== undefined ? { autoCompactWindow } : {}),
     ...(Object.keys(modelAutoCompactWindows).length > 0 ? { modelAutoCompactWindows } : {}),
-    ...(envAutoCompactWindow !== undefined ? { envAutoCompactWindow } : {}),
+    ...(envWindow.current !== undefined ? { envAutoCompactWindow: envWindow.current } : {}),
+    ...(envWindow.legacy !== undefined && envWindow.legacy !== envWindow.current
+      ? { envAutoCompactWindowLegacy: envWindow.legacy }
+      : {}),
     ...(autoCompactPct !== undefined ? { autoCompactPct } : {}),
     idleCompaction: autoCompactEnabled && first('idleCompaction') !== false,
     idleCompactMinTokens: idleMin !== undefined
       ? Math.max(IDLE_COMPACT_FLOOR_TOKENS, idleMin)
       : IDLE_COMPACT_MIN_TOKENS,
     disable1m: flag(variable('CLAUDE_CODE_DISABLE_1M_CONTEXT')),
+  };
+}
+
+/**
+ * CLAUDE_CODE_AUTO_COMPACT_WINDOW as Claude Code reads it, clamped to
+ * [100K, 1M].
+ *
+ * From 2.1.304 the variable takes `k` and `M` suffixes like `--autocompact`
+ * (`200k`, `1.5M`). Earlier versions read only the leading digits, so
+ * `200k` became 200 and was raised to the 100K floor. Both readings are
+ * returned; `resolveCompactionModel` picks by the session's Claude Code
+ * version.
+ *
+ * @param raw - The variable's value, if set
+ * @returns `current` (2.1.304+ reading) and `legacy` (earlier reading), each
+ *   undefined when that version ignores the value
+ */
+export function parseAutoCompactWindowVariable(raw: string | undefined): { current?: number; legacy?: number } {
+  if (raw === undefined) return {};
+  const value = raw.trim();
+  const clamp = (n: number): number => Math.min(1_000_000, Math.max(100_000, Math.floor(n)));
+  const suffixed = value.match(/^(\d+(?:\.\d+)?)\s*([kKmM])?$/);
+  const amount = suffixed
+    ? Number(suffixed[1]) * (suffixed[2] === undefined ? 1 : suffixed[2].toLowerCase() === 'k' ? 1_000 : 1_000_000)
+    : Number.NaN;
+  const leading = value.match(/^\d+/);
+  const leadingDigits = leading ? Number(leading[0]) : Number.NaN;
+  return {
+    ...(Number.isFinite(amount) && amount > 0 ? { current: clamp(amount) } : {}),
+    ...(Number.isFinite(leadingDigits) && leadingDigits > 0 ? { legacy: clamp(leadingDigits) } : {}),
   };
 }
 

@@ -39,7 +39,7 @@ import type {
   ModelHistory,
   ModelSegment,
 } from './types.ts';
-import { resolveContextLimitWithSignal, resolveCompactionModel, latestCacheTtl, effectiveInput, cacheCreationTokens, modelFamily } from './model-context.ts';
+import { resolveContextLimitWithSignal, resolveCompactionModel, latestCacheTtl, effectiveInput, cacheCreationTokens, modelFamily, tokenizerFactor } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
 import { resolveCoreSchemaTokens, deferredLoadCost, isMcpToolName, mcpServerName, compareVersions } from './built-in-tools.ts';
@@ -380,10 +380,14 @@ const RENDERED_ATTACHMENTS_SINCE = '2.1.268';
  * CLAUDE.md to 0 after every resume.
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
+ * @param factor - Tokenizer factor of the session's model (see `tokenizerFactor`)
  * @returns System and memory token costs, or null when no instructions
  *   attachment with sent text exists
  */
-function instructionsOverhead(messages: SessionMessage[]): { systemTokens: number; memoryTokens: number } | null {
+function instructionsOverhead(
+  messages: SessionMessage[],
+  factor = 1,
+): { systemTokens: number; memoryTokens: number } | null {
   /** System and memory tokens of one attachment's sent text. */
   const split = (msg: SessionMessage): { systemTokens: number; memoryTokens: number } => {
     let sentChars = 0;
@@ -403,7 +407,7 @@ function instructionsOverhead(messages: SessionMessage[]): { systemTokens: numbe
       }
     }
     const memoryShare = memoryChars + otherChars > 0 ? memoryChars / (memoryChars + otherChars) : 0;
-    const total = sentChars / CHARS_PER_TOKEN_TEXT;
+    const total = (sentChars / CHARS_PER_TOKEN_TEXT) * factor;
     const memoryTokens = Math.round(total * memoryShare);
     return { systemTokens: Math.round(total) - memoryTokens, memoryTokens };
   };
@@ -428,6 +432,52 @@ function instructionsOverhead(messages: SessionMessage[]): { systemTokens: numbe
     total.memoryTokens += part.memoryTokens;
   }
   return total;
+}
+
+/**
+ * Claude Code's own system prompt as the session recorded it.
+ *
+ * From 2.1.269 Claude Code writes a `prompt_snapshot` attachment holding the
+ * system prompt it sends (`systemPrompt`, an array of text blocks, after the
+ * `cliPrefix` line) and its tool schemas. The snapshot is never sent itself
+ * (it has no `rendered`, so it costs 0 as an attachment), but it is the one
+ * copy of the system prompt in the transcript. The latest snapshot is the
+ * prompt the live window carries, and it is sized like any other text.
+ *
+ * Without a snapshot the system prompt can only be derived as a residual
+ * (see `deriveInternalSystemPrompt`), and that residual also holds every
+ * under-estimate of the content around its anchor turn: on a 2.1.300 session
+ * it read 24.0K where `/context` showed 3K for the system prompt.
+ *
+ * @param messages - Session messages (the classifier's `effectiveMessages`)
+ * @param factor - Tokenizer factor of the session's model (see `tokenizerFactor`)
+ * @returns Token estimate, character count and record index, or null when no
+ *   snapshot with system prompt text was recorded
+ */
+function recordedSystemPrompt(
+  messages: SessionMessage[],
+  factor = 1,
+): { tokens: number; chars: number; index: number } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!;
+    if (msg.type !== 'attachment' || msg.attachment?.type !== 'prompt_snapshot') continue;
+    const snapshot = msg.attachment as { systemPrompt?: unknown; cliPrefix?: unknown };
+    const blocks = Array.isArray(snapshot.systemPrompt) ? snapshot.systemPrompt : [snapshot.systemPrompt];
+    let chars = typeof snapshot.cliPrefix === 'string' ? snapshot.cliPrefix.length : 0;
+    let found = false;
+    for (const block of blocks) {
+      const text = typeof block === 'string'
+        ? block
+        : block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+          ? (block as { text: string }).text
+          : null;
+      if (text === null) continue;
+      chars += text.length;
+      found = true;
+    }
+    if (found) return { tokens: Math.round((chars / CHARS_PER_TOKEN_TEXT) * factor), chars, index: i };
+  }
+  return null;
 }
 
 /**
@@ -2189,6 +2239,45 @@ export function classifySession(
   const lineGroups = groupAssistantLines(effectiveMessages);
   const apportionedOutput = buildApportionedTokens(effectiveMessages, lineGroups);
 
+  // Resolve the model ID and full session model history.
+  //
+  // `modelHistory` walks every non-synthetic assistant turn in order and
+  // groups contiguous runs of the same model into segments, recording the
+  // API token flows for each segment. When the user switches Claude models
+  // mid-session (e.g. sonnet → opus), each switch closes one segment and
+  // opens another — the chronological flow is preserved, not collapsed.
+  //
+  // `breakdown.model` reports the CURRENT model (the last non-synthetic
+  // assistant) rather than the first, which is more useful as an "at-a-glance
+  // what am I on?" label. The first model is still accessible via
+  // `modelHistory.segments[0].model`.
+  //
+  // A live override (Claude Code's statusline payload — which preserves the
+  // `[1m]` variant JSONL strips) takes precedence when supplied.
+  const modelHistory = computeModelHistory(effectiveMessages, lineGroups);
+  // Before the first response there is no assistant model yet, but Claude
+  // Code's `model` attachment already names it (identity.modelId), so a
+  // fresh native-1M session is not sized at the 200K default.
+  const model = modelOverride
+    ?? (modelHistory.current !== 'unknown' ? modelHistory.current : announcedModel(effectiveMessages) ?? 'unknown');
+  // Contiguous same-model spans covering every message index.
+  const modelSpans = computeModelSpans(effectiveMessages, modelHistory);
+
+  // crusts' character divisors were measured on Claude's older tokenizer;
+  // Claude 4.7 and later count about 30% more tokens for the same text. So
+  // every content estimate is scaled by the tokenizer of the model its
+  // message ran on, and the config overhead by the current model's. Exact
+  // API figures (output tokens, usage) and the core tool schema table, read
+  // off /context, are not scaled.
+  const currentFactor = tokenizerFactor(model);
+  // The classification loop asks in index order, so one cursor walks the spans.
+  let spanCursor = 0;
+  const factorAt = (index: number): number => {
+    while (spanCursor < modelSpans.length - 1 && index > modelSpans[spanCursor]!.end) spanCursor++;
+    const spanModel = modelSpans[spanCursor]?.model;
+    return spanModel && spanModel !== 'unknown' ? tokenizerFactor(spanModel) : currentFactor;
+  };
+
   // Classify each message
   const classifiedMessages: ClassifiedMessage[] = [];
   let cumulative = 0;
@@ -2210,7 +2299,10 @@ export function classifySession(
     const estimate = apportioned !== undefined
       ? { tokens: apportioned, accuracy: 'estimated' as const }
       : estimateMessageTokens(msg);
-    let tokens = estimate.tokens;
+    // Apportioned lines split an exact API sum, so only content estimates scale.
+    let tokens = apportioned === undefined && estimate.accuracy === 'estimated'
+      ? Math.round(estimate.tokens * factorAt(i))
+      : estimate.tokens;
     let accuracy = estimate.accuracy;
 
     // ToolSearch results materialise deferred schemas into the request's
@@ -2288,8 +2380,8 @@ export function classifySession(
   // Config overhead tokens (added to both lifetime and current context).
   // The session's own `instructions` attachment (2.1.268+) replaces the disk
   // copies of CLAUDE.md and memory when it was recorded.
-  const configOverhead = computeConfigOverhead(configData, coreSchema.tokens);
-  const recordedInstructions = instructionsOverhead(effectiveMessages);
+  const configOverhead = computeConfigOverhead(configData, coreSchema.tokens, currentFactor);
+  const recordedInstructions = instructionsOverhead(effectiveMessages, currentFactor);
   if (recordedInstructions) {
     configOverhead.systemTokens = recordedInstructions.systemTokens;
     configOverhead.memoryTokens = recordedInstructions.memoryTokens;
@@ -2298,13 +2390,22 @@ export function classifySession(
   // Derive overhead values from THIS SESSION's API usage data
   const derivedSystemPrompt = deriveInternalSystemPrompt(
     effectiveMessages, classifiedMessages, compactionEvents, configData, coreSchema.tokens, configOverhead,
+    currentFactor,
   );
+  // The System bucket carries Claude Code's own system prompt: the recorded
+  // copy when the session has one (2.1.269+), else the derived residual. The
+  // residual is everything the anchor turn held beyond the estimated
+  // components, so with a recorded prompt the rest of it is those estimates'
+  // shortfall, which reconciliation to the API total spreads over every
+  // bucket instead of piling it onto System.
+  const recordedPrompt = recordedSystemPrompt(effectiveMessages, currentFactor);
+  const systemPromptTokens = recordedPrompt?.tokens ?? derivedSystemPrompt?.tokens ?? 0;
   // Add config overhead to session lifetime totals
   addConfigOverhead(categoryTokens, categoryAccuracy, configOverhead);
 
-  // Add derived internal system prompt to System bucket
-  if (derivedSystemPrompt) {
-    categoryTokens.system += derivedSystemPrompt.tokens;
+  // Add Claude Code's system prompt to the System bucket
+  if (systemPromptTokens > 0) {
+    categoryTokens.system += systemPromptTokens;
     categoryAccuracy.system = 'estimated';
   }
 
@@ -2348,7 +2449,10 @@ export function classifySession(
   // usage (see `liveWindowTokens`). Falls back to the content sum when no
   // usable usage data exists (fresh sessions, synthetic-only sessions, or
   // fixtures without `usage` fields).
-  const fixedContextTokens = (derivedSystemPrompt?.tokens ?? 0) + configOverhead.systemTokens
+  // The pre-live estimate keeps the derived figure even when the prompt was
+  // recorded: anchored on the exact first request, it also carries the
+  // estimates' shortfall, which offsets the chars/4 basis of `postTokens`.
+  const fixedContextTokens = (derivedSystemPrompt?.tokens ?? recordedPrompt?.tokens ?? 0) + configOverhead.systemTokens
     + configOverhead.toolTokens + configOverhead.mcpTokens + configOverhead.memoryTokens;
   const effectiveInputTokens = liveWindowTokens(
     effectiveMessages, compactionEvents, classifiedMessages, fixedContextTokens,
@@ -2458,35 +2562,12 @@ export function classifySession(
     };
   }
 
-  // Resolve the model ID and full session model history.
-  //
-  // `modelHistory` walks every non-synthetic assistant turn in order and
-  // groups contiguous runs of the same model into segments, recording the
-  // API token flows for each segment. When the user switches Claude models
-  // mid-session (e.g. sonnet → opus), each switch closes one segment and
-  // opens another — the chronological flow is preserved, not collapsed.
-  //
-  // `breakdown.model` reports the CURRENT model (the last non-synthetic
-  // assistant) rather than the first, which is more useful as an "at-a-glance
-  // what am I on?" label. The first model is still accessible via
-  // `modelHistory.segments[0].model`.
-  //
-  // A live override (Claude Code's statusline payload — which preserves the
-  // `[1m]` variant JSONL strips) takes precedence when supplied.
-  const modelHistory = computeModelHistory(effectiveMessages, lineGroups);
-  // Before the first response there is no assistant model yet, but Claude
-  // Code's `model` attachment already names it (identity.modelId), so a
-  // fresh native-1M session is not sized at the 200K default.
-  const model = modelOverride
-    ?? (modelHistory.current !== 'unknown' ? modelHistory.current : announcedModel(effectiveMessages) ?? 'unknown');
-
   // Window size is a property of the MODEL RUN, not the compaction window:
   // compaction never resizes the window, but a mid-session model switch
-  // can. Partition the session into contiguous same-model spans and
-  // resolve each compaction event's limit from the signals of every span
-  // of the model its window ran on, so pre-switch 200K events keep their
-  // own limit instead of inheriting the current model's window.
-  const modelSpans = computeModelSpans(effectiveMessages, modelHistory);
+  // can. Each compaction event's limit is resolved from the signals of
+  // every span of the model its window ran on (`modelSpans`, computed before
+  // classification), so pre-switch 200K events keep their own limit instead
+  // of inheriting the current model's window.
   const lastSpan = modelSpans[modelSpans.length - 1]!;
   // Evidence for one model's window is not confined to one contiguous run:
   // after fable -> opus-4-8 -> fable -> opus-4-8, the last opus-4-8 run
@@ -2621,9 +2702,9 @@ export function classifySession(
     // Add same config overhead to current context
     addConfigOverhead(currentCategoryTokens, currentCategoryAccuracy, configOverhead);
 
-    // Add derived overhead to current context too
-    if (derivedSystemPrompt) {
-      currentCategoryTokens.system += derivedSystemPrompt.tokens;
+    // Add Claude Code's system prompt to the current context too
+    if (systemPromptTokens > 0) {
+      currentCategoryTokens.system += systemPromptTokens;
       currentCategoryAccuracy.system = 'estimated';
     }
     if (derivedFraming && derivedFraming.tokensPerMessage > 0) {
@@ -2708,6 +2789,7 @@ export function classifySession(
     currentContext,
     derivedOverhead: {
       internalSystemPrompt: derivedSystemPrompt,
+      recordedSystemPrompt: recordedPrompt,
       messageFraming: derivedFraming,
     },
     compaction,
@@ -2757,6 +2839,8 @@ export function classifySession(
  * @param coreSchemaTokens - Resolved core tool schema cost for this session
  * @param overhead - The session's config overhead (CLAUDE.md and memory from
  *   its own instructions attachment when recorded, else from disk)
+ * @param factor - Tokenizer factor for the disk skills estimate (see
+ *   `tokenizerFactor`); the classified records and `overhead` are scaled already
  * @returns Derivation result or null if insufficient data
  */
 function deriveInternalSystemPrompt(
@@ -2766,6 +2850,7 @@ function deriveInternalSystemPrompt(
   configData: ConfigData,
   coreSchemaTokens: number,
   overhead: ConfigOverhead,
+  factor = 1,
 ): DerivedOverhead['internalSystemPrompt'] {
   /** A real API turn with usage. On current Claude Code the first turn's
    * input_tokens is typically 2 with the real context in cache_creation /
@@ -2813,7 +2898,7 @@ function deriveInternalSystemPrompt(
   // Core schema cost resolved per session (calibration > version > legacy)
   const knownToolSchemas = coreSchemaTokens;
   const knownMemory = overhead.memoryTokens;
-  const discoveredSkillTokens = configData.skills.totalEstimatedTokens;
+  const discoveredSkillTokens = Math.round(configData.skills.totalEstimatedTokens * factor);
 
   for (const candidate of candidates) {
     const totalInput = effectiveInput(messages[candidate.anchor]!.message!.usage);
@@ -3049,14 +3134,17 @@ interface ConfigOverhead {
  *
  * @param configData - Config data from scanner
  * @param coreSchemaTokens - Core tool schema cost resolved for this session
+ * @param factor - Tokenizer factor for the disk estimates of CLAUDE.md and
+ *   memory (see `tokenizerFactor`); the schema figures are not estimates of
+ *   text and are not scaled
  * @returns Overhead token values per category
  */
-function computeConfigOverhead(configData: ConfigData, coreSchemaTokens: number): ConfigOverhead {
+function computeConfigOverhead(configData: ConfigData, coreSchemaTokens: number, factor = 1): ConfigOverhead {
   return {
-    systemTokens: configData.systemPrompt.totalEstimatedTokens,
+    systemTokens: Math.round(configData.systemPrompt.totalEstimatedTokens * factor),
     toolTokens: coreSchemaTokens,
     mcpTokens: configData.mcpServers.reduce((sum, s) => sum + s.estimatedSchemaTokens, 0),
-    memoryTokens: configData.memoryFiles.totalEstimatedTokens,
+    memoryTokens: Math.round(configData.memoryFiles.totalEstimatedTokens * factor),
   };
 }
 

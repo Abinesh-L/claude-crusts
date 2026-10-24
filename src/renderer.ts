@@ -283,9 +283,12 @@ export function renderAnalysis(
   // Derivation details and transparency note
   console.log(chalk.bold('\u2551') + ' '.repeat(62) + chalk.bold('\u2551'));
   const derived = breakdown.derivedOverhead;
-  if (derived?.internalSystemPrompt || derived?.messageFraming) {
+  if (derived?.internalSystemPrompt || derived?.recordedSystemPrompt || derived?.messageFraming) {
     console.log(chalk.bold('\u2551') + chalk.dim('  Derived from this session\'s API data:'.padEnd(62)) + chalk.bold('\u2551'));
-    if (derived.internalSystemPrompt) {
+    if (derived.recordedSystemPrompt) {
+      const spLine = `    Claude Code system prompt: ~${derived.recordedSystemPrompt.tokens.toLocaleString()} tokens (recorded)`;
+      console.log(chalk.bold('\u2551') + chalk.dim(spLine.padEnd(62)) + chalk.bold('\u2551'));
+    } else if (derived.internalSystemPrompt) {
       const sp = derived.internalSystemPrompt;
       const spLine = `    Internal system prompt: ~${sp.tokens.toLocaleString()} tokens`;
       console.log(chalk.bold('\u2551') + chalk.dim(spLine.padEnd(62)) + chalk.bold('\u2551'));

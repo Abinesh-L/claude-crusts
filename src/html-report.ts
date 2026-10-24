@@ -466,10 +466,12 @@ ${hasCompaction ? `<p class="meta" style="color:#ffb300">${bd.compactionEvents.l
 
   // Derived overhead
   const derived = bd.derivedOverhead;
-  if (derived?.internalSystemPrompt || derived?.messageFraming) {
+  if (derived?.internalSystemPrompt || derived?.recordedSystemPrompt || derived?.messageFraming) {
     html += `<h2>Derived Overhead</h2>
 <div class="card" style="color:#888;font-size:0.85rem">`;
-    if (derived.internalSystemPrompt) {
+    if (derived.recordedSystemPrompt) {
+      html += `<p>Claude Code system prompt: ~${fmt(derived.recordedSystemPrompt.tokens)} tokens (recorded)</p>`;
+    } else if (derived.internalSystemPrompt) {
       html += `<p>Internal system prompt: ~${fmt(derived.internalSystemPrompt.tokens)} tokens</p>`;
     }
     if (derived.messageFraming) {
