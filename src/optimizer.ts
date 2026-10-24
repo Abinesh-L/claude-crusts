@@ -33,6 +33,8 @@ import { copyToClipboard } from './clipboard.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
 import { loadWasteThresholds, stripBom, writeFileAtomic } from './config.ts';
 import type { CrustsBreakdown, WasteItem, ConfigData, SessionMessage } from './types.ts';
+import { sessionClaudeMd, claudeMdLabel, CLAUDE_MD_SPLIT_ADVICE } from './classifier.ts';
+import { compactTargets } from './waste-detector.ts';
 
 /**
  * Noise paths that shouldn't be re-read into context repeatedly.
@@ -399,7 +401,7 @@ function joinNames(names: string[]): string {
  * strings on the same session.
  */
 export function buildCompactFocus(waste: WasteItem[]): { text: string; savings: number } | null {
-  const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
+  const top = compactTargets(waste);
   if (top.length === 0) return null;
 
   const targets: string[] = [];
@@ -561,20 +563,25 @@ export function buildOptimizeReport(
     });
   }
 
-  // 5. claudemd-oversized — system-prompt CLAUDE.md bloat
+  // 5. claudemd-oversized: the CLAUDE.md files the session loads at startup
   const claudeMdThreshold = loadWasteThresholds().claudeMdOversizedThreshold
     ?? CLAUDE_MD_OVERSIZED_THRESHOLD_DEFAULT;
-  const claudeMdTokens = configData.systemPrompt.totalEstimatedTokens;
+  const claudeMd = sessionClaudeMd(breakdown, configData);
+  const claudeMdTokens = claudeMd.tokens;
   if (claudeMdTokens > claudeMdThreshold) {
     const excess = claudeMdTokens - claudeMdThreshold;
     if (excess >= minSavings) {
+      const largest = claudeMd.files
+        .slice(0, 3)
+        .map((f) => `${claudeMdLabel(f.path)} ~${f.tokens.toLocaleString()} tokens`)
+        .join(', ');
       fixes.push({
         id: nextId++,
         kind: 'claudemd-oversized',
-        title: `CLAUDE.md is ${claudeMdTokens.toLocaleString()} tokens (recommended <${claudeMdThreshold.toLocaleString()})`,
-        description: 'Consider moving large reference sections (constants tables, file-responsibility lists) to CLAUDE.local.md (project-local, not committed).',
+        title: `CLAUDE.md files are ${claudeMdTokens.toLocaleString()} tokens (recommended <${claudeMdThreshold.toLocaleString()})`,
+        description: `${largest ? `Largest: ${largest}. ` : ''}Large reference sections (constants tables, file-responsibility lists) are the usual candidates. ${CLAUDE_MD_SPLIT_ADVICE}`,
         estimatedSavings: excess,
-        action: 'Review CLAUDE.md manually — no safe auto-trim in v1.',
+        action: 'Review the CLAUDE.md files by hand; there is no safe automatic trim.',
         autoApplicable: false,
       });
     }

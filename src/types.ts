@@ -849,6 +849,28 @@ export interface CrustsBreakdown {
    * breakdowns; consumers then fall back to the window minus the buffer.
    */
   compaction?: CompactionModel;
+  /**
+   * The CLAUDE.md files the session loads at startup and their size, set by
+   * classifySession. Absent on hand-built breakdowns; `sessionClaudeMd`
+   * then sizes the files on disk.
+   */
+  claudeMd?: ClaudeMdFootprint;
+}
+
+/**
+ * The CLAUDE.md files a session loads at startup, sized in the session
+ * model's tokens. Advice about CLAUDE.md size reads this.
+ */
+export interface ClaudeMdFootprint {
+  /** Total tokens the files add to every request */
+  tokens: number;
+  /**
+   * 'recorded': the files the session's own `instructions` record lists
+   * (Claude Code 2.1.268+); 'disk': the files on disk today
+   */
+  source: 'recorded' | 'disk';
+  /** Each file, largest first (empty when only a total is known) */
+  files: { path: string; tokens: number; lines: number }[];
 }
 
 /** A detected waste item with recommendation */

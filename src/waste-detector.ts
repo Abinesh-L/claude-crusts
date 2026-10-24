@@ -15,9 +15,10 @@ import type {
   ClassifiedMessage,
   WasteItem,
   ConfigData,
+  ClaudeMdFootprint,
 } from './types.ts';
 import { loadWasteThresholds, describeThresholdOverrides } from './config.ts';
-import { isHumanUserText } from './classifier.ts';
+import { isHumanUserText, sessionClaudeMd, claudeMdLabel, CLAUDE_MD_SPLIT_ADVICE } from './classifier.ts';
 import { findCacheRewrites, CACHE_TTL_MS } from './cache-rewrites.ts';
 import type { CacheRewrite, CacheRewriteCause, CacheTtl } from './cache-rewrites.ts';
 
@@ -770,29 +771,27 @@ function detectDuplicateReads(
 }
 
 /**
- * Detect oversized system prompt — system instructions exceeding
- * the threshold token count.
+ * Detect oversized CLAUDE.md: the CLAUDE.md files the session loads at
+ * startup (see `claudeMdFootprint`) add more than the threshold to every
+ * request.
  *
- * @param configData - Config data with system prompt file info
- * @returns Array of waste items (0 or 1) for oversized system prompt
+ * @param claudeMd - The session's CLAUDE.md files, in its model's tokens
+ * @returns Array of waste items (0 or 1)
  */
-function detectOversizedSystem(configData: ConfigData): WasteItem[] {
-  const total = configData.systemPrompt.totalEstimatedTokens;
+function detectOversizedSystem(claudeMd: ClaudeMdFootprint): WasteItem[] {
+  const total = claudeMd.tokens;
   if (total <= OVERSIZED_SYSTEM_THRESHOLD) return [];
 
-  const fileList = configData.systemPrompt.files
-    .map((f) => {
-      const name = f.path.replace(/\\/g, '/').split('/').pop() ?? f.path;
-      return `${name} (~${f.estimatedTokens} tokens)`;
-    })
+  const fileList = claudeMd.files
+    .map((f) => `${claudeMdLabel(f.path)} ~${f.tokens.toLocaleString()} tokens`)
     .join(', ');
 
   return [{
     type: 'oversized_system',
     severity: 'medium',
-    description: `System prompt is ~${total.toLocaleString()} tokens (${fileList})`,
+    description: `CLAUDE.md files add ~${total.toLocaleString()} tokens to every request${fileList ? ` (${fileList})` : ''}`,
     estimated_tokens: total - OVERSIZED_SYSTEM_THRESHOLD,
-    recommendation: 'Split CLAUDE.md into CLAUDE.md (essentials) + CLAUDE.local.md (project-specific details) to reduce base context cost.',
+    recommendation: CLAUDE_MD_SPLIT_ADVICE,
   }];
 }
 
@@ -1189,6 +1188,23 @@ function detectUnusedResults(
   return items;
 }
 
+/**
+ * The waste items a `/compact` acts on: the top three high- or
+ * medium-severity items that sit in the conversation. A large CLAUDE.md is
+ * read again after every compaction and cache re-writes are billing, so
+ * neither can be compacted away; counting them overstated what a compact
+ * frees and could push a real target out of the three.
+ *
+ * @param waste - Detected waste items, in detectWaste's order
+ * @returns Up to three items
+ */
+export function compactTargets(waste: WasteItem[]): WasteItem[] {
+  return waste
+    .filter((w) => (w.severity === 'high' || w.severity === 'medium')
+      && w.type !== 'oversized_system' && w.type !== 'cache_overhead')
+    .slice(0, 3);
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -1229,7 +1245,7 @@ export function detectWaste(
   const items: WasteItem[] = [
     ...detectStaleReads(effectiveMessages, effectiveClassified),
     ...detectDuplicateReads(effectiveMessages, effectiveClassified),
-    ...detectOversizedSystem(configData),
+    ...detectOversizedSystem(sessionClaudeMd(breakdown, configData)),
     ...detectResolvedExchanges(effectiveMessages, effectiveClassified),
     ...detectCacheOverhead(messages, breakdown), // Whole session: cache writes are billed across compactions
     ...detectUnusedResults(effectiveMessages, effectiveClassified),

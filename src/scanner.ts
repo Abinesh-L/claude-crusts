@@ -7,7 +7,7 @@
  */
 
 import { homedir } from 'os';
-import { join, basename, dirname } from 'path';
+import { join, basename, dirname, resolve } from 'path';
 import {
   createReadStream,
   existsSync,
@@ -471,28 +471,46 @@ function safeReadFile(filePath: string): FileContent {
 }
 
 /**
- * Read system prompt files (CLAUDE.md, settings) and estimate their token cost.
+ * Read the CLAUDE.md files Claude Code loads at launch and estimate their
+ * token cost.
  *
- * Reads the user-level and project-level CLAUDE.md files, plus any
- * project-level .claude/settings.json. Returns each file's content
- * and a total token estimate for the System category.
+ * Claude Code loads `~/.claude/CLAUDE.md`, then `CLAUDE.md`,
+ * `.claude/CLAUDE.md` and `CLAUDE.local.md` in the working directory and
+ * every directory above it, root first. Files in subdirectories load on
+ * demand and are not counted; `@path` imports, `.claude/rules/` files and
+ * the managed policy file are not read either. settings.json is never sent
+ * to the model. Sessions from Claude Code 2.1.268 on record the files they
+ * loaded, which the classifier prefers, so this scan stands in for older
+ * sessions.
  *
- * @param projectPath - Path to the project directory (for project-level files)
+ * @param projectPath - The session's working directory (its parents are read too)
  * @returns Object with individual file contents and total estimated tokens
  */
 export function readSystemPromptFiles(projectPath?: string): {
   files: FileContent[];
   totalEstimatedTokens: number;
 } {
-  const files: FileContent[] = [];
-
-  // User-level CLAUDE.md
-  files.push(safeReadFile(join(homedir(), '.claude', 'CLAUDE.md')));
-
-  // Project-level files
+  const paths = [join(homedir(), '.claude', 'CLAUDE.md')];
   if (projectPath) {
-    files.push(safeReadFile(join(projectPath, 'CLAUDE.md')));
-    files.push(safeReadFile(join(projectPath, '.claude', 'settings.json')));
+    const dirs: string[] = [];
+    for (let dir = resolve(projectPath); ; dir = dirname(dir)) {
+      dirs.push(dir);
+      if (dirname(dir) === dir) break;
+    }
+    for (const dir of dirs.reverse()) {
+      paths.push(join(dir, 'CLAUDE.md'), join(dir, '.claude', 'CLAUDE.md'), join(dir, 'CLAUDE.local.md'));
+    }
+  }
+
+  // The home folder's .claude/CLAUDE.md is the user file, met again on the
+  // walk up from a project inside the home folder.
+  const seen = new Set<string>();
+  const files: FileContent[] = [];
+  for (const path of paths) {
+    const key = process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    files.push(safeReadFile(path));
   }
 
   const existing = files.filter((f) => f.exists);

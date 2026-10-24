@@ -38,7 +38,9 @@ import type {
   DerivedOverhead,
   ModelHistory,
   ModelSegment,
+  ClaudeMdFootprint,
 } from './types.ts';
+import { homedir } from 'os';
 import { resolveContextLimitWithSignal, resolveCompactionModel, latestCacheTtl, effectiveInput, cacheCreationTokens, modelFamily, tokenizerFactor } from './model-context.ts';
 import { describeThresholdOverrides } from './config.ts';
 import { detectClaudeCodeVersion } from './scanner.ts';
@@ -478,6 +480,99 @@ function recordedSystemPrompt(
     if (found) return { tokens: Math.round((chars / CHARS_PER_TOKEN_TEXT) * factor), chars, index: i };
   }
   return null;
+}
+
+/**
+ * What to do about a large CLAUDE.md, per Claude Code's memory docs. Shared
+ * by the waste item, the recommendation, the fix prompt and the optimizer
+ * so they cannot drift apart.
+ */
+export const CLAUDE_MD_SPLIT_ADVICE =
+  'Move instructions that only matter for part of the codebase into path-scoped rules '
+  + '(.claude/rules/ files with paths: frontmatter) or a CLAUDE.md in that folder; Claude Code '
+  + 'loads those only when it works there. CLAUDE.local.md and @imports load at startup with '
+  + 'CLAUDE.md, so moving text into them saves nothing.';
+
+/**
+ * The CLAUDE.md files a session loads at startup, sized in the session
+ * model's tokens, for advice about CLAUDE.md size.
+ *
+ * The session's own `instructions` records (2.1.268+) list every file Claude
+ * Code loaded with its text, including CLAUDE.local.md and a parent folder's
+ * CLAUDE.md. The latest full record is the baseline and later deltas
+ * (`changed: true`) replace the files they carry. Auto-memory (`AutoMem`) is
+ * not CLAUDE.md and is left out. Without a recorded file list the disk scan
+ * stands in (see `readSystemPromptFiles`), scaled by the same factor.
+ *
+ * @param messages - Session messages (the classifier's `effectiveMessages`)
+ * @param configData - Config data from scanner, the disk fallback
+ * @param factor - Tokenizer factor of the session's model (see `tokenizerFactor`)
+ * @returns The files, largest first, and their total
+ */
+export function claudeMdFootprint(
+  messages: SessionMessage[],
+  configData: ConfigData,
+  factor = 1,
+): ClaudeMdFootprint {
+  const recorded = new Map<string, string>();
+  let found = false;
+  for (const msg of messages) {
+    if (msg.type !== 'attachment' || msg.attachment?.type !== 'instructions') continue;
+    const files = msg.attachment.files;
+    if (!Array.isArray(files)) continue;
+    // A full record lists every loaded file, so it replaces what came before.
+    if (msg.attachment.changed !== true) recorded.clear();
+    found = true;
+    for (const file of files) {
+      if (!file || typeof file !== 'object') continue;
+      const { path, type, content } = file as { path?: unknown; type?: unknown; content?: unknown };
+      if (type === 'AutoMem' || typeof path !== 'string' || typeof content !== 'string') continue;
+      recorded.set(path, content);
+    }
+  }
+  if (found) {
+    const files = [...recorded]
+      .map(([path, text]) => ({
+        path,
+        tokens: Math.round((text.length / CHARS_PER_TOKEN_TEXT) * factor),
+        lines: text.split('\n').length,
+      }))
+      .sort((a, b) => b.tokens - a.tokens);
+    return { tokens: files.reduce((sum, f) => sum + f.tokens, 0), source: 'recorded', files };
+  }
+  const files = configData.systemPrompt.files
+    .filter((f) => f.exists)
+    .map((f) => ({ path: f.path, tokens: Math.round(f.estimatedTokens * factor), lines: f.content.split('\n').length }))
+    .sort((a, b) => b.tokens - a.tokens);
+  return { tokens: Math.round(configData.systemPrompt.totalEstimatedTokens * factor), source: 'disk', files };
+}
+
+/**
+ * The session's CLAUDE.md footprint: the classifier's, or for a hand-built
+ * breakdown the disk scan sized for the session's model.
+ *
+ * @param breakdown - CRUSTS breakdown
+ * @param configData - Config data from scanner
+ * @returns The CLAUDE.md files and their total
+ */
+export function sessionClaudeMd(breakdown: CrustsBreakdown, configData: ConfigData): ClaudeMdFootprint {
+  return breakdown.claudeMd ?? claudeMdFootprint([], configData, tokenizerFactor(breakdown.model));
+}
+
+/**
+ * A CLAUDE.md path as advice shows it: home-relative with forward slashes,
+ * so the user, parent-folder and project files are told apart.
+ *
+ * @param path - Absolute file path
+ * @returns The path with the home folder written as `~`
+ */
+export function claudeMdLabel(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const home = homedir().replace(/\\/g, '/').replace(/\/+$/, '');
+  const underHome = process.platform === 'win32'
+    ? normalized.toLowerCase().startsWith(home.toLowerCase() + '/')
+    : normalized.startsWith(home + '/');
+  return underHome ? '~' + normalized.slice(home.length) : normalized;
 }
 
 /**
@@ -2796,6 +2891,7 @@ export function classifySession(
       messageFraming: derivedFraming,
     },
     compaction,
+    claudeMd: claudeMdFootprint(effectiveMessages, configData, currentFactor),
   };
 }
 

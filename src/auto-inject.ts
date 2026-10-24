@@ -23,7 +23,7 @@ import { basename, dirname, join } from 'path';
 import { parseSession, collectObservedMcpServers } from './scanner.ts';
 import { gatherConfigData, deriveProjectPath } from './analyzer.ts';
 import { classifySession, nonHumanPromptKind } from './classifier.ts';
-import { detectWaste } from './waste-detector.ts';
+import { detectWaste, compactTargets } from './waste-detector.ts';
 import { loadAutoInjectConfig, loadAutocompactBufferTokens, recordInjection } from './config.ts';
 import { autocompactTrigger, AUTOCOMPACT_BUFFER_TOKENS } from './model-context.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
@@ -261,7 +261,7 @@ export function buildInjectionText(
   waste: WasteItem[],
   usagePercent: number,
 ): string {
-  const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
+  const top = compactTargets(waste);
   const compactLine = compactCommandFor(waste);
   const saveable = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
@@ -301,7 +301,7 @@ export function buildInjectionText(
  */
 export function compactCommandFor(waste: WasteItem[]): string {
   const targets: string[] = [];
-  const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
+  const top = compactTargets(waste);
   for (const item of top) {
     if (item.type === 'duplicate_read') {
       const m = /"([^"]+)"/.exec(item.description);
@@ -450,7 +450,7 @@ export async function runAutoInject(): Promise<void> {
     if (decision.inject) {
       const waste = detectWaste(messages, breakdown, configData);
       const text = buildInjectionText(breakdown, waste, decision.usagePercent);
-      const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
+      const top = compactTargets(waste);
       const reclaimableTokens = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
       emitHookResponse(text, buildUserNotice(breakdown, decision.usagePercent, compactCommandFor(waste)));

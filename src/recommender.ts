@@ -16,10 +16,11 @@ import type {
   SessionMessage,
   FixPrompts,
   ClassifiedMessage,
+  ClaudeMdFootprint,
 } from './types.ts';
 import { buildCompactFocus } from './optimizer.ts';
-import { countAnalyzedMessages } from './classifier.ts';
-import { autocompactTrigger } from './model-context.ts';
+import { countAnalyzedMessages, sessionClaudeMd, claudeMdLabel, CLAUDE_MD_SPLIT_ADVICE } from './classifier.ts';
+import { autocompactTrigger, tokenizerFactor } from './model-context.ts';
 import { loadAutocompactBufferTokens } from './config.ts';
 
 /**
@@ -357,29 +358,24 @@ function recommendIdleCompaction(breakdown: CrustsBreakdown, waste: WasteItem[])
 /**
  * Generate specific CLAUDE.md size reduction recommendation.
  *
- * @param configData - Config data from scanner
+ * @param claudeMd - The session's CLAUDE.md files, in its model's tokens
  * @returns Recommendation with current size and split suggestion
  */
-function recommendClaudeMdSplit(configData: ConfigData): Recommendation[] {
-  const total = configData.systemPrompt.totalEstimatedTokens;
+function recommendClaudeMdSplit(claudeMd: ClaudeMdFootprint): Recommendation[] {
+  const total = claudeMd.tokens;
   if (total <= 1500) return [];
 
-  const files = configData.systemPrompt.files.filter((f) => f.exists);
-  const fileDetails = files
-    .map((f) => {
-      const name = f.path.replace(/\\/g, '/').split('/').pop() ?? f.path;
-      const lines = f.content.split('\n').length;
-      return `${name}: ${lines} lines, ~${f.estimatedTokens.toLocaleString()} tokens`;
-    })
+  const fileDetails = claudeMd.files
+    .map((f) => `${claudeMdLabel(f.path)}: ${f.lines} lines, ~${f.tokens.toLocaleString()} tokens`)
     .join('; ');
 
   const excess = total - 1500;
 
   return [{
     priority: 4,
-    action: `CLAUDE.md is ~${total.toLocaleString()} tokens — consider splitting`,
+    action: `CLAUDE.md files are ~${total.toLocaleString()} tokens, consider splitting them`,
     impact: excess,
-    reason: `${fileDetails}. Move project-specific sections to CLAUDE.local.md (gitignored, not loaded by default). Saves ~${excess.toLocaleString()} tokens per message.`,
+    reason: `${fileDetails ? `${fileDetails}. ` : ''}${CLAUDE_MD_SPLIT_ADVICE} Getting under 1,500 tokens saves ~${excess.toLocaleString()} tokens per message.`,
   }];
 }
 
@@ -534,7 +530,7 @@ function recommendTopConsumers(
   // prompt when there is one (else the derived figure), so this list and the
   // buckets agree.
   const derivation = breakdown.derivedOverhead?.internalSystemPrompt?.derivation;
-  const claudeMdTokens = derivation?.knownClaudeMd ?? configData.systemPrompt.totalEstimatedTokens;
+  const claudeMdTokens = derivation?.knownClaudeMd ?? sessionClaudeMd(breakdown, configData).tokens;
   const promptTokens = breakdown.derivedOverhead?.recordedSystemPrompt?.tokens
     ?? breakdown.derivedOverhead?.internalSystemPrompt?.tokens ?? 0;
   consumers.push({
@@ -558,7 +554,8 @@ function recommendTopConsumers(
   }
 
   // 5. Memory files
-  const memTokens = derivation?.knownMemory ?? configData.memoryFiles.totalEstimatedTokens;
+  const memTokens = derivation?.knownMemory
+    ?? Math.round(configData.memoryFiles.totalEstimatedTokens * tokenizerFactor(breakdown.model));
   if (memTokens > 0) {
     consumers.push({
       name: 'Memory files',
@@ -615,7 +612,7 @@ export function generateRecommendations(
     ...recommendDuplicateFiles(waste),
     ...recommendTopConsumers(breakdown, waste, configData, messages),
     ...recommendMCPInfo(configData, breakdown, messages),
-    ...recommendClaudeMdSplit(configData),
+    ...recommendClaudeMdSplit(sessionClaudeMd(breakdown, configData)),
     ...recommendSessionHabit(breakdown, waste),
   ];
 
@@ -762,12 +759,12 @@ function buildClaudeMdSnippet(
     sections.push('- Run /compact proactively at 60% context usage');
   }
 
-  // System prompt size warning
-  const sysToks = configData.systemPrompt.totalEstimatedTokens;
-  if (sysToks > 1500) {
+  // CLAUDE.md size warning
+  const claudeMd = sessionClaudeMd(breakdown, configData);
+  if (claudeMd.tokens > 1500) {
     if (sections.length > 0) sections.push('');
     sections.push('## Note');
-    sections.push(`This CLAUDE.md is ~${sysToks.toLocaleString()} tokens. Consider moving project-specific details to CLAUDE.local.md to reduce per-message cache overhead.`);
+    sections.push(`The CLAUDE.md files are ~${claudeMd.tokens.toLocaleString()} tokens. ${CLAUDE_MD_SPLIT_ADVICE}`);
   }
 
   if (sections.length === 0) return null;

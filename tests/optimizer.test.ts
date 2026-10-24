@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { buildOptimizeReport, parseFixKinds, FIX_KINDS } from '../src/optimizer.ts';
+import { NEWER_TOKENIZER_FACTOR } from '../src/model-context.ts';
 import type { CrustsBreakdown, WasteItem, ConfigData, SessionMessage, MCPBreakdown } from '../src/types.ts';
 
 function emptyBreakdown(extra?: Partial<CrustsBreakdown>): CrustsBreakdown {
@@ -107,7 +108,8 @@ describe('buildOptimizeReport', () => {
     const report = buildOptimizeReport('sid', emptyBreakdown(), [], emptyConfigData(3000), [], '/tmp/proj');
     const warning = report.fixes.find((f) => f.kind === 'claudemd-oversized');
     expect(warning).toBeDefined();
-    expect(warning!.estimatedSavings).toBe(1500); // 3000 - 1500 threshold
+    // 3,000 disk tokens on Opus 4.7's tokenizer, minus the 1,500 threshold
+    expect(warning!.estimatedSavings).toBe(Math.round(3000 * NEWER_TOKENIZER_FACTOR) - 1500);
     expect(warning!.autoApplicable).toBe(false);
   });
 
