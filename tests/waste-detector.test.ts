@@ -491,6 +491,43 @@ describe('duplicate descriptions keep the shape consumers parse', () => {
     expect(dupe.message_range![0]).toBe(5);
   });
 
+  test('after a compaction, the stale and resolved hints use the timeline\'s numbers too', () => {
+    const reply = (uuid: string, text: string, output: number): SessionMessage => ({
+      type: 'assistant', uuid, message: { role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text }], usage: { input_tokens: 30_000, output_tokens: output } },
+    } as SessionMessage);
+    const msgs: SessionMessage[] = [
+      prompt('earlier work'),
+      { type: 'assistant', uuid: 'a-0', message: { role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 90_000, output_tokens: 100 } } } as SessionMessage,
+      { type: 'system', subtype: 'compact_boundary', uuid: 'b-1', compactMetadata: { trigger: 'manual', preTokens: 90_100, postTokens: 5_000 } } as SessionMessage,
+      { type: 'user', uuid: 's-1', isCompactSummary: true, message: { role: 'user', content: 'summary '.repeat(400) } } as SessionMessage,
+      prompt('read app.ts'),
+      readCall('r1', FILE), readResult('r1', 1, fileLines(1, 400)),
+      prompt('why does the parser drop records?'),
+      reply('a-1', 'Because scanner.ts filters them. '.repeat(80), 800),
+      prompt('looks good, thanks'),
+    ];
+    for (let n = 0; n < 8; n++) msgs.push(prompt(`next step ${n}`), reply(`a-n${n}`, `step ${n} done`, 50));
+    const breakdown = classifySession(msgs, EMPTY_CONFIG);
+    expect(breakdown.currentContext!.startIndex).toBeGreaterThan(0);
+    const waste = detectWaste(msgs, breakdown, EMPTY_CONFIG);
+
+    // The read call is record 5 of the session: the timeline's #6.
+    const stale = waste.find((w) => w.type === 'stale_read')!;
+    expect(stale.description).toContain('was read at message #6 ');
+    expect(stale.recommendation).toBe('/compact focus: messages 6-7');
+    expect(stale.message_range).toEqual([5, 6]);
+
+    // "looks good, thanks" is record 9, the timeline's #10; the exchange
+    // before it ends at #9, in the hint and in the /compact builder alike.
+    const resolved = waste.find((w) => w.type === 'resolved_exchange')!;
+    const [first, last] = resolved.message_range!;
+    expect(resolved.description).toContain('before message #10 ');
+    expect(last).toBe(9);
+    expect(first).toBeGreaterThanOrEqual(breakdown.currentContext!.startIndex);
+    expect(resolved.recommendation).toBe(`/compact focus: messages ${first + 1}-9`);
+    expect(buildCompactFocus(waste)!.text).toContain(`drop resolved exchange at messages #${first + 1}-9`);
+  });
+
   test('a page edge repeated on every page is not a duplicate', () => {
     // Paging with a two-line overlap: each earlier read repeats two lines,
     // far under the floor, however many pages there are.

@@ -640,7 +640,7 @@ function detectStaleReads(
         severity: 'high',
         description: `File "${filename}" was read at message #${offset + read.messageIndex + 1} (${messageAge} messages ago) and not referenced since`,
         estimated_tokens: read.estimatedTokens,
-        recommendation: `/compact focus: messages ${read.messageIndex + 1}-${read.messageIndex + 2}`,
+        recommendation: `/compact focus: messages ${offset + read.messageIndex + 1}-${offset + read.messageIndex + 2}`,
         message_range: [offset + read.messageIndex, offset + read.messageIndex + 1],
       });
     }
@@ -871,7 +871,7 @@ function detectResolvedExchanges(
         severity: 'high',
         description: `Resolved exchange before message #${offset + i + 1} ("${textLower.slice(0, 40)}") — preceding discussion is compactable`,
         estimated_tokens: exchangeTokens,
-        recommendation: `/compact focus: messages ${lookbackStart + 1}-${i + 1}`,
+        recommendation: `/compact focus: messages ${offset + lookbackStart + 1}-${offset + i}`,
         message_range: [offset + lookbackStart, offset + i],
       });
     }
