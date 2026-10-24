@@ -224,9 +224,19 @@ describe('0.8.1 per-session injection record and atomic writes', () => {
     expect(leftovers).toEqual([]);
   });
 
-  test('writeFileAtomic into a missing folder throws and creates nothing', () => {
+  test('writeFileAtomic creates a missing folder', () => {
     const target = join(sandbox, 'missing', 'file.json');
-    expect(() => writeFileAtomic(target, '{}')).toThrow();
-    expect(require('fs').existsSync(join(sandbox, 'missing'))).toBe(false);
+    writeFileAtomic(target, '{}\n');
+    expect(readFileSync(target, 'utf-8')).toBe('{}\n');
+  });
+
+  test('writeFileAtomic that cannot write throws and leaves no temp file', () => {
+    // The target's "folder" is a plain file, so the temp file cannot be created.
+    const plain = join(sandbox, 'plain');
+    writeFileSync(plain, 'x');
+    expect(() => writeFileAtomic(join(plain, 'file.json'), '{}')).toThrow();
+    expect(readFileSync(plain, 'utf-8')).toBe('x');
+    const leftovers = require('fs').readdirSync(sandbox).filter((f: string) => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
   });
 });

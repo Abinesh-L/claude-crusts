@@ -29,7 +29,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { CRUSTS_DIR } from './calibrator.ts';
 import { AUTOCOMPACT_BUFFER_TOKENS } from './model-context.ts';
 
@@ -50,6 +50,15 @@ function configDir(): string {
 /** Resolve the active config-file path (override-aware, computed per call). */
 export function crustsConfigPath(): string {
   return join(configDir(), 'config.json');
+}
+
+/**
+ * Resolve the folder holding the per-session summaries
+ * (`~/.claude-crusts/sessions`, see session-summary.ts). It sits next to
+ * config.json, so `CRUSTS_CONFIG_DIR_OVERRIDE` moves both.
+ */
+export function crustsSessionsDir(): string {
+  return join(configDir(), 'sessions');
 }
 
 /** Defaults for the waste-detection thresholds. */
@@ -179,28 +188,34 @@ export function loadConfig(): Record<string, unknown> {
 export function saveConfig(updates: Record<string, unknown>): void {
   const current = loadConfig();
   const merged = { ...current, ...updates };
-  const dir = configDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileAtomic(crustsConfigPath(), JSON.stringify(merged, null, 2) + '\n');
 }
 
 /**
- * Write a whole file atomically: the content goes to a temp file in the same
- * folder, which is then renamed over the target, so a reader never sees a
- * half-written file and a failed write leaves the old file intact.
+ * Replace a file's content atomically: write a temp file in the same
+ * folder, then rename it over the target, so a reader sees the old file or
+ * the new one and never a half-written one. Creates the folder when needed.
+ * Shared by `saveConfig`, the optimizer's settings writes and the session
+ * summaries.
  *
- * The target's folder must exist. Shared by `saveConfig` and the optimizer's
- * settings writes.
+ * On Windows a rename over a file another process has open for reading
+ * fails with EPERM, EBUSY or EACCES for a moment (seen under concurrent
+ * hooks), so it is retried briefly before giving up. On failure the temp
+ * file is removed and the error is thrown.
  *
- * @param target - File to create or replace
- * @param content - Full new content (UTF-8)
+ * @param target - Path of the file to create or replace
+ * @param content - The complete new content (UTF-8)
  */
 export function writeFileAtomic(target: string, content: string): void {
+  const dir = dirname(target);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(temp, content, 'utf-8');
-  // On Windows a rename over a file another process has open for reading
-  // fails with EPERM or EBUSY for a moment (seen under concurrent hooks), so
-  // it is retried briefly before giving up.
+  try {
+    writeFileSync(temp, content, 'utf-8');
+  } catch (err) {
+    try { unlinkSync(temp); } catch { /* best effort */ }
+    throw err;
+  }
   for (let attempt = 0; ; attempt++) {
     try {
       renameSync(temp, target);

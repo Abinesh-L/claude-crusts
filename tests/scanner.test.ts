@@ -13,7 +13,7 @@
  * under ~/.claude or ~/.claude-crusts is touched.
  */
 import { describe, test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -22,6 +22,7 @@ import {
   discoverSessions,
   detectClaudeCodeVersion,
   readClaudeCodeVersion,
+  readLatestClaudeCodeVersion,
   VERSION_PROBE_MAX_BYTES,
   readMemoryFiles,
   readMCPConfig,
@@ -531,6 +532,39 @@ describe('claudeCodeVersion (M4)', () => {
       { ...userRecord('u1', 'hello'), version: '2.1.224' },
     ];
     expect(readClaudeCodeVersion(writeFixture(late))).toBeUndefined();
+  });
+
+  test('readLatestClaudeCodeVersion returns the newest versioned record (0.8.2)', () => {
+    // A session resumed after an update: the head says 2.1.239, the tail 2.1.240.
+    const path = writeFixture([...versionedRecords(), { type: 'last-prompt', lastPrompt: 'bye' }]);
+    expect(readLatestClaudeCodeVersion(path)).toBe('2.1.240');
+    expect(readClaudeCodeVersion(path)).toBe('2.1.239');
+  });
+
+  test('readLatestClaudeCodeVersion reads past a large unversioned tail and a torn last line (0.8.2)', () => {
+    const records = [
+      { ...userRecord('u1', 'hello'), version: '2.1.305' },
+      // 150 KB of unversioned records after it: the probe must widen its window.
+      { type: 'file-history-snapshot', snapshot: { blob: 'y'.repeat(150_000) } },
+      userRecord('u2', 'paste: {"version":"9.9.9"}'),
+    ];
+    const path = writeFixture(records);
+    // A record still being written: no newline, truncated JSON.
+    writeFileSync(path, readFileSync(path, 'utf-8') + '{"type":"user","version":"2.1.399","message":{"ro', 'utf-8');
+    expect(readLatestClaudeCodeVersion(path)).toBe('2.1.305');
+  });
+
+  test('readLatestClaudeCodeVersion returns undefined without a version in reach (0.8.2)', () => {
+    expect(readLatestClaudeCodeVersion(writeFixture([userRecord('u1', 'hello'), assistantRecord('a1', 1, 1)]))).toBeUndefined();
+    expect(readLatestClaudeCodeVersion(join(sandbox, 'missing.jsonl'))).toBeUndefined();
+    const early = [
+      { ...userRecord('u1', 'hello'), version: '2.1.224' },
+      { type: 'file-history-snapshot', snapshot: { blob: 'z'.repeat(VERSION_PROBE_MAX_BYTES + 10) } },
+    ];
+    expect(readLatestClaudeCodeVersion(writeFixture(early))).toBeUndefined();
+    const empty = join(sandbox, 'empty.jsonl');
+    writeFileSync(empty, '', 'utf-8');
+    expect(readLatestClaudeCodeVersion(empty)).toBeUndefined();
   });
 
   test('discoverSessions populates SessionInfo.claudeCodeVersion', () => {

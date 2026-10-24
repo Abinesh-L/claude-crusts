@@ -27,6 +27,7 @@ import { detectWaste } from './waste-detector.ts';
 import { loadAutoInjectConfig, loadAutocompactBufferTokens, recordInjection } from './config.ts';
 import { autocompactTrigger, AUTOCOMPACT_BUFFER_TOKENS } from './model-context.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
+import { recordSessionSummary } from './session-summary.ts';
 import type { CrustsBreakdown, WasteItem } from './types.ts';
 
 /**
@@ -407,8 +408,10 @@ export function buildUserNotice(breakdown: CrustsBreakdown, usagePercent: number
  *
  * Reads the hook payload, analyses the live session, decides whether to
  * inject, and emits either a hook response with additionalContext or an
- * empty response (allowing the user's prompt to proceed unchanged). All
- * errors are swallowed so the hook can never block the user.
+ * empty response (allowing the user's prompt to proceed unchanged). Every
+ * analysed prompt also updates the session's summary in
+ * `~/.claude-crusts/sessions` (see session-summary.ts), which outlives the
+ * transcript. All errors are swallowed so the hook can never block the user.
  */
 export async function runAutoInject(): Promise<void> {
   try {
@@ -441,25 +444,32 @@ export async function runAutoInject(): Promise<void> {
     const breakdown = classifySession(messages, configData, undefined, payload.model?.id);
 
     const sessionId = payload.session_id ?? basename(transcriptPath).replace(/\.jsonl$/, '');
-    const decision = shouldInject(breakdown, config, sessionId, Date.now(), loadAutocompactBufferTokens());
-    if (!decision.inject) return;
+    const bufferTokens = loadAutocompactBufferTokens();
+    const decision = shouldInject(breakdown, config, sessionId, Date.now(), bufferTokens);
+    let advisoryAt: string | undefined;
+    if (decision.inject) {
+      const waste = detectWaste(messages, breakdown, configData);
+      const text = buildInjectionText(breakdown, waste, decision.usagePercent);
+      const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
+      const reclaimableTokens = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
 
-    const waste = detectWaste(messages, breakdown, configData);
-    const text = buildInjectionText(breakdown, waste, decision.usagePercent);
-    const top = waste.filter((w) => w.severity === 'high' || w.severity === 'medium').slice(0, 3);
-    const reclaimableTokens = top.reduce((sum, w) => sum + w.estimated_tokens, 0);
+      emitHookResponse(text, buildUserNotice(breakdown, decision.usagePercent, compactCommandFor(waste)));
+      // The advisory is out: log it first, then arm this session's min-gap.
+      // Each step fails on its own, so a busy config.json cannot cost the log.
+      advisoryAt = new Date().toISOString();
+      writeInjectionLog({
+        ts: advisoryAt,
+        sessionId,
+        usagePercent: decision.usagePercent,
+        reclaimableTokens,
+        advisoryText: text,
+      });
+      try { recordInjection(sessionId); } catch { /* the next prompt may advise again */ }
+    }
 
-    emitHookResponse(text, buildUserNotice(breakdown, decision.usagePercent, compactCommandFor(waste)));
-    // The advisory is out: log it first, then arm this session's min-gap.
-    // Each step fails on its own, so a busy config.json cannot cost the log.
-    writeInjectionLog({
-      ts: new Date().toISOString(),
-      sessionId,
-      usagePercent: decision.usagePercent,
-      reclaimableTokens,
-      advisoryText: text,
-    });
-    try { recordInjection(sessionId); } catch { /* the next prompt may advise again */ }
+    // Keep what this run saw where Claude Code's transcript cleanup cannot
+    // reach it (cleanupPeriodDays). Built from this run's analysis; never throws.
+    recordSessionSummary({ sessionId, transcriptPath, breakdown, messages, advisoryAt, bufferTokens });
   } catch {
     // Auto-inject must never break Claude Code — swallow all errors.
   }

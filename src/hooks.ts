@@ -10,7 +10,8 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import chalk from 'chalk';
-import { loadConfig, saveConfig, stripBom } from './config.ts';
+import { loadConfig, saveConfig, stripBom, crustsSessionsDir } from './config.ts';
+import { loadSessionSummaries } from './session-summary.ts';
 
 /** Path to Claude Code's global settings */
 const CLAUDE_SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
@@ -303,7 +304,10 @@ export function disableAutoInject(): void {
   console.log(chalk.yellow('  CRUSTS auto-inject disabled.'));
 }
 
-/** Report the install + enabled state of the auto-inject hook. */
+/**
+ * Report the install + enabled state of the auto-inject hook, and the
+ * session summaries it keeps (see session-summary.ts).
+ */
 export function autoInjectStatus(): void {
   const settings = readJson(CLAUDE_SETTINGS_PATH);
   const cfg = loadConfig();
@@ -326,4 +330,9 @@ export function autoInjectStatus(): void {
     console.log(chalk.dim('  CRUSTS auto-inject: not installed'));
     console.log(chalk.dim('  Run `claude-crusts hooks auto-inject enable` to opt in.'));
   }
+
+  const summaries = loadSessionSummaries().length;
+  console.log(chalk.dim(summaries > 0
+    ? `  Session summaries: ${summaries} kept in ${crustsSessionsDir()}`
+    : `  Session summaries: none yet (the hook keeps one per session in ${crustsSessionsDir()})`));
 }

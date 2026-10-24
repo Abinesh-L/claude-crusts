@@ -212,6 +212,56 @@ export function readClaudeCodeVersion(filePath: string): string | undefined {
   }
 }
 
+/**
+ * Read the Claude Code version from the end of a session file: the newest
+ * record that carries a non-empty `version`.
+ *
+ * A session outlives Claude Code updates, so `readClaudeCodeVersion` (the
+ * head) names the build it started on, and this one the build that wrote to
+ * it last. The probe reads a 64 KB window from the end, doubling up to
+ * `VERSION_PROBE_MAX_BYTES`, and parses its complete lines newest first.
+ *
+ * @param filePath - Absolute path to the .jsonl file
+ * @returns Version string, or undefined when none is found in the probed tail
+ */
+export function readLatestClaudeCodeVersion(filePath: string): string | undefined {
+  let fd: number | null = null;
+  try {
+    const size = statSync(filePath).size;
+    fd = openSync(filePath, 'r');
+    for (let window = VERSION_PROBE_CHUNK_BYTES; ; window *= 2) {
+      const length = Math.min(window, size, VERSION_PROBE_MAX_BYTES);
+      const start = size - length;
+      const buffer = Buffer.alloc(length);
+      const bytesRead = readSync(fd, buffer, 0, length, start);
+      const lines = buffer.subarray(0, bytesRead).toString('utf8').split('\n');
+      // The window's first line is cut off unless it starts the file.
+      if (start > 0) lines.shift();
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]!;
+        if (!line.includes('"version"')) continue;
+        try {
+          const version = recordVersion(JSON.parse(line));
+          if (version) return version;
+        } catch {
+          // A line still being written: keep looking
+        }
+      }
+      if (start === 0 || length >= VERSION_PROBE_MAX_BYTES) return undefined;
+    }
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing to recover from a failed close on a read-only handle
+      }
+    }
+  }
+}
+
 /** Record types that carry conversation the model actually receives */
 const ANALYZED_RECORD_TYPES: ReadonlySet<string> = new Set(['user', 'assistant', 'system', 'attachment']);
 
