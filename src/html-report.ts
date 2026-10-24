@@ -117,6 +117,7 @@ const BASE_CSS = `
     border-bottom: 1px solid #333;
   }
   .meta { color: #888; font-size: 0.85rem; margin-bottom: 0.15rem; }
+  .note { color: #888; font-size: 0.9rem; margin: 0.5rem 0 1rem; }
   .card {
     background: #16213e;
     border: 1px solid #2a2a4a;
@@ -462,6 +463,9 @@ ${hasCompaction ? `<p class="meta" style="color:#ffb300">${bd.compactionEvents.l
     if (fix.compactCommand) {
       html += renderCodeBlock(`${blockNum}. Run this command now`, fix.compactCommand, blockNum);
     }
+  }
+  if (fix.claudeMdNote) {
+    html += `<p class="note">Note: ${esc(fix.claudeMdNote)}</p>`;
   }
 
   // Derived overhead

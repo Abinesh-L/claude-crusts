@@ -21,6 +21,7 @@ import type {
 import { buildCompactFocus } from './optimizer.ts';
 import { countAnalyzedMessages, sessionClaudeMd, claudeMdLabel, CLAUDE_MD_SPLIT_ADVICE } from './classifier.ts';
 import { autocompactTrigger, tokenizerFactor } from './model-context.ts';
+import { indexToolResults, resultTokens } from './waste-detector.ts';
 import { loadAutocompactBufferTokens } from './config.ts';
 
 /**
@@ -471,8 +472,11 @@ function recommendTopConsumers(
   const ctx = breakdown.currentContext ?? breakdown;
   const startIdx = breakdown.currentContext?.startIndex ?? 0;
   const effectiveMessages = messages.slice(startIdx);
+  const effectiveClassified = breakdown.messages.slice(startIdx);
+  const results = indexToolResults(effectiveMessages);
 
-  // 1. File reads — group by filename
+  // 1. File reads, grouped by filename. Each read costs its own tool_result
+  // row, found by tool_use id: parallel calls put another call's record next.
   const fileTokens = new Map<string, { tokens: number; readCount: number; dupeTokens: number }>();
   for (let i = 0; i < effectiveMessages.length; i++) {
     const msg = effectiveMessages[i]!;
@@ -483,9 +487,8 @@ function recommendTopConsumers(
       const filename = filePath.replace(/\\/g, '/').split('/').pop() ?? filePath;
       if (!filename) continue;
 
-      // Token cost is on the next message (tool_result)
-      const cm = breakdown.messages[startIdx + i + 1];
-      const tokens = cm?.tokens ?? 0;
+      const result = block.id ? results.get(block.id) : undefined;
+      const tokens = result ? resultTokens(result, effectiveClassified) : 0;
       const existing = fileTokens.get(filename);
       if (existing) {
         existing.tokens += tokens;
@@ -544,9 +547,12 @@ function recommendTopConsumers(
   for (let e = breakdown.compactionEvents.length - 1; e >= 0; e--) {
     const event = breakdown.compactionEvents[e]!;
     if (event.summaryTokens && event.summaryTokens > 0) {
+      // The summary record's classified row, as its bucket counts it (in the
+      // model's tokens); summaryTokens is a plain chars/3.5 count.
+      const summaryRow = event.summaryIndex !== undefined ? breakdown.messages[event.summaryIndex] : undefined;
       consumers.push({
         name: 'Compaction summary',
-        tokens: event.summaryTokens,
+        tokens: summaryRow?.tokens ?? event.summaryTokens,
         detail: `compressed context from ${event.tokensBefore.toLocaleString()} tokens`,
       });
       break;
@@ -685,9 +691,24 @@ export function generateFixPrompts(
 ): FixPrompts {
   return {
     sessionPrompt: buildSessionPrompt(breakdown, waste),
-    claudeMdSnippet: buildClaudeMdSnippet(breakdown, waste, configData),
+    claudeMdSnippet: buildClaudeMdSnippet(breakdown, waste),
     compactCommand: buildCompactCommand(breakdown, waste),
+    claudeMdNote: buildClaudeMdNote(breakdown, configData),
   };
+}
+
+/**
+ * A note for the person when the session's CLAUDE.md files pass the
+ * 1,500-token budget (see `sessionClaudeMd`).
+ *
+ * @param breakdown - CRUSTS breakdown
+ * @param configData - Config data from scanner
+ * @returns The note, or null when the files are within the budget
+ */
+function buildClaudeMdNote(breakdown: CrustsBreakdown, configData: ConfigData): string | null {
+  const claudeMd = sessionClaudeMd(breakdown, configData);
+  if (claudeMd.tokens <= 1500) return null;
+  return `The CLAUDE.md files are ~${claudeMd.tokens.toLocaleString()} tokens. ${CLAUDE_MD_SPLIT_ADVICE}`;
 }
 
 /**
@@ -726,17 +747,16 @@ function buildSessionPrompt(
 }
 
 /**
- * Build a CLAUDE.md snippet based on session patterns.
+ * Build a CLAUDE.md snippet based on session patterns: only instructions
+ * meant for Claude (the CLAUDE.md size note is `buildClaudeMdNote`).
  *
  * @param breakdown - CRUSTS breakdown
  * @param waste - Detected waste items
- * @param configData - Config data from scanner
  * @returns CLAUDE.md snippet text, or null if nothing to suggest
  */
 function buildClaudeMdSnippet(
   breakdown: CrustsBreakdown,
   waste: WasteItem[],
-  configData: ConfigData,
 ): string | null {
   const sections: string[] = [];
   const dupes = extractDuplicateFiles(waste);
@@ -759,13 +779,6 @@ function buildClaudeMdSnippet(
     sections.push('- Run /compact proactively at 60% context usage');
   }
 
-  // CLAUDE.md size warning
-  const claudeMd = sessionClaudeMd(breakdown, configData);
-  if (claudeMd.tokens > 1500) {
-    if (sections.length > 0) sections.push('');
-    sections.push('## Note');
-    sections.push(`The CLAUDE.md files are ~${claudeMd.tokens.toLocaleString()} tokens. ${CLAUDE_MD_SPLIT_ADVICE}`);
-  }
 
   if (sections.length === 0) return null;
   return sections.join('\n');

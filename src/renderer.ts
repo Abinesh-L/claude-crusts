@@ -716,6 +716,13 @@ export function renderFix(fix: FixPrompts, sessionId: string): void {
     console.log();
   }
 
+  // A note for the person, outside every paste box
+  if (fix.claudeMdNote) {
+    hasOutput = true;
+    for (const line of wrapText(`Note: ${fix.claudeMdNote}`, boxWidth)) console.log(chalk.dim(`  ${line}`));
+    console.log();
+  }
+
   if (!hasOutput) {
     console.log(chalk.green('  No fixes needed — session looks clean.'));
     console.log();

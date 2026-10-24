@@ -159,6 +159,30 @@ describe('sessionClaudeMd', () => {
     expect(b.claudeMd!.files.length).toBe(3);
   });
 
+  test('files carry their share of the text Claude Code sent, so the advice and the buckets agree', () => {
+    const files = [
+      { path: PROJECT_FILE, type: 'Project', content: 'p'.repeat(6_000) },
+      { path: MEMORY_FILE, type: 'AutoMem', content: 'm'.repeat(2_000) },
+    ];
+    // The sent text adds a preamble and a header per file to the contents.
+    const record = {
+      type: 'attachment',
+      uuid: 'i-sent',
+      attachment: { type: 'instructions', files },
+      rendered: [{ content: 'Codebase and user instructions are shown below.\n' + files.map((f) => `Contents of ${f.path}:\n\n${f.content}`).join('\n\n') }],
+    } as unknown as SessionMessage;
+    const msgs: SessionMessage[] = [
+      record,
+      { type: 'user', uuid: 'u-1', message: { role: 'user', content: 'hi' } } as SessionMessage,
+      { type: 'assistant', uuid: 'a-1', message: { role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 40_000, output_tokens: 10 } } } as SessionMessage,
+    ];
+    const b = classifySession(msgs, config());
+    // 6,000 chars is 1,500 tokens; the file's share of the preamble and headers adds to it.
+    expect(b.claudeMd!.tokens).toBeGreaterThan(1_500);
+    // Top 5 shows the bucket's figure (knownClaudeMd); rounding apart, they match.
+    expect(Math.abs(b.claudeMd!.tokens - b.derivedOverhead!.internalSystemPrompt!.derivation.knownClaudeMd)).toBeLessThanOrEqual(1);
+  });
+
   test('a hand-built breakdown falls back to the disk total in its model tokens', () => {
     expect(sessionClaudeMd(breakdown('claude-opus-4-7'), config(2_000)).tokens).toBe(Math.round(2_000 * NEWER_TOKENIZER_FACTOR));
     expect(sessionClaudeMd(breakdown('claude-sonnet-4-5'), config(2_000)).tokens).toBe(2_000);
@@ -202,10 +226,12 @@ describe('CLAUDE.md size advice', () => {
     expect(rec.reason).toContain(CLAUDE_MD_SPLIT_ADVICE);
     expect(movesToLocal(rec.action + rec.reason)).toBe(false);
 
-    const snippet = generateFixPrompts(b, [], config()).claudeMdSnippet!;
-    expect(snippet).toContain('~4,200 tokens');
-    expect(snippet).toContain(CLAUDE_MD_SPLIT_ADVICE);
-    expect(movesToLocal(snippet)).toBe(false);
+    // fix: the size note is for the person, never inside the CLAUDE.md paste block.
+    const fix = generateFixPrompts(b, [], config());
+    expect(fix.claudeMdSnippet).toBeNull();
+    expect(fix.claudeMdNote).toContain('~4,200 tokens');
+    expect(fix.claudeMdNote).toContain(CLAUDE_MD_SPLIT_ADVICE);
+    expect(movesToLocal(fix.claudeMdNote!)).toBe(false);
   });
 
   test('optimizer fix names the largest files', () => {

@@ -183,6 +183,10 @@ export function generateSessionReportMd(result: AnalysisResult, fix: FixPrompts)
       lines.push('');
     }
   }
+  if (fix.claudeMdNote) {
+    lines.push(`> Note: ${fix.claudeMdNote}`);
+    lines.push('');
+  }
 
   // Derived overhead
   const derived = bd.derivedOverhead;

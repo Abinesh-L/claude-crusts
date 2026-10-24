@@ -997,6 +997,12 @@ export interface FixPrompts {
   claudeMdSnippet: string | null;
   /** A specific /compact command ready to paste */
   compactCommand: string | null;
+  /**
+   * A note for the person when the CLAUDE.md files are large: what to move
+   * where. Shown beside the blocks, never inside one, since pasting it into
+   * CLAUDE.md would add to what it warns about.
+   */
+  claudeMdNote?: string | null;
 }
 
 // ---------------------------------------------------------------------------

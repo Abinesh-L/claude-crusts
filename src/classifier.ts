@@ -501,8 +501,11 @@ export const CLAUDE_MD_SPLIT_ADVICE =
  * Code loaded with its text, including CLAUDE.local.md and a parent folder's
  * CLAUDE.md. The latest full record is the baseline and later deltas
  * (`changed: true`) replace the files they carry. Auto-memory (`AutoMem`) is
- * not CLAUDE.md and is left out. Without a recorded file list the disk scan
- * stands in (see `readSystemPromptFiles`), scaled by the same factor.
+ * not CLAUDE.md and is left out. Each file is sized by its share of the text
+ * Claude Code sent for its record (`rendered`, which adds a preamble and a
+ * header per file), as `instructionsOverhead` sizes the buckets, so without
+ * deltas the two agree. Without a recorded file list the disk scan stands in
+ * (see `readSystemPromptFiles`), scaled by the same factor.
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
  * @param configData - Config data from scanner, the disk fallback
@@ -514,7 +517,7 @@ export function claudeMdFootprint(
   configData: ConfigData,
   factor = 1,
 ): ClaudeMdFootprint {
-  const recorded = new Map<string, string>();
+  const recorded = new Map<string, { chars: number; lines: number }>();
   let found = false;
   for (const msg of messages) {
     if (msg.type !== 'attachment' || msg.attachment?.type !== 'instructions') continue;
@@ -523,19 +526,29 @@ export function claudeMdFootprint(
     // A full record lists every loaded file, so it replaces what came before.
     if (msg.attachment.changed !== true) recorded.clear();
     found = true;
+    let contentChars = 0;
+    for (const file of files) {
+      const content = file && typeof file === 'object' ? (file as { content?: unknown }).content : undefined;
+      if (typeof content === 'string') contentChars += content.length;
+    }
+    let sentChars = 0;
+    for (const part of msg.rendered ?? []) {
+      if (part && typeof part.content === 'string') sentChars += part.content.length;
+    }
+    const share = contentChars > 0 && sentChars > 0 ? sentChars / contentChars : 1;
     for (const file of files) {
       if (!file || typeof file !== 'object') continue;
       const { path, type, content } = file as { path?: unknown; type?: unknown; content?: unknown };
       if (type === 'AutoMem' || typeof path !== 'string' || typeof content !== 'string') continue;
-      recorded.set(path, content);
+      recorded.set(path, { chars: content.length * share, lines: content.split('\n').length });
     }
   }
   if (found) {
     const files = [...recorded]
-      .map(([path, text]) => ({
+      .map(([path, file]) => ({
         path,
-        tokens: Math.round((text.length / CHARS_PER_TOKEN_TEXT) * factor),
-        lines: text.split('\n').length,
+        tokens: Math.round((file.chars / CHARS_PER_TOKEN_TEXT) * factor),
+        lines: file.lines,
       }))
       .sort((a, b) => b.tokens - a.tokens);
     return { tokens: files.reduce((sum, f) => sum + f.tokens, 0), source: 'recorded', files };
