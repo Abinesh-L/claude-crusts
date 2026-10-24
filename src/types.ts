@@ -133,6 +133,29 @@ export interface SessionMessage {
      * (and `requestId`) and repeat the same final `usage`.
      */
     id?: string;
+    /**
+     * The API's prompt-cache diagnosis for this response, on every
+     * assistant line since Claude Code 2.1.214. `null` when the API
+     * compared this request with the previous one and found no divergence
+     * (or no comparison was requested); `cache_miss_reason: null` while the
+     * comparison was still running. See `cache-rewrites.ts`.
+     */
+    diagnostics?: {
+      cache_miss_reason?: {
+        /**
+         * `model_changed`, `system_changed`, `tools_changed` and
+         * `messages_changed` name the first divergence;
+         * `previous_message_not_found` and `unavailable` mean no
+         * comparison was produced.
+         */
+        type?: string;
+        /**
+         * Byte-derived estimate of the input after the divergence (the four
+         * `*_changed` types only): a magnitude indicator, not a billing number.
+         */
+        cache_missed_input_tokens?: number;
+      } | null;
+    } | null;
   };
   /** API request id (`req_...`); groups the split lines of one response */
   requestId?: string;
@@ -176,6 +199,8 @@ export interface SessionMessage {
   parentUuid?: string | null;
   /** Whether this is a sidechain message */
   isSidechain?: boolean;
+  /** Subagent id on sidechain records (subagent transcripts, older inline sidechains) */
+  agentId?: string;
   /** Session ID */
   sessionId?: string;
   /** Working directory at time of message */

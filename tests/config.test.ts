@@ -27,9 +27,14 @@ describe('DEFAULT_WASTE_THRESHOLDS', () => {
   test('defaults match historical waste-detector constants', () => {
     expect(DEFAULT_WASTE_THRESHOLDS.staleReadThreshold).toBe(15);
     expect(DEFAULT_WASTE_THRESHOLDS.oversizedSystemThreshold).toBe(1500);
-    expect(DEFAULT_WASTE_THRESHOLDS.cacheOverheadThreshold).toBe(0.6);
     expect(DEFAULT_WASTE_THRESHOLDS.resolutionLookback).toBe(10);
     expect(DEFAULT_WASTE_THRESHOLDS.claudeMdOversizedThreshold).toBe(1500);
+  });
+
+  test('the cache rule measures re-writes: cacheRewriteThreshold replaces cacheOverheadThreshold', () => {
+    // 0.8.2: a quarter of the session's cache writes, not 60% cache reads.
+    expect(DEFAULT_WASTE_THRESHOLDS.cacheRewriteThreshold).toBe(0.25);
+    expect('cacheOverheadThreshold' in DEFAULT_WASTE_THRESHOLDS).toBe(false);
   });
 });
 

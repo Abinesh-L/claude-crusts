@@ -418,8 +418,8 @@ ${hasCompaction ? `<p class="meta" style="color:#ffb300">${bd.compactionEvents.l
       for (const item of items) {
         html += `<div class="waste-item">
   <div class="waste-desc"><span class="sev-badge" style="background:${sevColor}">${severity}</span> ${esc(item.description)}</div>
-  <div class="waste-rec">&rarr; ${esc(item.recommendation)}</div>
-  <div class="waste-tokens">~${fmt(item.estimated_tokens)} tokens</div>
+  <div class="waste-rec">&rarr; ${esc(item.recommendation)}</div>${item.estimated_tokens > 0 ? `
+  <div class="waste-tokens">~${fmt(item.estimated_tokens)} tokens</div>` : ''}
 </div>`;
       }
     }

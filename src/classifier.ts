@@ -651,10 +651,13 @@ interface AssistantLineGroup {
  * are namespaced so an id-keyed group can never collide with a
  * requestId-keyed one.
  *
+ * Exported so `cache-rewrites.ts` counts one request per API response with
+ * exactly the groups the classifier uses.
+ *
  * @param msg - The session message
  * @returns Namespaced group key, or null when the line cannot be grouped
  */
-function assistantGroupKey(msg: SessionMessage): string | null {
+export function assistantGroupKey(msg: SessionMessage): string | null {
   if (msg.type !== 'assistant' || !msg.message?.usage) return null;
   if (msg.message.model === '<synthetic>') return null;
   if (msg.message.id) return `id:${msg.message.id}`;

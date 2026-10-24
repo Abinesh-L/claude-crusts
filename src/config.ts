@@ -15,7 +15,7 @@
  *     "wasteThresholds": {
  *       "staleReadThreshold": number,
  *       "oversizedSystemThreshold": number,
- *       "cacheOverheadThreshold": number,
+ *       "cacheRewriteThreshold": number,
  *       "resolutionLookback": number,
  *       "claudeMdOversizedThreshold": number
  *     }
@@ -23,6 +23,9 @@
  *
  * All fields are optional. Readers should fall through to defaults for
  * missing keys. Writers merge — never replace the whole file.
+ *
+ * A retired key (`wasteThresholds.cacheOverheadThreshold`, the cache-read
+ * ratio of 0.8.1 and earlier) is ignored, so old files keep working.
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'fs';
@@ -53,9 +56,17 @@ export function crustsConfigPath(): string {
 export const DEFAULT_WASTE_THRESHOLDS: WasteThresholds = {
   staleReadThreshold: 15,
   oversizedSystemThreshold: 1_500,
-  cacheOverheadThreshold: 0.6,
+  cacheRewriteThreshold: 0.25,
   resolutionLookback: 10,
   claudeMdOversizedThreshold: 1_500,
+};
+
+/**
+ * `wasteThresholds` keys that crusts no longer reads, with the note
+ * `--verbose` prints when a config.json still sets one.
+ */
+const RETIRED_WASTE_THRESHOLDS: Readonly<Record<string, string>> = {
+  cacheOverheadThreshold: 'ignored since 0.8.2; the cache rule measures re-writes now (cacheRewriteThreshold)',
 };
 
 /** Defaults for hook-triggered auto-injection. */
@@ -114,8 +125,12 @@ export interface WasteThresholds {
   staleReadThreshold: number;
   /** System prompt token threshold before we flag it as oversized */
   oversizedSystemThreshold: number;
-  /** `cache_read / total_input` ratio that triggers the cache-overhead warning */
-  cacheOverheadThreshold: number;
+  /**
+   * Share of a session's cache-write tokens (0-1) that went to re-writing
+   * content already cached (after an expiry or a prefix change) before the
+   * `cache_overhead` item appears. Re-writes under 50,000 tokens never show.
+   */
+  cacheRewriteThreshold: number;
   /** Max messages to look back from a resolution marker */
   resolutionLookback: number;
   /** CLAUDE.md token threshold for the `claudemd-oversized` optimize fix */
@@ -224,7 +239,7 @@ export function loadWasteThresholds(): WasteThresholds {
   return {
     staleReadThreshold: pickNumber('staleReadThreshold'),
     oversizedSystemThreshold: pickNumber('oversizedSystemThreshold'),
-    cacheOverheadThreshold: pickNumber('cacheOverheadThreshold'),
+    cacheRewriteThreshold: pickNumber('cacheRewriteThreshold'),
     resolutionLookback: pickNumber('resolutionLookback'),
     claudeMdOversizedThreshold: pickNumber('claudeMdOversizedThreshold'),
   };
@@ -323,7 +338,8 @@ export function loadAutocompactBufferTokens(): number {
  * Return a list of human-readable notes about which thresholds differ from the default.
  *
  * Used by the `--verbose` diagnostic to surface that a user-local
- * `config.json` is actively changing behaviour.
+ * `config.json` is actively changing behaviour. A retired key the file
+ * still sets gets a note saying it is ignored.
  */
 export function describeThresholdOverrides(): string[] {
   const active = loadWasteThresholds();
@@ -331,6 +347,12 @@ export function describeThresholdOverrides(): string[] {
   for (const key of Object.keys(DEFAULT_WASTE_THRESHOLDS) as (keyof WasteThresholds)[]) {
     if (active[key] !== DEFAULT_WASTE_THRESHOLDS[key]) {
       notes.push(`${key}: ${DEFAULT_WASTE_THRESHOLDS[key]} \u2192 ${active[key]}`);
+    }
+  }
+  const raw = loadConfig().wasteThresholds;
+  if (raw && typeof raw === 'object') {
+    for (const [key, note] of Object.entries(RETIRED_WASTE_THRESHOLDS)) {
+      if (key in raw) notes.push(`${key}: ${note}`);
     }
   }
   return notes;

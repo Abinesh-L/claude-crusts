@@ -118,7 +118,11 @@ export function generateSessionReportMd(result: AnalysisResult, fix: FixPrompts)
       lines.push(`### ${severity.toUpperCase()} (${items.length})`);
       lines.push('');
       for (const item of items) {
-        lines.push(`- **${item.description}** (~${fmt(item.estimated_tokens)} tokens)`);
+        // A 0-token item (cache re-writes: cost, not window space) gets no
+        // "(~0 tokens)" suffix.
+        lines.push(item.estimated_tokens > 0
+          ? `- **${item.description}** (~${fmt(item.estimated_tokens)} tokens)`
+          : `- **${item.description}**`);
         lines.push(`  - ${item.recommendation}`);
       }
       lines.push('');

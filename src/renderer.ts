@@ -581,8 +581,12 @@ export function renderWaste(
 
     for (const item of items) {
       const badge = color(`[${severity.toUpperCase()}]`);
-      const tokens = chalk.dim(`~${item.estimated_tokens.toLocaleString()} tkns`);
-      console.log(`  ${badge} ${item.description} ${tokens}`);
+      // Items that free no window space (cache re-writes cost money, not
+      // context) carry 0 tokens; a "~0 tkns" suffix would contradict them.
+      const tokens = item.estimated_tokens > 0
+        ? ' ' + chalk.dim(`~${item.estimated_tokens.toLocaleString()} tkns`)
+        : '';
+      console.log(`  ${badge} ${item.description}${tokens}`);
       console.log(chalk.cyan(`    \u2192 ${item.recommendation}`));
       console.log();
     }

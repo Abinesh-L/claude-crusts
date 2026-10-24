@@ -3,7 +3,9 @@
  *
  * Scans classified session data for patterns that waste context window
  * space: stale file reads, duplicate reads, oversized system prompts,
- * resolved debug exchanges, cache overhead, and unused tool results.
+ * resolved debug exchanges and unused tool results. One rule measures cost
+ * rather than window space: cache overhead, the prompt-cache writes that
+ * repeated content already cached (see `cache-rewrites.ts`).
  */
 
 import type {
@@ -15,8 +17,9 @@ import type {
   ConfigData,
 } from './types.ts';
 import { loadWasteThresholds, describeThresholdOverrides } from './config.ts';
-import { effectiveInput } from './model-context.ts';
 import { isHumanUserText } from './classifier.ts';
+import { findCacheRewrites, CACHE_TTL_MS } from './cache-rewrites.ts';
+import type { CacheRewrite, CacheRewriteCause, CacheTtl } from './cache-rewrites.ts';
 
 // Thresholds are bound at the top of `detectWaste` from user config (with
 // defaults from `config.ts`). Kept as module-level `let`s so the internal
@@ -29,8 +32,15 @@ let STALE_READ_THRESHOLD = 15;
 /** System prompt token threshold before we flag it as oversized */
 let OVERSIZED_SYSTEM_THRESHOLD = 1_500;
 
-/** Cache read ratio threshold before we warn */
-let CACHE_OVERHEAD_THRESHOLD = 0.6;
+/** Share of a session's cache-write tokens spent re-writing cached content before we warn */
+let CACHE_REWRITE_THRESHOLD = 0.25;
+
+/**
+ * Fewest re-written tokens worth an item. Below this a session re-wrote
+ * less than a fresh session writes for its fixed context and first prompt,
+ * so even a large share is noise.
+ */
+const CACHE_REWRITE_MIN_TOKENS = 50_000;
 
 /** Phrases that indicate a debug exchange was resolved */
 const RESOLUTION_PHRASES = [
@@ -859,37 +869,233 @@ function detectResolvedExchanges(
 }
 
 /**
- * Detect excessive cache overhead — when cache_read_input_tokens
- * dominate the token usage, indicating system prompt and tool schemas
- * are consuming a large portion of effective context.
+ * Groups for describing cache re-writes: one per cause, with expiries split
+ * by whether a one-hour cache would have outlived the gap (only those are
+ * helped by the `promptCacheTtl` setting).
+ */
+type RewriteGroup = 'expired_short' | 'expired_long' | Exclude<CacheRewriteCause, 'expired'>;
+
+/** Lead phrase for each group: [one re-write, several]. */
+const REWRITE_PHRASES: Record<RewriteGroup, [string, string]> = {
+  expired_long: ['after the cache expired (gap over 1 h)', 'after the cache expired (gaps over 1 h)'],
+  expired_short: ['after the 5-minute cache expired (gap under 1 h)', 'after the 5-minute cache expired (gaps under 1 h)'],
+  model_changed: ['after a model switch', 'after model switches'],
+  system_changed: ['after the system prompt changed', 'after the system prompt changed'],
+  tools_changed: ['after the tool list changed', 'after the tool list changed'],
+  messages_changed: ['after earlier messages changed', 'after earlier messages changed'],
+  ttl_changed: ['after the cache TTL switched', 'after the cache TTL switched'],
+  unexplained: ['with no recorded cause', 'with no recorded cause'],
+};
+
+/** Noun for each group in the "Also" list: [one re-write, several]. */
+const REWRITE_NOUNS: Record<RewriteGroup, [string, string]> = {
+  expired_long: ['expiry after a gap over 1 h', 'expiries after gaps over 1 h'],
+  expired_short: ['5-minute cache expiry', '5-minute cache expiries'],
+  model_changed: ['model switch', 'model switches'],
+  system_changed: ['system prompt change', 'system prompt changes'],
+  tools_changed: ['tool list change', 'tool list changes'],
+  messages_changed: ['change to earlier messages', 'changes to earlier messages'],
+  ttl_changed: ['cache TTL switch', 'cache TTL switches'],
+  unexplained: ['unexplained re-write', 'unexplained re-writes'],
+};
+
+/** Short name of each cache TTL tier. */
+const TTL_NAMES: Record<CacheTtl, string> = { '5m': '5 min', '1h': '1 h' };
+
+/** Re-writes of one group with their token total. */
+interface RewriteGroupTotal {
+  group: RewriteGroup;
+  rewrites: CacheRewrite[];
+  tokens: number;
+}
+
+/**
+ * The description group of one re-write.
+ *
+ * @param rewrite - A detected re-write
+ * @returns Its cause, with expiries split at the one-hour mark
+ */
+function rewriteGroup(rewrite: CacheRewrite): RewriteGroup {
+  if (rewrite.cause !== 'expired') return rewrite.cause;
+  return rewrite.ttl === '5m' && rewrite.gapMs !== undefined && rewrite.gapMs <= CACHE_TTL_MS['1h']
+    ? 'expired_short'
+    : 'expired_long';
+}
+
+/**
+ * Group re-writes by cause and rank the groups by tokens re-written.
+ *
+ * @param rewrites - Detected re-writes
+ * @returns Groups, largest token total first
+ */
+function rankRewriteGroups(rewrites: CacheRewrite[]): RewriteGroupTotal[] {
+  const byGroup = new Map<RewriteGroup, CacheRewrite[]>();
+  for (const rewrite of rewrites) {
+    const group = rewriteGroup(rewrite);
+    const list = byGroup.get(group);
+    if (list) list.push(rewrite);
+    else byGroup.set(group, [rewrite]);
+  }
+  return [...byGroup]
+    .map(([group, list]) => ({ group, rewrites: list, tokens: list.reduce((sum, r) => sum + r.tokens, 0) }))
+    .sort((a, b) => b.tokens - a.tokens);
+}
+
+/**
+ * Compact token count for descriptions: 1.4M, 540K, 900.
+ *
+ * @param tokens - Token count
+ * @returns Formatted count
+ */
+function formatTokenCount(tokens: number): string {
+  const thousands = Math.round(tokens / 1000);
+  if (thousands >= 1000) {
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  if (tokens >= 1000) return `${thousands}K`;
+  return Math.round(tokens).toLocaleString();
+}
+
+/**
+ * Length of a gap as an adjective: "22 min", "3 h", "1.5 h", "7-day".
+ *
+ * @param ms - Gap in milliseconds
+ * @returns Formatted length
+ */
+function formatGap(ms: number): string {
+  const minutes = ms / 60_000;
+  if (minutes < 59.5) return `${Math.max(1, Math.round(minutes))} min`;
+  const hours = minutes / 60;
+  if (hours < 47.5) return `${hours < 9.95 ? Number(hours.toFixed(1)) : Math.round(hours)} h`;
+  return `${Math.round(hours / 24)}-day`;
+}
+
+/**
+ * Join phrases as "a", "a and b", "a, b and c".
+ *
+ * @param parts - Phrases
+ * @returns One phrase
+ */
+function joinPhrases(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? '';
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/**
+ * Where and how one re-write happened, for the description.
+ *
+ * @param group - The re-write's group
+ * @param rewrite - The re-write
+ * @returns e.g. "after a 3 h break at message #812"
+ */
+function rewriteLocation(group: RewriteGroup, rewrite: CacheRewrite): string {
+  const at = `message #${rewrite.messageIndex + 1}`;
+  if ((group === 'expired_long' || group === 'expired_short') && rewrite.gapMs !== undefined) {
+    return `after a ${formatGap(rewrite.gapMs)} break at ${at}`;
+  }
+  if (group === 'model_changed' && rewrite.fromModel && rewrite.toModel) {
+    return `at ${at} (${rewrite.fromModel} to ${rewrite.toModel})`;
+  }
+  if (group === 'ttl_changed' && rewrite.writeTtl) {
+    return `at ${at} (${TTL_NAMES[rewrite.ttl]} to ${TTL_NAMES[rewrite.writeTtl]})`;
+  }
+  return `at ${at}`;
+}
+
+/**
+ * Describe a session's cache re-writes: the largest group with its biggest
+ * re-write, the other groups in one line, and the share of the session's
+ * cache writes they took.
+ *
+ * @param groups - Ranked re-write groups (at least one)
+ * @param share - Re-written tokens over all cache-write tokens
+ * @returns Description text
+ */
+function describeCacheRewrites(groups: RewriteGroupTotal[], share: number): string {
+  const lead = groups[0]!;
+  const count = lead.rewrites.length;
+  const largest = lead.rewrites.reduce((a, b) => (b.tokens > a.tokens ? b : a));
+  const where = rewriteLocation(lead.group, largest);
+  let text = `${count} cache re-write${count === 1 ? '' : 's'} ${REWRITE_PHRASES[lead.group][count === 1 ? 0 : 1]}`
+    + ` re-wrote ${formatTokenCount(lead.tokens)} tokens${count === 1 ? ` ${where}` : `; the largest ${where}`}.`;
+  const others = groups.slice(1).map((g) =>
+    `${g.rewrites.length} ${REWRITE_NOUNS[g.group][g.rewrites.length === 1 ? 0 : 1]} (${formatTokenCount(g.tokens)})`);
+  if (others.length > 0) text += ` Also ${joinPhrases(others)}.`;
+  return `${text} Re-writes were ${Math.round(share * 100)}% of this session's cache writes.`;
+}
+
+/**
+ * What would have prevented or shrunk the re-writes, largest group first.
+ * Names `promptCacheTtl` where a setting applies; never keep-alive pings.
+ *
+ * @param groups - Ranked re-write groups
+ * @returns Recommendation text
+ */
+function cacheRewriteAdvice(groups: RewriteGroupTotal[]): string {
+  const present = new Set(groups.map((g) => g.group));
+  const hints: string[] = [];
+  let ttlHint = false;
+  let prefixHint = false;
+  for (const { group } of groups) {
+    if ((group === 'expired_short' || group === 'ttl_changed') && !ttlHint) {
+      ttlHint = true;
+      if (!present.has('expired_short')) {
+        hints.push('Set "promptCacheTtl" ("5m" or "1h") in settings.json (Claude Code 2.1.242+) to pin the cache TTL so it cannot switch mid-session.');
+      } else {
+        const alsoPins = present.has('ttl_changed') ? ' and stop the TTL switching mid-session' : '';
+        hints.push(`Set "promptCacheTtl": "1h" in settings.json (Claude Code 2.1.242+) to keep the cache through breaks under an hour${alsoPins}; 1-hour cache writes cost more per token, so it pays off when such breaks are common.`);
+      }
+    } else if (group === 'expired_long') {
+      hints.push('Re-writes after long breaks are expected; /compact before a long break (or /clear once a task is done) makes them smaller.');
+    } else if (group === 'model_changed') {
+      hints.push('Each model has its own cache, so choose the model when a task starts rather than switching mid-task.');
+    } else if ((group === 'system_changed' || group === 'tools_changed') && !prefixHint) {
+      prefixHint = true;
+      hints.push('The system prompt or tool list changed mid-session (a plugin or MCP server change, for example); make such changes between tasks.');
+    }
+  }
+  return hints.length > 0
+    ? hints.join(' ')
+    : 'No setting prevents these re-writes; they are listed so their cost is visible.';
+}
+
+/**
+ * Detect cache overhead: prompt-cache writes that repeated content the
+ * cache already held.
+ *
+ * Cache reads are the healthy case (about a tenth of the input price, and
+ * 95-97% of input on a normal session), so they are not counted.
+ * `findCacheRewrites` finds the requests that wrote most of their agent's
+ * previous cached prefix again, skipping each agent's first request and the
+ * first request after each compaction, and names why: the cache expired, the
+ * model, system prompt, tools or earlier messages changed, or the cache TTL
+ * switched. The item appears when the re-writes come to at least
+ * `CACHE_REWRITE_MIN_TOKENS` and to at least `CACHE_REWRITE_THRESHOLD` of
+ * the session's cache-write tokens (a quarter by default; with 97% of input
+ * read from a one-hour cache, that is about a tenth of the session's input
+ * cost). The whole session is measured, compactions included, up to the
+ * analysed end. `estimated_tokens` stays 0: re-writes cost money, not
+ * window space, so they free nothing in the window.
  *
  * @param messages - All session messages
- * @returns Array of waste items (0 or 1) for cache overhead
+ * @param breakdown - The session's breakdown (compactions, analysed range)
+ * @returns Array of waste items (0 or 1) for cache re-writes
  */
-function detectCacheOverhead(messages: SessionMessage[]): WasteItem[] {
-  let totalInput = 0;
-  let totalCacheRead = 0;
+function detectCacheOverhead(messages: SessionMessage[], breakdown: CrustsBreakdown): WasteItem[] {
+  const report = findCacheRewrites(messages, breakdown.compactionEvents, breakdown.messages.length);
+  const rewritten = report.rewrites.reduce((sum, r) => sum + r.tokens, 0);
+  if (rewritten < CACHE_REWRITE_MIN_TOKENS || report.cacheWriteTokens <= 0) return [];
+  const share = rewritten / report.cacheWriteTokens;
+  if (share < CACHE_REWRITE_THRESHOLD) return [];
 
-  for (const msg of messages) {
-    const usage = msg.message?.usage;
-    if (!usage) continue;
-
-    totalInput += effectiveInput(usage);
-    totalCacheRead += usage.cache_read_input_tokens ?? 0;
-  }
-
-  if (totalInput === 0) return [];
-
-  const ratio = totalCacheRead / totalInput;
-  if (ratio <= CACHE_OVERHEAD_THRESHOLD) return [];
-
-  const pct = (ratio * 100).toFixed(1);
+  const groups = rankRewriteGroups(report.rewrites);
   return [{
     type: 'cache_overhead',
     severity: 'info',
-    description: `Cache reads are ${pct}% of total input — system prompt + tool schemas are re-sent every turn`,
+    description: describeCacheRewrites(groups, share),
     estimated_tokens: 0,
-    recommendation: 'Reduce CLAUDE.md size and disable unused MCP servers to lower per-turn cache cost. High cache overhead increases per-turn cost.',
+    recommendation: cacheRewriteAdvice(groups),
   }];
 }
 
@@ -1012,7 +1218,7 @@ export function detectWaste(
   const thresholds = loadWasteThresholds();
   STALE_READ_THRESHOLD = thresholds.staleReadThreshold;
   OVERSIZED_SYSTEM_THRESHOLD = thresholds.oversizedSystemThreshold;
-  CACHE_OVERHEAD_THRESHOLD = thresholds.cacheOverheadThreshold;
+  CACHE_REWRITE_THRESHOLD = thresholds.cacheRewriteThreshold;
   RESOLUTION_LOOKBACK = thresholds.resolutionLookback;
 
   // If compaction occurred, only analyze post-compaction messages
@@ -1025,7 +1231,7 @@ export function detectWaste(
     ...detectDuplicateReads(effectiveMessages, effectiveClassified),
     ...detectOversizedSystem(configData),
     ...detectResolvedExchanges(effectiveMessages, effectiveClassified),
-    ...detectCacheOverhead(messages), // Cache overhead uses full session (cumulative API data)
+    ...detectCacheOverhead(messages, breakdown), // Whole session: cache writes are billed across compactions
     ...detectUnusedResults(effectiveMessages, effectiveClassified),
   ];
 
