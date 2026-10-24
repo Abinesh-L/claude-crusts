@@ -95,6 +95,8 @@ export interface CacheRewrite {
   fromModel?: string;
   /** Model of this request, when it differs from the previous one's */
   toModel?: string;
+  /** True when a subagent made the request (a sidechain record) */
+  subagent?: boolean;
 }
 
 /** Cache accounting for one transcript (requests counted once per API response). */
@@ -194,15 +196,41 @@ function reportedReason(msg: SessionMessage): string | null | undefined {
 }
 
 /**
+ * Attachments Claude Code stamps with the response's own time, written just
+ * before its first line: they say when the response arrived, not when the
+ * request was sent.
+ */
+const RESPONSE_TIME_ATTACHMENTS = new Set(['deferred_tools_record']);
+
+/**
+ * When a request was sent: the newest input its agent recorded since its
+ * previous response that is older than the response's first line, else the
+ * first line itself. The newest, not the last in file order: a queued
+ * command is written after the tool result but keeps the time it was queued.
+ *
+ * @param inputs - Timestamps (ms) of the agent's inputs since its previous response
+ * @param firstLineMs - Timestamp of the response's first line
+ * @returns The send time, or undefined when nothing carries a timestamp
+ */
+function sendTime(inputs: number[] | undefined, firstLineMs: number | undefined): number | undefined {
+  let newest: number | undefined;
+  for (const ms of inputs ?? []) {
+    if (firstLineMs !== undefined && ms >= firstLineMs) continue;
+    if (newest === undefined || ms > newest) newest = ms;
+  }
+  return newest ?? firstLineMs;
+}
+
+/**
  * Fold the analysed records into API requests, in order.
  *
  * Split lines of one response (same `message.id`, else `requestId`, the
  * classifier's grouping) count once. `<synthetic>` placeholders, zeroed usage
  * copies and records without input are skipped: they describe no request.
- * A request's send time is the newest prompt, tool result or attachment its
- * agent recorded after its previous response (Claude Code writes that record
- * just before sending), never later than the response's first line, which
- * stands in when there is no such record.
+ * A request's send time comes from the prompts, tool results and attachments
+ * its agent recorded after its previous response (Claude Code writes them
+ * just before sending; see `sendTime`), leaving out the attachments stamped
+ * at response time (`RESPONSE_TIME_ATTACHMENTS`).
  *
  * @param messages - Parsed session messages
  * @param end - Exclusive end of the analysed range
@@ -212,14 +240,19 @@ function reportedReason(msg: SessionMessage): string | null | undefined {
 function collectRequests(messages: SessionMessage[], end: number, freshWindowLines: ReadonlySet<number>): ApiRequest[] {
   const requests: ApiRequest[] = [];
   const byKey = new Map<string, ApiRequest>();
-  const lastInputMs = new Map<string, number>();
+  const inputsMs = new Map<string, number[]>();
 
   for (let i = 0; i < end; i++) {
     const msg = messages[i]!;
     const agent = agentOf(msg);
     if (msg.type === 'user' || msg.type === 'attachment') {
+      if (msg.type === 'attachment' && RESPONSE_TIME_ATTACHMENTS.has(msg.attachment?.type ?? '')) continue;
       const ms = timestampMs(msg);
-      if (ms !== undefined) lastInputMs.set(agent, ms);
+      if (ms !== undefined) {
+        const inputs = inputsMs.get(agent);
+        if (inputs) inputs.push(ms);
+        else inputsMs.set(agent, [ms]);
+      }
       continue;
     }
     if (msg.type !== 'assistant') continue;
@@ -230,14 +263,12 @@ function collectRequests(messages: SessionMessage[], end: number, freshWindowLin
     const key = assistantGroupKey(msg) ?? `line:${i}`;
     let request = byKey.get(key);
     if (!request) {
-      const firstLineMs = timestampMs(msg);
-      const inputMs = lastInputMs.get(agent);
       request = {
         index: i,
         agent,
         model: msg.message?.model,
         usage,
-        sentMs: inputMs !== undefined && firstLineMs !== undefined ? Math.min(inputMs, firstLineMs) : inputMs ?? firstLineMs,
+        sentMs: sendTime(inputsMs.get(agent), timestampMs(msg)),
         freshWindow: false,
       };
       byKey.set(key, request);
@@ -246,7 +277,7 @@ function collectRequests(messages: SessionMessage[], end: number, freshWindowLin
     if (freshWindowLines.has(i)) request.freshWindow = true;
     const reason = reportedReason(msg);
     if (reason !== undefined && typeof request.reason !== 'string') request.reason = reason;
-    lastInputMs.delete(agent);
+    inputsMs.delete(agent);
   }
 
   return requests;
@@ -305,6 +336,7 @@ function classifyRewrite(
     ...(writeTtl !== undefined ? { writeTtl } : {}),
     ...(reason !== undefined ? { reportedReason: reason } : {}),
     ...(modelChanged ? { fromModel: previous.model, toModel: request.model } : {}),
+    ...(request.agent !== 'main' ? { subagent: true } : {}),
   };
 }
 

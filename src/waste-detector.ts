@@ -1039,13 +1039,25 @@ function describeCacheRewrites(groups: RewriteGroupTotal[], share: number): stri
 
 /**
  * What would have prevented or shrunk the re-writes, largest group first.
- * Names `promptCacheTtl` where a setting applies; never keep-alive pings.
+ * Names the cache TTL setting where one applies: `promptCacheTtl` covers
+ * the main conversation and `subagentPromptCacheTtl` subagents (both
+ * Claude Code 2.1.242+), so the setting named matches whose requests
+ * expired. Never suggests keep-alive pings.
  *
  * @param groups - Ranked re-write groups
  * @returns Recommendation text
  */
 function cacheRewriteAdvice(groups: RewriteGroupTotal[]): string {
   const present = new Set(groups.map((g) => g.group));
+  const ttlRewrites = groups.filter((g) => g.group === 'expired_short' || g.group === 'ttl_changed').flatMap((g) => g.rewrites);
+  const subagents = ttlRewrites.some((r) => r.subagent);
+  const main = ttlRewrites.some((r) => !r.subagent);
+  /** The TTL setting(s) to name, optionally with a value. */
+  const ttlSetting = (value?: string): string => {
+    const one = (key: string): string => (value ? `"${key}": ${value}` : `"${key}"`);
+    if (subagents && main) return `${one('promptCacheTtl')} (main conversation) and ${one('subagentPromptCacheTtl')} (subagents)`;
+    return one(subagents ? 'subagentPromptCacheTtl' : 'promptCacheTtl');
+  };
   const hints: string[] = [];
   let ttlHint = false;
   let prefixHint = false;
@@ -1053,10 +1065,10 @@ function cacheRewriteAdvice(groups: RewriteGroupTotal[]): string {
     if ((group === 'expired_short' || group === 'ttl_changed') && !ttlHint) {
       ttlHint = true;
       if (!present.has('expired_short')) {
-        hints.push('Set "promptCacheTtl" ("5m" or "1h") in settings.json (Claude Code 2.1.242+) to pin the cache TTL so it cannot switch mid-session.');
+        hints.push(`Set ${ttlSetting()} ("5m" or "1h") in settings.json (Claude Code 2.1.242+) to pin the cache TTL so it cannot switch mid-session.`);
       } else {
         const alsoPins = present.has('ttl_changed') ? ' and stop the TTL switching mid-session' : '';
-        hints.push(`Set "promptCacheTtl": "1h" in settings.json (Claude Code 2.1.242+) to keep the cache through breaks under an hour${alsoPins}; 1-hour cache writes cost more per token, so it pays off when such breaks are common.`);
+        hints.push(`Set ${ttlSetting('"1h"')} in settings.json (Claude Code 2.1.242+) to keep the cache through breaks under an hour${alsoPins}; 1-hour cache writes cost more per token, so it pays off when such breaks are common.`);
       }
     } else if (group === 'expired_long') {
       hints.push('Re-writes after long breaks are expected; /compact before a long break (or /clear once a task is done) makes them smaller.');

@@ -288,6 +288,44 @@ describe('expiries', () => {
     expect(item.recommendation).not.toMatch(/keep-?alive|ping/i);
   });
 
+  test('a record stamped when the response arrived does not hide a 5-minute expiry', () => {
+    // Enough turns that a re-write writes most of the cached prefix again.
+    const s = new SessionBuilder('claude-opus-5-5', '5m').start(30_000).turns(8);
+    // P: the response takes 6 minutes, and Claude Code writes a
+    // deferred_tools_record stamped with the response's time just before it.
+    s.turns(1);
+    const firstLine = s.messages[s.messages.length - 1]!;
+    const arrived = new Date(Date.parse(firstLine.timestamp!) + 6 * 60_000).toISOString();
+    firstLine.timestamp = arrived;
+    s.messages.splice(s.messages.length - 1, 0, { type: 'attachment', timestamp: arrived, attachment: { type: 'deferred_tools_record' } } as SessionMessage);
+    // Q follows the response at once, 6.3 minutes after P was sent: the entry expired.
+    s.rewrite(5.8);
+    expect(findCacheRewrites(s.messages).rewrites.at(-1)!.cause).toBe('expired');
+  });
+
+  test('a queued command keeps its earlier time without pulling the send time back', () => {
+    // Enough turns that a re-write writes most of the cached prefix again.
+    const s = new SessionBuilder('claude-opus-5-5', '5m').start(30_000).turns(8);
+    s.turns(1); // Q
+    const prompt = s.messages.length - 2;
+    const queuedAt = new Date(Date.parse(s.messages[prompt]!.timestamp!) - 10 * 60_000).toISOString();
+    s.messages.splice(prompt + 1, 0, { type: 'attachment', timestamp: queuedAt, attachment: { type: 'queued_command', prompt: 'later' } } as SessionMessage);
+    // R comes 4.5 minutes after Q was sent: inside the 5-minute TTL.
+    s.rewrite(4);
+    expect(findCacheRewrites(s.messages).rewrites.at(-1)!.cause).not.toBe('expired');
+  });
+
+  test('a subagent\'s 5-minute expiries name subagentPromptCacheTtl', () => {
+    const sub = { agentId: 'a1' };
+    const s = new SessionBuilder('claude-opus-5-5', '5m').start(30_000, sub).turns(8, 4_000, sub)
+      .rewrite(22, sub).turns(4, 4_000, sub).rewrite(40, sub).turns(2, 4_000, sub);
+    const report = findCacheRewrites(s.messages);
+    expect(report.rewrites.every((r) => r.subagent === true)).toBe(true);
+    const item = cacheItem(s.messages)!;
+    expect(item.recommendation).toContain('"subagentPromptCacheTtl": "1h"');
+    expect(item.recommendation).not.toContain('"promptCacheTtl"');
+  });
+
   test('expiries on the 5-minute cache within the hour name promptCacheTtl', () => {
     const s = new SessionBuilder('claude-opus-5-5', '5m').start(30_000).turns(8).rewrite(22).turns(4).rewrite(40).turns(2);
     const report = findCacheRewrites(s.messages);
