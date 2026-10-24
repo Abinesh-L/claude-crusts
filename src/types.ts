@@ -887,6 +887,12 @@ export interface WasteItem {
   estimated_tokens: number;
   recommendation: string;
   message_range?: [number, number];
+  /**
+   * False when a /compact cannot act on the item safely: a duplicate read
+   * whose earlier reads were only partly delivered again, where keeping
+   * only the latest read would drop lines read once. Absent means it can.
+   */
+  compactable?: boolean;
 }
 
 /** Summary metadata for a session */

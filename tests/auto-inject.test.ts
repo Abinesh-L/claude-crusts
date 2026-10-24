@@ -172,7 +172,8 @@ describe('buildInjectionText', () => {
     ];
     const text = buildInjectionText(breakdownAt(80), waste, 80);
     expect(text).toContain('drop stale read of classifier.ts');
-    expect(text).toContain('resolved exchange at messages #42-48');
+    // message_range is half-open and 0-based; the text numbers messages from 1, as the timeline does.
+    expect(text).toContain('resolved exchange at messages #43-48');
   });
 
   test('falls back to bare /compact when no actionable waste', () => {

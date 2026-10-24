@@ -344,11 +344,12 @@ const NUMBERED_LINE = /^\s*(\d+)(?:\t|:|\u2192)/;
 const MAX_LISTED_READS = 8;
 
 /**
- * Smallest repeated share of a file worth reporting, in tokens (the floor
- * the unused-result rule and `optimize --min-savings` use). Below it sit
- * the few lines of context a model re-reads where one page of a file meets
- * the next: 39 of 44 duplicate files on the owner's transcripts, at most
- * 78 tokens each.
+ * Smallest repeated share of an earlier read worth reporting, in tokens (the
+ * floor the unused-result rule and `optimize --min-savings` use). It applies
+ * to each earlier read, not to a file's total: the few lines of context a
+ * model re-reads where one page of a file meets the next stay below it
+ * however many pages there are. Summed per file they passed it, and 107 of
+ * 110 duplicate items on the owner's transcripts were such page edges.
  */
 const MIN_DUPLICATE_TOKENS = 100;
 
@@ -613,11 +614,13 @@ function isAfter(
  *
  * @param messages - All session messages
  * @param classified - Classified message data
+ * @param offset - Index of `messages[0]` in the session, so message numbers match the timeline
  * @returns Array of waste items for stale reads
  */
 function detectStaleReads(
   messages: SessionMessage[],
   classified: ClassifiedMessage[],
+  offset = 0,
 ): WasteItem[] {
   const items: WasteItem[] = [];
   const reads = extractFileReads(messages, classified);
@@ -635,10 +638,10 @@ function detectStaleReads(
       items.push({
         type: 'stale_read',
         severity: 'high',
-        description: `File "${filename}" was read at message #${read.messageIndex + 1} (${messageAge} messages ago) and not referenced since`,
+        description: `File "${filename}" was read at message #${offset + read.messageIndex + 1} (${messageAge} messages ago) and not referenced since`,
         estimated_tokens: read.estimatedTokens,
         recommendation: `/compact focus: messages ${read.messageIndex + 1}-${read.messageIndex + 2}`,
-        message_range: [read.messageIndex, read.messageIndex + 1],
+        message_range: [offset + read.messageIndex, offset + read.messageIndex + 1],
       });
     }
   }
@@ -665,8 +668,10 @@ interface RedundantRead {
  * `readDelivery`), so paging through a file (lines 1-200, then 201-400) is
  * not a duplicate. An earlier read is waste only for the part a later read
  * of the same file delivered again, and is sized as that share of its
- * tokens. A file is reported once its repeated share reaches
- * `MIN_DUPLICATE_TOKENS`.
+ * tokens; it counts once that share reaches `MIN_DUPLICATE_TOKENS`. When an
+ * earlier read was only partly delivered again, the item is not a /compact
+ * target (`compactable: false`): keeping only the latest read would drop
+ * the lines read once.
  *
  * Edit-aware: an Edit, Write, MultiEdit or NotebookEdit of the file between
  * the two reads makes the earlier copy stale rather than duplicated, so it
@@ -684,11 +689,13 @@ interface RedundantRead {
  *
  * @param messages - All session messages
  * @param classified - Classified message data
+ * @param offset - Index of `messages[0]` in the session, so message numbers match the timeline
  * @returns Array of waste items for duplicate reads (one per file)
  */
 function detectDuplicateReads(
   messages: SessionMessage[],
   classified: ClassifiedMessage[],
+  offset = 0,
 ): WasteItem[] {
   const items: WasteItem[] = [];
   const analysed = messages.length > classified.length ? messages.slice(0, classified.length) : messages;
@@ -740,18 +747,19 @@ function detectDuplicateReads(
 
       const share = coveredShare(delivered, covered);
       const tokens = Math.round(earlier.estimatedTokens * share);
-      if (tokens <= 0) continue;
+      if (tokens < MIN_DUPLICATE_TOKENS) continue;
       redundant.push({ read: earlier, spans: covered, full: share >= 1, tokens });
     }
+    if (redundant.length === 0) continue;
 
     const wasteTokens = redundant.reduce((sum, r) => sum + r.tokens, 0);
-    if (wasteTokens < MIN_DUPLICATE_TOKENS) continue;
+    const allFull = redundant.every((r) => r.full);
 
     // Consumers parse this text: `"<file>" read <n> times` and
     // `reads at <locations> are` (locations must not contain ')').
     const filename = extractFilename(pathReads[0]!.filePath);
     const listed = redundant.slice(0, MAX_LISTED_READS).map((r) => {
-      const at = `#${r.read.messageIndex + 1}`;
+      const at = `#${offset + r.read.messageIndex + 1}`;
       return r.full ? at : `${at} ${describeSpans(r.spans)}`;
     });
     const unlisted = redundant.length - listed.length;
@@ -762,8 +770,11 @@ function detectDuplicateReads(
       severity: 'medium',
       description: `"${filename}" read ${pathReads.length} times (earlier reads at ${locations} are redundant)`,
       estimated_tokens: wasteTokens,
-      recommendation: 'Unchanged lines already read are still in context: refer to the earlier read, and use offset and limit to read only new lines. /compact can drop the older copy.',
-      message_range: [redundant[0]!.read.messageIndex, redundant[redundant.length - 1]!.read.messageIndex + 1],
+      recommendation: allFull
+        ? 'Unchanged lines already read are still in context: refer to the earlier read, and use offset and limit to read only new lines. /compact can drop the older copy.'
+        : 'Unchanged lines already read are still in context: refer to the earlier read, and use offset and limit to read only new lines. The earlier reads also hold lines read only once, so a /compact should keep them.',
+      message_range: [offset + redundant[0]!.read.messageIndex, offset + redundant[redundant.length - 1]!.read.messageIndex + 1],
+      ...(allFull ? {} : { compactable: false }),
     });
   }
 
@@ -807,11 +818,13 @@ function detectOversizedSystem(claudeMd: ClaudeMdFootprint): WasteItem[] {
  *
  * @param messages - All session messages
  * @param classified - Classified message data
+ * @param offset - Index of `messages[0]` in the session, so message numbers match the timeline
  * @returns Array of waste items for resolved exchanges
  */
 function detectResolvedExchanges(
   messages: SessionMessage[],
   classified: ClassifiedMessage[],
+  offset = 0,
 ): WasteItem[] {
   const items: WasteItem[] = [];
 
@@ -856,10 +869,10 @@ function detectResolvedExchanges(
       items.push({
         type: 'resolved_exchange',
         severity: 'high',
-        description: `Resolved exchange before message #${i + 1} ("${textLower.slice(0, 40)}") — preceding discussion is compactable`,
+        description: `Resolved exchange before message #${offset + i + 1} ("${textLower.slice(0, 40)}") — preceding discussion is compactable`,
         estimated_tokens: exchangeTokens,
         recommendation: `/compact focus: messages ${lookbackStart + 1}-${i + 1}`,
-        message_range: [lookbackStart, i],
+        message_range: [offset + lookbackStart, offset + i],
       });
     }
   }
@@ -1104,11 +1117,13 @@ function detectCacheOverhead(messages: SessionMessage[], breakdown: CrustsBreakd
  *
  * @param messages - All session messages
  * @param classified - Classified message data
+ * @param offset - Index of `messages[0]` in the session, so message numbers match the timeline
  * @returns Array of waste items for unused results
  */
 function detectUnusedResults(
   messages: SessionMessage[],
   classified: ClassifiedMessage[],
+  offset = 0,
 ): WasteItem[] {
   const items: WasteItem[] = [];
 
@@ -1175,10 +1190,10 @@ function detectUnusedResults(
           items.push({
             type: 'unused_result',
             severity: 'low',
-            description: `${toolName ?? 'Tool'} result at message #${i + 1} (~${tokens} tokens) appears unused by assistant`,
+            description: `${toolName ?? 'Tool'} result at message #${offset + i + 1} (~${tokens} tokens) appears unused by assistant`,
             estimated_tokens: tokens,
             recommendation: 'Consider whether this tool call was necessary. Unused results waste context space.',
-            message_range: [i, i],
+            message_range: [offset + i, offset + i + 1],
           });
         }
       }
@@ -1193,7 +1208,9 @@ function detectUnusedResults(
  * medium-severity items that sit in the conversation. A large CLAUDE.md is
  * read again after every compaction and cache re-writes are billing, so
  * neither can be compacted away; counting them overstated what a compact
- * frees and could push a real target out of the three.
+ * frees and could push a real target out of the three. Items marked
+ * `compactable: false` (a duplicate whose earlier reads hold lines read
+ * once) are left out too: "keep only latest read" would drop those lines.
  *
  * @param waste - Detected waste items, in detectWaste's order
  * @returns Up to three items
@@ -1201,7 +1218,7 @@ function detectUnusedResults(
 export function compactTargets(waste: WasteItem[]): WasteItem[] {
   return waste
     .filter((w) => (w.severity === 'high' || w.severity === 'medium')
-      && w.type !== 'oversized_system' && w.type !== 'cache_overhead')
+      && w.type !== 'oversized_system' && w.type !== 'cache_overhead' && w.compactable !== false)
     .slice(0, 3);
 }
 
@@ -1243,12 +1260,12 @@ export function detectWaste(
   const effectiveClassified = startIndex > 0 ? breakdown.messages.slice(startIndex) : breakdown.messages;
 
   const items: WasteItem[] = [
-    ...detectStaleReads(effectiveMessages, effectiveClassified),
-    ...detectDuplicateReads(effectiveMessages, effectiveClassified),
+    ...detectStaleReads(effectiveMessages, effectiveClassified, startIndex),
+    ...detectDuplicateReads(effectiveMessages, effectiveClassified, startIndex),
     ...detectOversizedSystem(sessionClaudeMd(breakdown, configData)),
-    ...detectResolvedExchanges(effectiveMessages, effectiveClassified),
+    ...detectResolvedExchanges(effectiveMessages, effectiveClassified, startIndex),
     ...detectCacheOverhead(messages, breakdown), // Whole session: cache writes are billed across compactions
-    ...detectUnusedResults(effectiveMessages, effectiveClassified),
+    ...detectUnusedResults(effectiveMessages, effectiveClassified, startIndex),
   ];
 
   // Sort: high severity first, then by token savings descending

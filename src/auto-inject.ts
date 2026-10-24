@@ -310,7 +310,7 @@ export function compactCommandFor(waste: WasteItem[]): string {
       const m = /"([^"]+)"/.exec(item.description);
       if (m) targets.push(`drop stale read of ${m[1]}`);
     } else if (item.type === 'resolved_exchange' && item.message_range) {
-      targets.push(`drop resolved exchange at messages #${item.message_range[0]}-${item.message_range[1]}`);
+      targets.push(`drop resolved exchange at messages #${item.message_range[0] + 1}-${item.message_range[1]}`);
     }
   }
   return targets.length > 0 ? `/compact focus "${targets.join('; ')}"` : '/compact';

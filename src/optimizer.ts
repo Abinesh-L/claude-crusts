@@ -415,7 +415,7 @@ export function buildCompactFocus(waste: WasteItem[]): { text: string; savings: 
       const match = /"([^"]+)"/.exec(item.description);
       if (match) targets.push(`drop stale read of ${match[1]}`);
     } else if (item.type === 'resolved_exchange') {
-      if (item.message_range) targets.push(`drop resolved exchange at messages #${item.message_range[0]}-${item.message_range[1]}`);
+      if (item.message_range) targets.push(`drop resolved exchange at messages #${item.message_range[0] + 1}-${item.message_range[1]}`);
     }
   }
   if (targets.length === 0) return null;

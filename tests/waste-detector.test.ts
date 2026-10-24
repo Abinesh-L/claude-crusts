@@ -440,9 +440,65 @@ describe('duplicate descriptions keep the shape consumers parse', () => {
     const fix = generateFixPrompts(breakdown, waste, EMPTY_CONFIG);
     expect(fix.sessionPrompt).toContain('- app.ts (already read, at messages #2 lines 101-200)');
 
+    // The earlier read also holds lines 1-100 and 201-400, read once: keeping
+    // only the latest read (lines 401-500) would drop them, so the partial
+    // duplicate is no /compact target.
+    expect(dupe.compactable).toBe(false);
+    expect(dupe.recommendation).not.toContain('/compact can drop');
+    expect(buildCompactFocus(waste)).toBeNull();
+    expect(compactCommandFor(waste)).toBe('/compact');
+  });
+
+  test('a full re-read is a /compact target, the same in every builder', () => {
+    const msgs = [
+      prompt('read app.ts'),
+      readCall('r1', FILE), readResult('r1', 1, fileLines(1, 400)),
+      readCall('r2', FILE), readResult('r2', 1, fileLines(1, 400)),
+    ];
+    msgs.push({
+      type: 'assistant',
+      uuid: 'a-final',
+      message: { role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 150_000, output_tokens: 100 } },
+    } as SessionMessage);
+    const breakdown = classifySession(msgs, EMPTY_CONFIG);
+    const waste = detectWaste(msgs, breakdown, EMPTY_CONFIG);
+    const dupe = waste.find((w) => w.type === 'duplicate_read')!;
+    expect(dupe.description).toBe('"app.ts" read 2 times (earlier reads at #2 are redundant)');
+    expect(dupe.compactable).toBeUndefined();
+
     const focus = buildCompactFocus(waste)!;
-    expect(focus.text).toContain('keep only latest read of app.ts');
+    expect(focus.text).toBe('/compact focus "keep only latest read of app.ts"');
     expect(compactCommandFor(waste)).toBe(focus.text);
-    expect(fix.compactCommand).toBe(focus.text);
+    expect(generateFixPrompts(breakdown, waste, EMPTY_CONFIG).compactCommand).toBe(focus.text);
+  });
+
+  test('after a compaction, message numbers are the timeline\'s', () => {
+    const msgs: SessionMessage[] = [
+      prompt('earlier work'),
+      { type: 'assistant', uuid: 'a-0', message: { role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 90_000, output_tokens: 100 } } } as SessionMessage,
+      { type: 'system', subtype: 'compact_boundary', uuid: 'b-1', compactMetadata: { trigger: 'manual', preTokens: 90_100, postTokens: 5_000 } } as SessionMessage,
+      { type: 'user', uuid: 's-1', isCompactSummary: true, message: { role: 'user', content: 'summary '.repeat(400) } } as SessionMessage,
+      prompt('read app.ts again'),
+      readCall('r1', FILE), readResult('r1', 1, fileLines(1, 400)),
+      readCall('r2', FILE), readResult('r2', 1, fileLines(1, 400)),
+      { type: 'assistant', uuid: 'a-9', message: { role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 30_000, output_tokens: 100 } } } as SessionMessage,
+    ];
+    const breakdown = classifySession(msgs, EMPTY_CONFIG);
+    expect(breakdown.currentContext!.startIndex).toBeGreaterThan(0);
+    const dupe = detectWaste(msgs, breakdown, EMPTY_CONFIG).find((w) => w.type === 'duplicate_read')!;
+    // The first read call is record 5 of the session: the timeline's #6.
+    expect(dupe.description).toBe('"app.ts" read 2 times (earlier reads at #6 are redundant)');
+    expect(dupe.message_range![0]).toBe(5);
+  });
+
+  test('a page edge repeated on every page is not a duplicate', () => {
+    // Paging with a two-line overlap: each earlier read repeats two lines,
+    // far under the floor, however many pages there are.
+    const msgs: SessionMessage[] = [prompt('read app.ts')];
+    for (let page = 0; page < 12; page++) {
+      const start = 1 + page * 98;
+      msgs.push(readCall(`p${page}`, FILE, { offset: start, limit: 100 }), readResult(`p${page}`, start, fileLines(start, 100)));
+    }
+    expect(duplicates(msgs)).toEqual([]);
   });
 });
