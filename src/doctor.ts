@@ -132,11 +132,12 @@ export interface RetentionContext {
  * when the setting is absent; under 1 is a settings error), and crusts can
  * analyse a session only while its transcript exists. The auto-inject
  * hook's session summaries (session-summary.ts) keep a small record past
- * that. Warns when the setting is absent, invalid or under
- * `MIN_RETENTION_DAYS`, recommending `RECOMMENDED_RETENTION_DAYS`. Before
- * Claude Code 2.1.310 a very large value made background cleanup delete
- * some recent files, such as pasted images, so on an older version the
- * advice says to stay moderate and a value above the recommendation warns.
+ * that. Warns when the setting is absent, not a whole number of at least 1
+ * (Claude Code then skips the settings file) or under `MIN_RETENTION_DAYS`,
+ * recommending `RECOMMENDED_RETENTION_DAYS`. Before Claude Code 2.1.310 a
+ * value of `HUGE_CLEANUP_PERIOD_DAYS` or more put the cleanup cutoff outside
+ * the Date range, so background cleanup deleted recent files, such as pasted
+ * images; on an older version such a value warns.
  * Without a known version that caveat is left out.
  *
  * @param settings - Parsed ~/.claude/settings.json: {} when the file does

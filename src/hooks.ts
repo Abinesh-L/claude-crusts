@@ -657,12 +657,12 @@ export function summarizeStatus(breakdown: CrustsBreakdown): StatusSummary {
  * Parse a session and summarise its live window for the status line.
  *
  * Config comes from the session's own project, as `analyze` reads it: the
- * project root decoded from the transcript's folder (else `cwd`), the
+ * folder the session started in (`sessionProjectPath`, else `cwd`), the
  * folder's slug for memory, and the MCP servers the transcript used. So the
  * status line and `analyze` agree on the window size and the usage.
  *
  * @param sessionPath - Session JSONL path
- * @param cwd - Project root to use when the folder name does not decode
+ * @param cwd - Project root to use when the session's own folder cannot be found
  * @returns The summary, or null for an empty session
  */
 export async function buildStatusSummary(sessionPath: string, cwd?: string): Promise<StatusSummary | null> {

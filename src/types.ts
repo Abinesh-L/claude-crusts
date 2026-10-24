@@ -683,7 +683,7 @@ export interface DerivedOverhead {
   } | null;
   /**
    * Claude Code's own system prompt as the session recorded it (the latest
-   * `prompt_snapshot` attachment, 2.1.269+), sized at the text divisor. When
+   * `prompt_snapshot` attachment, 2.1.268+), sized at the text divisor. When
    * present, the System bucket carries this instead of `internalSystemPrompt`:
    * the derived figure is everything the anchor turn held beyond the
    * estimated components, so it also holds their shortfall (24.0K against

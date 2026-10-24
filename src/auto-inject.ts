@@ -433,10 +433,11 @@ export async function runAutoInject(): Promise<void> {
 
     // The session's own project: its CLAUDE.md, memory folder, project
     // settings (model, auto-compact window, idle compaction) and the MCP
-    // servers the transcript used. The project root comes from the
-    // transcript's folder (the session's start directory), as in `analyze`;
+    // servers the transcript used. The project root is the folder the
+    // session started in (`sessionProjectPath`), as in `analyze`;
     // payload.cwd follows a `cd` mid-session and would drop the project's
-    // settings. A bare gatherConfigData() read only the user-level files.
+    // settings, so it is only the fallback. A bare gatherConfigData() read
+    // only the user-level files.
     const slug = basename(dirname(transcriptPath));
     const projectRoot = sessionProjectPath(messages, transcriptPath)
       ?? (payload.cwd && existsSync(payload.cwd) ? payload.cwd : undefined);

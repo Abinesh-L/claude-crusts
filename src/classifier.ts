@@ -439,7 +439,7 @@ function instructionsOverhead(
 /**
  * Claude Code's own system prompt as the session recorded it.
  *
- * From 2.1.269 Claude Code writes a `prompt_snapshot` attachment holding the
+ * From 2.1.268 Claude Code writes a `prompt_snapshot` attachment holding the
  * system prompt it sends (`systemPrompt`, an array of text blocks, after the
  * `cliPrefix` line) and its tool schemas. The snapshot is never sent itself
  * (it has no `rendered`, so it costs 0 as an attachment), but it is the one
@@ -2120,7 +2120,7 @@ function computeEffectiveInputTokens(
  * itemize after a compaction (without it the estimate ran about 27% low).
  * Files Claude Code has re-attached but not yet recorded count as recorded
  * ones would (`pendingReattachments`). On 50 real boundaries the estimate
- * came within a median 6.3% of the next request (worst 28.5%).
+ * came within a median 6.2% of the next request (worst 25.5%).
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
  * @param events - Compaction events detected on the same messages
@@ -2543,7 +2543,7 @@ export function classifySession(
     currentFactor,
   );
   // The System bucket carries Claude Code's own system prompt: the recorded
-  // copy when the session has one (2.1.269+), else the derived residual. The
+  // copy when the session has one (2.1.268+), else the derived residual. The
   // residual is everything the anchor turn held beyond the estimated
   // components, so with a recorded prompt the rest of it is those estimates'
   // shortfall, which reconciliation to the API total spreads over every

@@ -71,7 +71,8 @@ TOTAL:   92,108 / 200,000  (46.1%)
 
 No duplicate reads
 Stale reads trimmed
-Tool schemas pruned (.claudeignore)
+Old tool results compacted
+Noise reads refused from now on (Read deny rules)
 Auto-compaction in ~180 msgs
 
 Context health: HEALTHY
@@ -87,7 +88,7 @@ Context health: HEALTHY
 ┌──────────────────────────────────────────────┐
 │  CONTEXT FRESHNESS      ████████ CRISP       │
 │  DUPLICATE FILE READS   ░░░░░░░░ PURGED      │
-│  UNUSED TOOL SCHEMAS    ░░░░░░░░ REMOVED     │
+│  NOISE PATH READS       ░░░░░░░░ BLOCKED     │
 │  SELF-HEALING HOOK      ████████ LIVE        │
 │  OFFLINE / API-FREE     ████████ 100%        │
 │  VIBES                  ████████ TOASTY      │
@@ -103,7 +104,8 @@ Three commands cover 90% of day-to-day use. You can stop reading right there if 
 #    Claude surfaces it in its reply. You run it.
 claude-crusts hooks auto-inject enable
 
-# 2. ACTIVE FIX — write .claudeignore + CLAUDE.md rules for you.
+# 2. ACTIVE FIX: Read deny rules in .claude/settings.local.json that make
+#    Claude Code refuse to read noise paths, written for you.
 #    Atomic backups under ~/.claude-crusts/backups/, per-fix confirmation.
 claude-crusts optimize --apply
 
@@ -163,9 +165,9 @@ Fully offline. Zero API calls. Zero token cost.
 
 **Core capabilities:**
 - **Auto-inject** — `hooks auto-inject enable` installs a hook that writes a session-specific `/compact focus` command when the window nears Claude Code's auto-compaction trigger (or your configured threshold). You see a one-line notice with the command, and Claude surfaces it in its next reply. You run it, context drops. Every fire logged to `~/.claude-crusts/auto-inject.log` for audit.
-- **Active optimization** — `optimize --apply` writes `.claudeignore` and CLAUDE.md rules for you, with confirmation prompts and backups under `~/.claude-crusts/backups/`.
+- **Active optimization**: `optimize --apply` adds Read deny rules to the project's `.claude/settings.local.json`, so Claude Code refuses to read the noise paths a session read (`node_modules/`, `dist/`, lock files and so on), with confirmation prompts and backups under `~/.claude-crusts/backups/`.
 - **6-category context breakdown** — Conversation, Retrieved, User, System, Tools, State/Memory. See exactly where your tokens are going.
-- **Waste detection** — duplicate file reads, unused tool schemas, stale content, resolved exchanges, cache overhead, unused tool results.
+- **Waste detection**: duplicate file reads, unused tool schemas, stale content, resolved exchanges, cache re-writes (the cache expired or the prompt prefix changed, so an already-cached conversation was written again), oversized CLAUDE.md files, unused tool results.
 - **Past-session analysis** — Claude Code forgets everything when you exit. The JSONL logs don't. Analyze any session from days or weeks ago.
 - **Cross-session trends** — sparklines, direction (improving / worsening / flat), recent-session table.
 - **Interactive TUI** — `claude-crusts tui` drops you into a REPL shell with tab completion for commands and session IDs.
@@ -303,7 +305,7 @@ Start with the TUI — the other commands are here for scripting, CI, and power 
 ```bash
 # Friction reducers (install once, benefit every session):
 claude-crusts hooks auto-inject enable        # self-healing context
-claude-crusts optimize --apply                 # writes .claudeignore + CLAUDE.md
+claude-crusts optimize --apply                 # writes Read deny rules
 claude-crusts statusline install               # ambient health glyph
 
 # Day-to-day:
@@ -329,7 +331,7 @@ claude-crusts bench compact                    # tail JSONL, capture before/afte
 claude-crusts bench compare a.json b.json      # diff two bench results
 
 # Management:
-claude-crusts doctor                           # install sanity check (9 checks)
+claude-crusts doctor                           # install sanity check (10 checks)
 claude-crusts hooks enable                     # one-line health after every response
 ```
 
@@ -394,13 +396,13 @@ claude-crusts waste
 claude-crusts waste e5f6a7b8       # any past session
 ```
 
-Real output from the same session as the `analyze` example above:
+Example output (abridged):
 
 ```
   Waste Detection Report
   Session: 34ac6b07 | Messages: 281
 
-  11 issue(s) found — ~6,850 tokens reclaimable (5.6%)
+  10 issue(s) found — ~6,850 tokens reclaimable (5.6%)
 
   ── LOW (10) ──
 
@@ -410,16 +412,11 @@ Real output from the same session as the `analyze` example above:
   [LOW] Bash result at message #85 (~1128 tokens) appears unused by assistant ~1,128 tkns
     → Consider whether this tool call was necessary. Unused results waste context space.
 
-  ── INFO (1) ──
-
-  [INFO] Cache reads are 89.3% of total input — system prompt + tool schemas are re-sent every turn ~0 tkns
-    → Reduce CLAUDE.md size and disable unused MCP servers to lower per-turn cache cost.
-
   ── RECOMMENDATIONS ──
 
   P3 Top 5 context consumers:
           1. Tool schemas (22 loaded, 11 used) — 22,500 tokens
-          2. System prompt (CLAUDE.md 1,294 + internal 20,389) — 21,683 tokens
+          2. System prompt (CLAUDE.md 1,294 + Claude Code 20,389) — 21,683 tokens
           3. Compaction summary (compressed context from 199,326 tokens) — 3,413 tokens
           4. Memory files (56 file(s)) — 2,345 tokens
      These items consume the most context window space in your current session.
@@ -432,15 +429,15 @@ Real output from the same session as the `analyze` example above:
 ```
 
 Detects:
-- **Duplicate file reads** — which files, how many times, which messages, estimated wasted tokens
+- **Duplicate file reads**: which files, which messages and which lines a later read delivered again with no edit in between, and the repeated tokens. Paging through a file, re-reads after an edit and Claude Code's "file unchanged" stubs are not waste
 - **Unused tools** — which of the loaded tool schemas (core plus any ToolSearch-loaded deferred tools) were never invoked; deferred tools that were never loaded cost nothing and are never counted against you
-- **Cache overhead** — what percentage of your input is re-reading the same cached content every message
-- **Oversized system prompt** — when CLAUDE.md is large enough to consider splitting
+- **Cache re-writes**: requests that wrote an already-cached conversation to the prompt cache again, because the cache expired (5-minute or 1-hour TTL) or the model, system prompt, tools or earlier messages changed. You get the count, the tokens re-written, the largest one with its gap and message number, the share of the session's cache writes, and the setting that helps (`promptCacheTtl`) when one applies. Only the session's own transcript is measured: Claude Code keeps each subagent's requests in a transcript of its own, which crusts does not read. Cache reads are the healthy case and are never flagged
+- **Oversized CLAUDE.md**: when the CLAUDE.md files a session loads at startup (a parent folder's and CLAUDE.local.md included, as the session recorded them) add more than 1,500 tokens to every request. Each file is named with its size, and the advice says what loads on demand instead: path-scoped rules or a CLAUDE.md in a subfolder
 - **Compaction patterns** — how often you're hitting auto-compaction and what to do about it
 
 ### `claude-crusts fix [session-id]`
 
-The headline feature. Generates three pasteable text blocks — one for your current session, one for your CLAUDE.md, and one /compact command — all tailored to your session's actual waste patterns. No LLM involved.
+The headline feature. Generates three pasteable text blocks (one for your current session, one for your CLAUDE.md and one /compact command), all tailored to your session's actual waste patterns. No LLM involved. When the CLAUDE.md files are over the 1,500-token budget, a note under the blocks says what to move where; it is not text to paste.
 
 ```bash
 claude-crusts fix                  # fix for most recent session
@@ -500,24 +497,30 @@ claude-crusts optimize                           # dry-run, ranked report
 claude-crusts optimize --apply                   # apply with per-fix confirmation
 claude-crusts optimize --apply --yes             # apply without prompting (use with care)
 claude-crusts optimize --min-savings 500         # hide fixes below 500 tokens
-claude-crusts optimize --filter claudeignore,compact-focus
+claude-crusts optimize --filter read-deny,compact-focus
+claude-crusts optimize --project-path ~/work/app  # treat ~/work/app as the project: its reads, its settings file
 ```
+
+The file fixes go to the project the session ran in (the folder it started in), whichever folder you run `optimize` from.
 
 ```
 CRUSTS Optimize — session a1b2c3d4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total saveable: 12,400 tokens (6.2% of window)
+Total saveable: 7,300 tokens (3.6% of window)
 
 1. ▶ [-4,200 tkns] Session-specific /compact command
    Targets the top waste items in this session rather than a generic compact.
-   /compact focus "keep only latest read of renderer.ts; drop resolved exchange at #42-48"
+   /compact focus "keep only latest read of renderer.ts; drop resolved exchange at messages #42-48"
 
-2. ⚙ [-3,100 tkns] Add 2 noise pattern(s) to .claudeignore
-   node_modules — 4 file(s), ~2,100 tokens
-   dist — 2 file(s), ~1,000 tokens
-   node_modules/
-   dist/
-   Target: /your/project/.claudeignore
+2. ⚙ [-3,100 tkns] Make Claude Code refuse to read node_modules/ and dist/
+   node_modules (installed deps): 4 file(s) read, ~2,100 tokens
+   dist (build output): 2 file(s) read, ~1,000 tokens
+   Adds Read deny rules to .claude/settings.local.json, your personal settings for this project.
+   Claude Code will refuse to read these paths (file reads, searches, @-mentions, and shell commands such as cat that name them) and to edit or write files there.
+   Remove the rules in /permissions or in that file to undo.
+   Read(/**/node_modules/**)
+   Read(/dist/**)
+   Target: /your/project/.claude/settings.local.json
 
 3. ⦿ [ info ]    1 MCP server(s) loaded but never invoked
    Unused in this session: gmail
@@ -528,16 +531,18 @@ Total saveable: 12,400 tokens (6.2% of window)
 | Kind | Auto-apply | What it does |
 |------|:----------:|-------------|
 | `compact-focus` | copy to clipboard | Generates a `/compact focus "..."` tuned to your session's exact waste |
-| `claudeignore` | ✅ append | Adds noise patterns (`node_modules/`, `dist/`, `*.lock`, etc.) to `.claudeignore` |
-| `claudemd-rule` | ✅ append | Adds a "Files to avoid reading" rule block to your `CLAUDE.md` |
+| `read-deny` | ✅ merge | Adds `Read(...)` deny rules for the noise paths the session read inside the project to the project's `.claude/settings.local.json`. Claude Code then refuses to read them and to edit or write files there. `node_modules/`, `.git/` and lock files are denied at any depth. An output folder (`dist/`, `build/`, `.next/`, `target/`) is denied only where it was read, and only when git ignores it or tracks nothing in it, since folders with those names often hold source. Other settings and existing rules are kept, and a file that is not valid JSON is reported and left alone. Formerly `claudeignore`, a name `--filter` still accepts. |
+| `claudemd-rule` | ✅ append | Adds a "Files to avoid reading" rule block to your `CLAUDE.md`, only where the deny rules cannot apply (the settings file is not valid JSON, or `--filter` leaves `read-deny` out) |
 | `mcp-disable` | copy to clipboard | Flags MCP servers loaded but never invoked this session |
-| `claudemd-oversized` | warn only | Flags a `CLAUDE.md` above the recommended 1,500-token budget |
+| `claudemd-oversized` | warn only | Flags CLAUDE.md files over the recommended 1,500-token budget: every file the session loads at startup, sized for its model, with the largest named. Path-scoped rules or a CLAUDE.md in a subfolder load on demand; CLAUDE.local.md and `@` imports load with CLAUDE.md, so moving text there saves nothing |
 
 **Safety guarantees:**
 - `--apply` is opt-in; dry-run is the default.
 - Every file modification is **backed up** to `~/.claude-crusts/backups/<file>.<timestamp>.bak` before writing.
 - Every fix requires per-fix confirmation unless `--yes` is passed.
 - No fix ever touches Claude Code's live session state directly.
+- `read-deny` merges into `.claude/settings.local.json` and never overwrites it. Other keys and rules stay, a rule already there is not added twice, and a file that is not valid JSON is never written. Remove the rules in `/permissions` or in that file to undo. If git lists the new file, add `.claude/settings.local.json` to `.gitignore`.
+- Claude Code has no ignore file for Claude's own reads. A `.claudeignore` written by crusts up to 0.8.1 has no effect and can be deleted.
 
 ### `claude-crusts models [session-id]`
 
@@ -570,7 +575,9 @@ The `analyze` header gets a `(switched from claude-sonnet-4-6)` hint whenever th
 
 ### `claude-crusts doctor`
 
-Sanity-check your install. Runs 9 checks — Claude Code install, settings.json validity, session discovery, hook/statusline presence, calibration data, trend history, backup dir writability — and reports a `pass | warn | fail` verdict.
+Sanity-check your install. Runs 10 checks (crusts version, Claude Code install, settings.json validity, session discovery, transcript retention, hook and statusline presence, calibration data, trend history, backup dir writability) and reports a `pass | warn | fail` verdict.
+
+Transcript retention warns when `cleanupPeriodDays` in `~/.claude/settings.json` is unset or under 90: Claude Code deletes transcripts older than that (30 days by default), and crusts cannot analyze a session without its transcript. Set `"cleanupPeriodDays": 365`. Before Claude Code 2.1.310 a value of about 100 million days or more made background cleanup delete recent files, such as pasted images; ordinary long retention such as 3650 was never affected. The hook check warns when the status hook from 0.8.1 or earlier, which never showed anything, is still installed, and when the installed hook's command would fail (`claude-crusts` missing from PATH, or older than 0.8.2).
 
 ```bash
 claude-crusts doctor
@@ -579,10 +586,12 @@ claude-crusts doctor
 ```
   CRUSTS Doctor
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✓ pass  claude-crusts version         0.7.0
+  ✓ pass  claude-crusts version         0.8.2
   ✓ pass  Claude Code install           Found ~/.claude
+  ✓ pass  Claude Code settings          settings.json parses cleanly.
   ✓ pass  Session discovery             Found 12 session(s)
-  ✓ pass  Hook integration              CRUSTS hook installed
+  ! warn  Transcript retention          cleanupPeriodDays is not set, so Claude Code deletes transcripts older than 30 days ...
+  ✓ pass  Hook integration              CRUSTS Stop hook installed (context health after each response).
   ✓ pass  Statusline integration        CRUSTS statusline installed
   ! warn  Calibration data              No calibration saved.
   ✓ pass  Trend history                 42 record(s), 12,276 bytes
@@ -730,14 +739,14 @@ Output is a coloured cli-table with green/yellow highlights for negative/positiv
 
 ### Customising waste thresholds
 
-All waste thresholds (stale-read window, oversized-system limit, cache-overhead ratio, resolution lookback, CLAUDE.md-oversized threshold) can be overridden via `~/.claude-crusts/config.json`:
+All waste thresholds (stale-read window, oversized-system limit, cache re-write share, resolution lookback, CLAUDE.md-oversized threshold) can be overridden via `~/.claude-crusts/config.json`:
 
 ```json
 {
   "wasteThresholds": {
     "staleReadThreshold": 30,
     "oversizedSystemThreshold": 2500,
-    "cacheOverheadThreshold": 0.5,
+    "cacheRewriteThreshold": 0.4,
     "resolutionLookback": 15,
     "claudeMdOversizedThreshold": 2000
   }
@@ -746,26 +755,40 @@ All waste thresholds (stale-read window, oversized-system limit, cache-overhead 
 
 Run any analysis with `--verbose` to see which overrides are active. Missing or invalid values fall through to defaults; sibling config keys (hooks, auto-inject state) are preserved by the merge-safe writer.
 
+`cacheRewriteThreshold` is the share of a session's cache-write tokens (0 to 1, default 0.25) that must go to re-writes before the cache item appears; re-writes under 50,000 tokens never show. The 0.8.1 key `cacheOverheadThreshold` (a cache-read ratio) is ignored, and `--verbose` says so. The two CLAUDE.md limits (`oversizedSystemThreshold` for the waste item, `claudeMdOversizedThreshold` for the `optimize` fix) are compared with all the CLAUDE.md files the session loads at startup, in its model's tokens.
+
 ### `claude-crusts status [session-id]`
 
-One-line context health summary. Fast path — classify only, no waste detection or recommendations. Used by hooks but also useful standalone.
+One-line context health summary. Fast path: classify only, no waste detection or recommendations. It reads the session's own project settings, CLAUDE.md and memory, as `analyze` does, so the two agree. The Stop hook runs it; it is also useful standalone.
 
 ```bash
 claude-crusts status
 # CRUSTS: 62.4% (warming) | 45 msgs | 1 compaction
 ```
 
+`--hook` runs it as Claude Code's Stop hook. It reads the hook payload on stdin (waiting at most 1 second), reports the session named by `transcript_path` (else `session_id`, else the latest session), and prints one JSON object, `{"systemMessage": "CRUSTS: ..."}`, which Claude Code shows to you. It prints nothing when `stop_hook_active` is true or when anything fails, always exits 0, and never asks Claude to keep working.
+
 ### `claude-crusts hooks enable|disable|status`
 
-Opt-in Claude Code hook integration. When enabled, `claude-crusts status` runs automatically after each Claude Code response, showing a one-line context health indicator.
+Opt-in Claude Code hook integration. `hooks enable` adds a `Stop` hook to `~/.claude/settings.json` that runs `claude-crusts status --hook` each time Claude finishes a response, and Claude Code shows the one-line context health notice under the response:
+
+```
+CRUSTS: 62.4% (warming) | 45 msgs | 1 compaction
+```
 
 ```bash
-claude-crusts hooks enable           # install hook in ~/.claude/settings.json
-claude-crusts hooks disable          # remove hook (other hooks untouched)
+claude-crusts hooks enable           # install the Stop hook in ~/.claude/settings.json
+claude-crusts hooks disable          # remove it (other hooks untouched)
 claude-crusts hooks status           # check if enabled
 ```
 
-Not everyone wants context info after every response — this is strictly opt-in.
+Upgrading from 0.8.1 or earlier: those versions installed `claude-crusts status` on the `Notification` event, where Claude Code discards a hook's output, so no notice ever appeared. Run `claude-crusts hooks enable` once to move it to `Stop`. Until then, `hooks status` and `doctor` flag the old entry.
+
+Claude Code runs the hook by name, so `hooks enable` first checks that the `claude-crusts` on your PATH is 0.8.2 or later. If it is missing or older, nothing is installed and the message says how to fix it (`npm install -g claude-crusts@latest`).
+
+`hooks enable` and `hooks disable` back up settings.json to `~/.claude-crusts/backups/` before writing (the newest 10 are kept), change only crusts' own entries, and leave a settings.json that does not parse untouched. The hook reads the transcript after every response: a fraction of a second on most sessions, about 1 second on a 186 MB transcript.
+
+Not everyone wants context info after every response, so this is strictly opt-in.
 
 ### `claude-crusts hooks auto-inject <subcommand>`
 
@@ -775,10 +798,12 @@ You see a one-line notice with the usage and the command, and Claude surfaces th
 
 **Idle compaction.** From Claude Code 2.1.286 (announced in 2.1.299, rolled out in stages), a conversation over 200K tokens that sits idle about 54 minutes can be compacted before its one-hour prompt cache expires. On a 1M window that usually happens long before any percentage threshold, so `analyze` warns when it applies, and the advisory says so. To keep compaction under your control, set `"idleCompaction": false` in `~/.claude/settings.json` (or use the Idle compaction row in `/config`, 2.1.302+); your next message after a long break then re-reads the whole conversation from scratch.
 
+**Session summaries.** Claude Code deletes transcripts older than `cleanupPeriodDays` (30 days unless you set it), and every crusts view of a session needs its transcript. So the hook also keeps a small summary per session in `~/.claude-crusts/sessions/<sessionId>.json`: model, context window, auto-compact trigger, peak and last window size, each compaction (time, trigger, idle, size before and after) and the advisories it gave. It is rewritten only when something changes. `hooks auto-inject status` shows how many are kept; `doctor` warns when transcripts are kept under 90 days.
+
 ```bash
 claude-crusts hooks auto-inject enable       # opt in, installs UserPromptSubmit hook
 claude-crusts hooks auto-inject disable      # opt out, removes the hook
-claude-crusts hooks auto-inject status       # show install + enabled + last-injection-at state
+claude-crusts hooks auto-inject status       # install + enabled + last-injection state, and the session summaries kept
 claude-crusts hooks auto-inject log          # view injection history (newest first)
 claude-crusts hooks auto-inject log --limit 5 --verbose  # last 5 fires with full advisory text
 ```
@@ -799,6 +824,7 @@ Tune via `~/.claude-crusts/config.json` (`threshold` is optional; when present i
 - Opt-in. Disabled by default.
 - Advisory-only. CRUSTS writes the `/compact` command; Claude surfaces it; you decide whether to run. CRUSTS never executes `/compact` directly.
 - Fire-and-forget. Any error in crusts is swallowed so the hook can never block your prompt.
+- `enable` and `disable` back up settings.json to `~/.claude-crusts/backups/` first, change only the auto-inject entry, and leave a settings.json that does not parse untouched.
 - Per-session min-gap prevents spam on long sessions.
 - Only emits when the threshold is crossed — quiet on healthy sessions.
 - Every injection logged for audit — `hooks auto-inject log` shows what the hook said, when, and at what usage percent.
@@ -912,7 +938,7 @@ CRUSTS reads Claude Code's session files directly from disk. **No API calls. No 
 
 **Past sessions work.** Claude Code forgets everything when a session ends. The JSONL files remain on disk permanently. CRUSTS can analyze sessions from days or weeks ago — useful for understanding why a past session hit compaction unexpectedly or consumed more tokens than expected.
 
-**System prompt is derived, not hardcoded.** Claude Code injects its own internal system prompt at the API level. CRUSTS derives its size from an anchor turn, the first turn whose whole window the transcript records (the session's first response, or for a continued session the first response after the compaction it opens with), as that turn's API token count minus all known components (CLAUDE.md, core tool schemas, memory, skills, and every recorded message and attachment before it). The result is capped by the smallest window the session ever sent, since every request carries it. Skills are read from the session's own skill listing when present, falling back to `~/.claude/skills/` and installed plugins. Different sessions with different setups produce different derived values.
+**System prompt is read from the session, or derived.** Claude Code injects its own system prompt at the API level. From Claude Code 2.1.268 a transcript records a copy by default (`prompt_snapshot`; bare mode records none unless you pass `--system-prompt-snapshot on`), and CRUSTS sizes that copy like any other text. For sessions without one it derives the size from an anchor turn, the first turn whose whole window the transcript records (the session's first response, or for a continued session the first response after the compaction it opens with), as that turn's API token count minus all known components (CLAUDE.md, core tool schemas, memory, skills, and every recorded message and attachment before it). The result is capped by the smallest window the session ever sent, since every request carries it. Skills are read from the session's own skill listing when present, falling back to `~/.claude/skills/` and installed plugins. Different sessions with different setups produce different derived values.
 
 **Token estimation** uses `output_tokens` from the API response (exact for assistant messages) and character-based heuristics for everything else (empirically calibrated). Use `claude-crusts calibrate` with `/context` output to measure estimation accuracy for your sessions.
 
@@ -927,7 +953,7 @@ On March 31, 2026, Claude Code's full TypeScript source (~512K lines) was accide
 | `model: "<synthetic>"` on session exit messages | Filters out false compaction events caused by session exit/resume artifacts. |
 | Tool schema architecture (core + deferred tools) | Enables unused tool detection: CRUSTS tracks which schemas were loaded (always-loaded core tools plus ToolSearch-loaded deferred tools) vs actually invoked during a session. |
 | `block.signature` on thinking blocks | Confirms the signature is an opaque verification token, not content. CRUSTS excludes it from token estimation, and thinking text itself is never persisted in the JSONL. |
-| Cache read architecture | Detects cache overhead ratio: flags when cache re-reads exceed 60% of input tokens. |
+| Cache read architecture | Cache reads are the cheap, healthy case, so CRUSTS never flags them. It reports cache re-writes instead: requests that wrote an already-cached conversation again because the cache expired or the model, system prompt, tools or earlier messages changed (the API's own `cache_miss_reason` where recorded, Claude Code 2.1.214+). |
 
 **What was already publicly known:**
 - JSONL session logs at `~/.claude/` — the community had already been parsing these
@@ -965,7 +991,7 @@ CRUSTS answers the question behind the number — not just "how full is my conte
 
 - **"I'm at 75% context — but what's eating it?"** → CRUSTS breakdown shows Tools at 65%, Retrieved at 25%, Conversation at 5%. The problem isn't your chat — it's tool schemas and redundant file reads.
 - **"Why does auto-compaction keep surprising me?"** → CRUSTS models the trigger the way Claude Code actually behaves: auto-compaction fires when about 33K tokens of headroom remain below the auto-compact window (83.5% of a 200K window, 96.7% of 1M, earlier if you set a smaller window with `/autocompact`), not at a flat 80%. It also tells you when idle compaction can strike: a 200K+ conversation left idle about 54 minutes. "Auto-compaction in ~48 messages." (Note: the check lands on turn boundaries — a heavy turn with multiple file reads can overshoot the trigger before it fires.)
-- **"Why is my quota depleting so fast?"** → CRUSTS flags cache overhead: when cache re-reads exceed 60% of input tokens, most of your quota is re-sending the same content every message — even at the 90% cache discount.
+- **"Why is my quota depleting so fast?"** → CRUSTS finds cache re-writes: every return after the cache expired, and every model switch or tool change mid-task, writes the whole conversation to the cache again at the cache-write price. It reports how many, how many tokens, the largest with its gap and message number, and the setting that helps (`promptCacheTtl` for 5-minute expiries).
 - **"What can I actually DO about it?"** → Run `claude-crusts fix` — it generates three pasteable blocks: one to paste into your current session (tells Claude which files to stop re-reading), one to add to your CLAUDE.md (prevents the same waste next time), and one /compact command with a content-based focus hint describing what to preserve.
 
 If you've ever been surprised by auto-compaction wiping your carefully built context, CRUSTS helps you see it coming and act before it happens.
@@ -974,21 +1000,14 @@ If you've ever been surprised by auto-compaction wiping your carefully built con
 
 Every CRUSTS recommendation is rule-based (no LLM needed), derived from your session data, and gives you something you can act on immediately.
 
-### Duplicate file reads — with exact files and a pasteable tip
+### Duplicate file reads, with exact files and messages
 
 ```
-⚠  WASTE DETECTED:
-   • "app.py" read 17 times (earlier reads at #12, #34, 
-     #56, #78, #91, #103, #115, #128, #140, #152, #165, #178, #189, 
-     #195, #201, #206 are redundant) — est. ~20,929 tokens
-     
-     → This file is already in context from msg #206. 
-       Instead of "Read app.py and fix X", say:
-       "In app.py that you already read, fix X"
-   
-   • "utils.py" read 7 times — est. ~2,600 tokens
-     → Avoid re-reading files that haven't changed.
+  [MEDIUM] "app.py" read 3 times (earlier reads at #12, #56 are redundant) ~2,930 tkns
+    → Unchanged lines already read are still in context: refer to the earlier read, and use offset and limit to read only new lines. /compact can drop the older copy.
 ```
+
+An earlier read counts only for the lines a later read delivered again. Reading lines 1-200 and then 201-400 is not a duplicate, nor is a re-read after an edit or one Claude Code answered with its "file unchanged" stub. An earlier read counts once 100 tokens or more of it came back, so the few lines where one page meets the next are never listed, and when an earlier read also holds lines read only once, the `/compact` suggestion leaves it alone.
 
 ### Specific /compact command with content-based focus
 
@@ -1004,7 +1023,7 @@ This is a command you paste directly into Claude Code. CRUSTS looks at the files
 ```
 💡 P3  Top 5 context consumers:
        1. Tool schemas (22 loaded, 11 used) — 22,500 tokens
-       2. System prompt (CLAUDE.md 1,294 + internal 20,389) — 21,683 tokens
+       2. System prompt (CLAUDE.md 1,294 + Claude Code 20,389) — 21,683 tokens
        3. Compaction summary (compressed context from 199,326 tokens) — 3,413 tokens
        4. Memory files (56 file(s)) — 2,345 tokens
 ```
@@ -1032,10 +1051,16 @@ When the countdown gets critical:
 ### CLAUDE.md size warning
 
 ```
-💡 P5  Your CLAUDE.md is 1,674 tokens (89 lines).
-       Consider splitting into CLAUDE.md + CLAUDE.local.md.
-       Move project-specific preferences to CLAUDE.local.md.
-       Estimated savings: ~874 tokens per message.
+💡 P4  CLAUDE.md files are ~2,708 tokens, consider splitting them
+       ~/work/app/CLAUDE.md: 70 lines, ~1,579 tokens;
+       ~/work/CLAUDE.md: 81 lines, ~1,055 tokens;
+       ~/.claude/CLAUDE.md: 3 lines, ~74 tokens.
+       Move instructions that only matter for part of the codebase into
+       path-scoped rules (.claude/rules/ files with paths: frontmatter) or
+       a CLAUDE.md in that folder; Claude Code loads those only when it
+       works there. CLAUDE.local.md and @imports load at startup with
+       CLAUDE.md, so moving text into them saves nothing.
+       Getting under 1,500 tokens saves ~1,208 tokens per message.
 ```
 
 ### Session habit advice
@@ -1054,24 +1079,26 @@ All of these are generated from patterns in your session data — no LLM, no API
 CRUSTS produces estimates — like `/context` itself, which Claude Code labels "Estimated usage by category."
 
 **What is exact** (verified against raw JSONL data):
-- The TOTAL line — the latest API response's own token accounting (input + cache), not a sum of guesses. The exception is the moment between a compaction and the first response after it: there TOTAL is estimated from Claude Code's post-compaction size plus the fixed context (typically within about -17% to +19% of the next request, about a third low at the first prompt of a continued session)
-- Duplicate file counts — every file, every read, every message number
-- Unused tool detection — loaded vs invoked, exact set difference
-- Cache overhead ratio — direct calculation from API usage fields
-- Compaction events — detected from actual `compact_boundary` markers in the JSONL
-- Assistant output tokens — `output_tokens` from the API, counted once per API message even when Claude Code splits one response across several JSONL lines
+- The TOTAL line: the latest API response's own token accounting (input + cache), not a sum of guesses. The exception is the moment between a compaction and the first response after it: there TOTAL is estimated from Claude Code's post-compaction size, scaled for the model's tokenizer, plus the fixed context and the re-attached files (a median 6.2% from the next request's exact size on 50 compactions, 25.5% at worst)
+- Duplicate file reads: which reads, message numbers and line ranges were delivered twice (from Claude Code's own line numbers; the tokens are the repeated share of an estimate)
+- Unused tool detection: loaded vs invoked, exact set difference
+- Cache re-writes: sized from the API usage fields (`cache_creation` tokens, once per API response), with the cause from the API's own diagnostics where recorded
+- Compaction events: detected from actual `compact_boundary` markers in the JSONL
+- Assistant output tokens: `output_tokens` from the API, counted once per API message even when Claude Code splits one response across several JSONL lines
 
 **What is estimated:**
-- Per-message token counts — uses chars/3.3 for code, chars/4.0 for English text. Dense tool output measures closer to 2.3-2.7 chars per token on current models, so raw content estimates run low there; the buckets are scaled to the exact API total, but the split between them inherits the bias
-- Category bucket values — content estimates, reconciled so they sum to the exact API window total (the raw pre-reconciliation values are kept as `contentTokens` in the JSON output)
-- System prompt size — derived from an anchor API response minus known components
-- Compaction prediction — based on the live window's growth per message since it started (no projection until 4 messages)
+- Per-message token counts: chars/3.3 for code, chars/4.0 for English text, scaled 1.3x on Claude 4.7 and later models (every Fable and Mythos), whose newer tokenizer counts about 30% more tokens for the same text (Anthropic's token-counting docs). The buckets are scaled to the exact API total; on 62 recorded `/context` outputs the median error for messages was about 3%, and the median gap to Claude Code's system-prompt figure about 60 tokens
+- Category bucket values: content estimates, reconciled so they sum to the exact API window total (the raw pre-reconciliation values are kept as `contentTokens` in the JSON output), except in a few views right after a compaction (see Known limitations)
+- System prompt size: the session's recorded copy (Claude Code 2.1.268+, by default); sessions without one derive it from an anchor API response minus known components
+- CLAUDE.md size: the files the session recorded loading (Claude Code 2.1.268+; parent folders, CLAUDE.local.md and imports included), else the files found on disk today, at the text divisor and the model's tokenizer factor
+- Compaction prediction: based on the live window's growth per message since it started (no projection until 4 messages)
 
 **Known limitations:**
 - Memory file detection may undercount (conservative approach — reads MEMORY.md + linked files only)
 - Skills token estimate is per-skill flat rate (~60 tokens each); falls back to 476 total when no skills are discovered
 - CLAUDE.md split recommendations use estimated line ranges
 - Token estimation is calibrated for code-heavy sessions — pure English conversation sessions may vary
+- Right after a compaction, crusts does not itemize some of what Claude Code sends again (the skills listing, among others), so the buckets of a few such views stay unreconciled and do not add up to TOTAL (4 of 48 views right after `/compact` on the author's sessions)
 
 For ground truth comparison, run `claude-crusts calibrate` and paste your `/context` output.
 
@@ -1090,7 +1117,7 @@ bun run src/index.ts analyze
 
 # Verify your change before committing
 bun run typecheck                   # strict TS typecheck
-bun test                            # 450+ unit tests (under 10s)
+bun test                            # unit tests
 ```
 
 Every new user-visible command must land with:
@@ -1121,6 +1148,9 @@ scanner.ts -> classifier.ts -> waste-detector.ts -> recommender.ts -> renderer.t
                                                                      bench.ts
                                                                      html-report.ts
                                                                      md-report.ts
+                                                                     cache-rewrites.ts
+                                                                     session-summary.ts
+                                                                     completion.ts
 ```
 
 Supporting: `types.ts`, `built-in-tools.ts`, `version.ts`.
