@@ -28,6 +28,7 @@ import { generateRecommendations, generateFixPrompts } from '../src/recommender.
 import { buildOptimizeReport, buildCompactFocus } from '../src/optimizer.ts';
 import { buildInjectionText, compactCommandFor } from '../src/auto-inject.ts';
 import { readSystemPromptFiles } from '../src/scanner.ts';
+import { sessionProjectPath } from '../src/analyzer.ts';
 import { NEWER_TOKENIZER_FACTOR } from '../src/model-context.ts';
 import type { ConfigData, CrustsBreakdown, SessionMessage, WasteItem } from '../src/types.ts';
 
@@ -295,5 +296,22 @@ describe('readSystemPromptFiles', () => {
       '/work/app/CLAUDE.local.md',
     ]);
     expect(result.totalEstimatedTokens).toBe(result.files.reduce((sum, f) => sum + f.estimatedTokens, 0));
+  });
+});
+
+describe('sessionProjectPath', () => {
+  /** A user record written in the folder `cwd`. */
+  const at = (cwd: string): SessionMessage => ({ type: 'user', cwd, message: { role: 'user', content: 'hi' } } as SessionMessage);
+
+  test('the folder the session started in, which a hyphenated slug cannot decode', () => {
+    const project = join(sandbox, 'career-ops');
+    mkdirSync(join(project, 'sub'), { recursive: true });
+    // Later records follow a cd; the first one is where the session started.
+    const msgs = [at(project), at(join(project, 'sub'))];
+    expect(sessionProjectPath(msgs, join(sandbox, 'C--x-career-ops', 's.jsonl'))).toBe(project);
+  });
+
+  test('a start folder that no longer exists falls back to the slug decode', () => {
+    expect(sessionProjectPath([at(join(sandbox, 'gone'))], join(sandbox, 'C--nowhere', 's.jsonl'))).toBeUndefined();
   });
 });

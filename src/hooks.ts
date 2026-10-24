@@ -27,7 +27,7 @@ import { loadConfig, saveConfig, stripBom, crustsSessionsDir } from './config.ts
 import { loadSessionSummaries } from './session-summary.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
 import { discoverSessions, parseSession, collectObservedMcpServers } from './scanner.ts';
-import { gatherConfigData, deriveProjectPath } from './analyzer.ts';
+import { gatherConfigData, sessionProjectPath } from './analyzer.ts';
 import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import { getContextHealth } from './recommender.ts';
 import type { ContextHealth, CrustsBreakdown } from './types.ts';
@@ -631,7 +631,7 @@ export function summarizeStatus(breakdown: CrustsBreakdown): StatusSummary {
 export async function buildStatusSummary(sessionPath: string, cwd?: string): Promise<StatusSummary | null> {
   const messages = await parseSession(sessionPath);
   if (messages.length === 0) return null;
-  const projectRoot = deriveProjectPath(sessionPath) ?? (cwd && existsSync(cwd) ? cwd : undefined);
+  const projectRoot = sessionProjectPath(messages, sessionPath) ?? (cwd && existsSync(cwd) ? cwd : undefined);
   const configData = gatherConfigData(projectRoot, basename(dirname(sessionPath)), collectObservedMcpServers(messages));
   return summarizeStatus(classifySession(messages, configData));
 }

@@ -1096,6 +1096,8 @@ export interface AnalysisResult {
   calibration: CalibrationComparison[] | null;
   configData: ConfigData;
   messages: SessionMessage[];
+  /** The session's project folder (see `sessionProjectPath`), when it exists */
+  projectPath?: string;
 }
 
 /** A trend record together with the percent-used delta vs the previous record */

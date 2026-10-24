@@ -72,7 +72,7 @@ const CHARS_PER_TOKEN = 4;
 // ---------------------------------------------------------------------------
 
 /** Where a tool call's result was recorded */
-interface ToolResultRef {
+export interface ToolResultRef {
   /** Index of the user record that carries the tool_result block */
   index: number;
   /** The tool_result block itself */
@@ -105,7 +105,7 @@ interface FileReadInfo {
  * @param messages - Session messages
  * @returns tool_use id -> where its result was recorded
  */
-function indexToolResults(messages: SessionMessage[]): Map<string, ToolResultRef> {
+export function indexToolResults(messages: SessionMessage[]): Map<string, ToolResultRef> {
   const results = new Map<string, ToolResultRef>();
 
   for (let i = 0; i < messages.length; i++) {
@@ -131,7 +131,7 @@ function indexToolResults(messages: SessionMessage[]): Map<string, ToolResultRef
  * @param classified - Classified rows, index-aligned with the messages
  * @returns Estimated tokens, 0 when the record is outside the classified rows
  */
-function resultTokens(result: ToolResultRef, classified: ClassifiedMessage[]): number {
+export function resultTokens(result: ToolResultRef, classified: ClassifiedMessage[]): number {
   const row = classified[result.index];
   if (!row) return 0;
 

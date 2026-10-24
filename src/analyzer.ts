@@ -28,6 +28,7 @@ import { recordTrend } from './trend.ts';
 import type {
   AnalysisResult,
   ConfigData,
+  SessionMessage,
 } from './types.ts';
 
 /**
@@ -94,6 +95,26 @@ export function deriveProjectPath(sessionPath: string): string | undefined {
 }
 
 /**
+ * The folder a session started in: the `cwd` of its first record that
+ * carries one, when that folder still exists, else the folder decoded from
+ * the transcript's project slug (`deriveProjectPath`).
+ *
+ * Claude Code names the transcript folder after the starting directory, but
+ * the slug writes every `/`, `-`, `.`, `_` and space as `-`, so a path
+ * holding any of them does not decode. The first record's `cwd` is the
+ * starting directory itself; later records follow `cd`.
+ *
+ * @param messages - Parsed session messages
+ * @param sessionPath - Path to the session JSONL file
+ * @returns The project folder, or undefined when neither exists
+ */
+export function sessionProjectPath(messages: SessionMessage[], sessionPath: string): string | undefined {
+  const started = messages.find((m) => typeof m.cwd === 'string' && m.cwd.length > 0)?.cwd;
+  if (started && existsSync(started)) return started;
+  return deriveProjectPath(sessionPath);
+}
+
+/**
  * Run the full CRUSTS analysis pipeline on a session.
  *
  * Orchestrates all analysis stages:
@@ -120,8 +141,8 @@ export async function analyzeSession(
   const messages = await parseSession(sessionPath);
   if (messages.length === 0) return null;
 
-  // 2. Derive project path if not explicitly provided
-  const resolvedProjectPath = options?.projectPath ?? deriveProjectPath(sessionPath);
+  // 2. The session's project folder unless one was given
+  const resolvedProjectPath = options?.projectPath ?? sessionProjectPath(messages, sessionPath);
 
   // 3. Read config files. The session file's parent directory name is the
   // encoded project slug Claude Code keys its per-project memory by, and
@@ -160,6 +181,7 @@ export async function analyzeSession(
     calibration,
     configData,
     messages,
+    projectPath: resolvedProjectPath,
   };
 
   // Persist a one-line summary for the `trend` command. Best-effort —

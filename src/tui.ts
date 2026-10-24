@@ -434,7 +434,7 @@ export async function executeCommand(input: string, state: TuiState): Promise<bo
         r.waste,
         r.configData,
         r.messages,
-        process.cwd(),
+        r.projectPath,
       );
       renderOptimizeReport(report);
       return true;

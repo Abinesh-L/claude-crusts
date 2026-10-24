@@ -253,7 +253,7 @@ program
   .option('--yes', 'Skip per-fix confirmations (requires --apply)')
   .option('--min-savings <n>', 'Skip fixes saving less than N tokens', '100')
   .option('--filter <types>', `Only show fixes of these kinds, comma-separated: ${FIX_KINDS.join(', ')}`)
-  .option('--project-path <path>', 'Project folder for the .claude/settings.local.json and CLAUDE.md writes (default: cwd)')
+  .option('--project-path <path>', 'Project folder for the .claude/settings.local.json and CLAUDE.md writes (default: the folder the session started in)')
   .action(async (sessionId: string | undefined, options: { apply?: boolean; yes?: boolean; minSavings?: string; filter?: string; projectPath?: string }, cmd: Command) => {
     const globals = cmd.optsWithGlobals();
 
@@ -282,9 +282,9 @@ program
 
     const minSavings = parseInt(options.minSavings ?? '100', 10);
 
-    const projectPath = options.projectPath
-      ? resolve(options.projectPath)
-      : process.cwd();
+    // The session's own project, not the shell's folder: the deny rules and
+    // the CLAUDE.md rule belong to the project whose reads they cover.
+    const projectPath = options.projectPath ? resolve(options.projectPath) : result.projectPath;
 
     const report = buildOptimizeReport(
       result.sessionId,

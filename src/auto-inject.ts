@@ -21,7 +21,7 @@
 import { existsSync, appendFileSync, readFileSync, mkdirSync } from 'fs';
 import { basename, dirname, join } from 'path';
 import { parseSession, collectObservedMcpServers } from './scanner.ts';
-import { gatherConfigData, deriveProjectPath } from './analyzer.ts';
+import { gatherConfigData, sessionProjectPath } from './analyzer.ts';
 import { classifySession, nonHumanPromptKind } from './classifier.ts';
 import { detectWaste, compactTargets } from './waste-detector.ts';
 import { loadAutoInjectConfig, loadAutocompactBufferTokens, recordInjection } from './config.ts';
@@ -438,7 +438,7 @@ export async function runAutoInject(): Promise<void> {
     // payload.cwd follows a `cd` mid-session and would drop the project's
     // settings. A bare gatherConfigData() read only the user-level files.
     const slug = basename(dirname(transcriptPath));
-    const projectRoot = deriveProjectPath(transcriptPath)
+    const projectRoot = sessionProjectPath(messages, transcriptPath)
       ?? (payload.cwd && existsSync(payload.cwd) ? payload.cwd : undefined);
     const configData = gatherConfigData(projectRoot, slug, collectObservedMcpServers(messages));
     const breakdown = classifySession(messages, configData, undefined, payload.model?.id);

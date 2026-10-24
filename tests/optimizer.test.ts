@@ -2,7 +2,10 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
-import { buildOptimizeReport, parseFixKinds, FIX_KINDS } from '../src/optimizer.ts';
+import { buildOptimizeReport, parseFixKinds, FIX_KINDS, gitOutputFolder } from '../src/optimizer.ts';
+import type { OptimizeOptions } from '../src/optimizer.ts';
+import { classifySession } from '../src/classifier.ts';
+import { spawnSync } from 'child_process';
 import { NEWER_TOKENIZER_FACTOR } from '../src/model-context.ts';
 import type { CrustsBreakdown, WasteItem, ConfigData, SessionMessage, MCPBreakdown } from '../src/types.ts';
 
@@ -120,7 +123,7 @@ describe('buildOptimizeReport', () => {
     const msgs: SessionMessage[] = [
       ...readMsg('/tmp/proj/node_modules/a/b.js', 'r1', 'x'.repeat(10000)),
     ];
-    const report = buildOptimizeReport('sid', emptyBreakdown(), waste, emptyConfigData(2500), msgs, '/tmp/proj');
+    const report = buildOptimizeReport('sid', classifySession(msgs, emptyConfigData(2500)), waste, emptyConfigData(2500), msgs, '/tmp/proj');
     expect(report.fixes.some((f) => f.kind === 'read-deny')).toBe(true);
     expect(report.fixes.length).toBeGreaterThan(0);
     // sorted descending
@@ -173,9 +176,20 @@ describe('buildOptimizeReport: read-deny fix', () => {
     rmSync(sandbox, { recursive: true, force: true });
   });
 
-  /** Build the report for these messages against the temp project. */
-  function report(msgs: SessionMessage[]) {
-    return buildOptimizeReport('sid', emptyBreakdown(), [], emptyConfigData(), msgs, project);
+  /**
+   * Build the report for these messages against the temp project, sized from
+   * their classification. Output folders count as confirmed unless the
+   * options say otherwise (`gitOutputFolder` has its own tests).
+   */
+  function report(msgs: SessionMessage[], options: OptimizeOptions = {}, at: string = project) {
+    return buildOptimizeReport('sid', classifySession(msgs, emptyConfigData()), [], emptyConfigData(), msgs, at, { isOutputFolder: () => true, ...options });
+  }
+
+  /** Classified tokens of the tool_result answering `id`. */
+  function resultRow(msgs: SessionMessage[], id: string): number {
+    const index = msgs.findIndex((m) => m.type === 'user' && Array.isArray(m.message?.content)
+      && m.message!.content.some((b) => b.type === 'tool_result' && b.tool_use_id === id));
+    return classifySession(msgs, emptyConfigData()).messages[index]!.tokens;
   }
 
   test('proposes anchored Read deny rules for noise paths read in the project', () => {
@@ -186,15 +200,40 @@ describe('buildOptimizeReport: read-deny fix', () => {
     const fix = report(msgs).fixes.find((f) => f.kind === 'read-deny');
     expect(fix).toBeDefined();
     expect(fix!.autoApplicable).toBe(true);
-    expect(fix!.denyRules).toEqual(['Read(/**/node_modules/**)', 'Read(/**/dist/**)']);
-    expect(fix!.action).toBe('Read(/**/node_modules/**)\nRead(/**/dist/**)');
+    // node_modules is noise at any depth; an output folder's rule names the folder read.
+    expect(fix!.denyRules).toEqual(['Read(/**/node_modules/**)', 'Read(/dist/**)']);
+    expect(fix!.action).toBe('Read(/**/node_modules/**)\nRead(/dist/**)');
     expect(fix!.applyTarget).toBe(join(project, '.claude', 'settings.local.json'));
     expect(fix!.applyContent).toBeUndefined();
     expect(fix!.title).toBe('Make Claude Code refuse to read node_modules/ and dist/');
     expect(fix!.description).toContain('node_modules (installed deps): 1 file(s) read');
     expect(fix!.description).toContain('Claude Code will refuse to read these paths');
     expect(fix!.description).not.toContain('—');
-    expect(fix!.estimatedSavings).toBe(Math.ceil(4000 / 3.3) + Math.ceil(3000 / 3.3));
+    // Each read costs its own classified result row, the figure every view uses.
+    expect(fix!.estimatedSavings).toBe(resultRow(msgs, 'r1') + resultRow(msgs, 'r2'));
+  });
+
+  test('an output folder git does not confirm gets no rule; node_modules still does', () => {
+    const msgs: SessionMessage[] = [
+      ...readMsg(join(project, 'node_modules', 'chalk', 'index.js'), 'r1', 'a'.repeat(4000)),
+      ...readMsg(join(project, 'build', 'ci', 'Dockerfile'), 'r2', 'b'.repeat(3000)),
+    ];
+    const asked: string[] = [];
+    const fix = report(msgs, { isOutputFolder: (_root, folder) => { asked.push(folder); return false; } })
+      .fixes.find((f) => f.kind === 'read-deny');
+    expect(asked).toEqual(['build']);
+    expect(fix!.denyRules).toEqual(['Read(/**/node_modules/**)']);
+  });
+
+  test('output folders match their own spelling and are anchored where they were read', () => {
+    const msgs: SessionMessage[] = [
+      ...readMsg(join(project, 'llvm', 'lib', 'Target', 'X86', 'X86ISelLowering.cpp'), 'r1', 'a'.repeat(4000)),
+      ...readMsg(join(project, 'packages', 'web', 'dist', 'bundle.js'), 'r2', 'b'.repeat(4000)),
+    ];
+    const fix = report(msgs).fixes.find((f) => f.kind === 'read-deny');
+    // LLVM's Target/ is source: only lowercase target/ is an output folder.
+    expect(fix!.denyRules).toEqual(['Read(/packages/web/dist/**)']);
+    expect(fix!.title).toBe('Make Claude Code refuse to read packages/web/dist/');
   });
 
   test('nested copies of a noise folder share one any-depth rule', () => {
@@ -230,12 +269,10 @@ describe('buildOptimizeReport: read-deny fix', () => {
     const nested = join(sandbox, 'build', 'app');
     mkdirSync(nested, { recursive: true });
     const src = readMsg(join(nested, 'src', 'index.ts'), 'r1', 'a'.repeat(9000));
-    const srcReport = buildOptimizeReport('sid', emptyBreakdown(), [], emptyConfigData(), src, nested);
-    expect(srcReport.fixes.some((f) => f.kind === 'read-deny')).toBe(false);
+    expect(report(src, {}, nested).fixes.some((f) => f.kind === 'read-deny')).toBe(false);
 
     const out = readMsg(join(nested, 'build', 'out.js'), 'r2', 'a'.repeat(9000));
-    const outReport = buildOptimizeReport('sid', emptyBreakdown(), [], emptyConfigData(), out, nested);
-    expect(outReport.fixes.find((f) => f.kind === 'read-deny')!.denyRules).toEqual(['Read(/**/build/**)']);
+    expect(report(out, {}, nested).fixes.find((f) => f.kind === 'read-deny')!.denyRules).toEqual(['Read(/build/**)']);
   });
 
   test('rules keep the path\'s spelling and failed reads are not counted', () => {
@@ -272,12 +309,12 @@ describe('buildOptimizeReport: read-deny fix', () => {
       ...readMsg(join(project, 'dist', 'b.js'), 'r2', 'b'.repeat(3000)),
     ];
     const fix = report(msgs).fixes.find((f) => f.kind === 'read-deny');
-    expect(fix!.denyRules).toEqual(['Read(/**/dist/**)']);
-    expect(fix!.estimatedSavings).toBe(Math.ceil(3000 / 3.3));
+    expect(fix!.denyRules).toEqual(['Read(/dist/**)']);
+    expect(fix!.estimatedSavings).toBe(resultRow(msgs, 'r2'));
 
     writeFileSync(
       join(project, '.claude', 'settings.local.json'),
-      JSON.stringify({ permissions: { deny: ['Read(/**/node_modules/**)', 'Read(/**/dist/**)'] } }),
+      JSON.stringify({ permissions: { deny: ['Read(/**/node_modules/**)', 'Read(/dist/**)'] } }),
     );
     expect(report(msgs).fixes.some((f) => f.kind === 'read-deny')).toBe(false);
   });
@@ -297,13 +334,65 @@ describe('buildOptimizeReport: read-deny fix', () => {
     expect(fix!.description).toContain('.claudeignore has no effect');
   });
 
-  test('pairs the deny rules with a CLAUDE.md section when CLAUDE.md exists', () => {
+  test('offers the CLAUDE.md section only where the deny rules cannot apply', () => {
     writeFileSync(join(project, 'CLAUDE.md'), '# Project\n');
     const msgs = readMsg(join(project, 'dist', 'b.js'), 'r1', 'b'.repeat(3000));
-    const md = report(msgs).fixes.find((f) => f.kind === 'claudemd-rule');
+    // Next to enforced deny rules it saves nothing and costs tokens every request.
+    expect(report(msgs).fixes.some((f) => f.kind === 'claudemd-rule')).toBe(false);
+
+    // Filtered to it, the section is the only protection on offer.
+    const md = report(msgs, { filter: ['claudemd-rule'] }).fixes.find((f) => f.kind === 'claudemd-rule');
     expect(md).toBeDefined();
     expect(md!.applyContent).toContain('- dist (build output)');
-    expect(md!.applyContent).not.toContain('—');
+    expect(md!.applyContent).not.toContain('\u2014');
+
+    // A settings file the deny rules cannot be merged into: offered alongside.
+    mkdirSync(join(project, '.claude'));
+    writeFileSync(join(project, '.claude', 'settings.local.json'), '{ "permissions": ');
+    expect(report(msgs).fixes.some((f) => f.kind === 'claudemd-rule')).toBe(true);
+  });
+
+  test('without a project folder, no file fix is offered', () => {
+    const msgs = readMsg(join(project, 'node_modules', 'a.js'), 'r1', 'a'.repeat(4000));
+    const out = buildOptimizeReport('sid', classifySession(msgs, emptyConfigData()), [], emptyConfigData(), msgs, undefined);
+    expect(out.fixes.some((f) => f.kind === 'read-deny' || f.kind === 'claudemd-rule')).toBe(false);
+  });
+});
+
+describe('gitOutputFolder', () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = resolve(mkdtempSync(join(tmpdir(), 'crusts-git-output-')));
+  });
+
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  /** Run git in the temp repo. */
+  const git = (...args: string[]) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf-8' });
+
+  test('ignored or untracked folders are output; a folder with tracked files is not', () => {
+    git('init', '-q');
+    writeFileSync(join(repo, '.gitignore'), 'dist/\n');
+    mkdirSync(join(repo, 'dist'));
+    writeFileSync(join(repo, 'dist', 'a.js'), 'x');
+    mkdirSync(join(repo, 'build', 'ci'), { recursive: true });
+    writeFileSync(join(repo, 'build', 'ci', 'Dockerfile'), 'FROM scratch');
+    mkdirSync(join(repo, 'target'));
+    writeFileSync(join(repo, 'target', 'app'), 'bin');
+    git('add', '.gitignore', 'build');
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init');
+
+    expect(gitOutputFolder(repo, 'dist')).toBe(true);    // ignored
+    expect(gitOutputFolder(repo, 'build')).toBe(false);  // holds tracked source
+    expect(gitOutputFolder(repo, 'target')).toBe(true);  // untracked, nothing tracked in it
+  });
+
+  test('outside a repository nothing is confirmed', () => {
+    mkdirSync(join(repo, 'dist'));
+    expect(gitOutputFolder(repo, 'dist')).toBe(false);
   });
 });
 

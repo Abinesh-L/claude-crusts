@@ -28,32 +28,44 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, unlinkSync, utimesSync } from 'fs';
 import { join, basename, dirname, isAbsolute, resolve } from 'path';
 import { createInterface } from 'readline';
+import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { copyToClipboard } from './clipboard.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
 import { loadWasteThresholds, stripBom, writeFileAtomic } from './config.ts';
-import type { CrustsBreakdown, WasteItem, ConfigData, SessionMessage } from './types.ts';
+import type { CrustsBreakdown, WasteItem, ConfigData, SessionMessage, ClassifiedMessage } from './types.ts';
 import { sessionClaudeMd, claudeMdLabel, CLAUDE_MD_SPLIT_ADVICE } from './classifier.ts';
-import { compactTargets } from './waste-detector.ts';
+import { compactTargets, resultTokens } from './waste-detector.ts';
 
 /**
  * Noise paths that shouldn't be re-read into context repeatedly.
  *
- * Each regex matches a path relative to the project root and captures the
- * name the deny rule covers, as the path spells it: a folder (`folder: true`,
+ * Each regex matches a path relative to the project root and captures what
+ * the deny rule covers, as the path spells it: a folder (`folder: true`,
  * everything under it is covered) or, for lock files, which mix `.lock`,
  * `.json` and `.yaml` names, the file itself.
+ *
+ * `node_modules`, `.git` and lock files are noise wherever they sit, so
+ * their rule covers every copy at any depth. Output folders (`output: true`:
+ * `dist`, `build`, `.next`, `target`) share their names with source
+ * folders in many projects (Go's `build/`, electron-builder's resources,
+ * `com/android/build` packages), and a Read deny rule also blocks editing and
+ * creating files there. So they match case-sensitively, the capture is the
+ * folder's own path from the project root (the rule covers that folder
+ * only), and `detectNoiseReads` proposes them only when git shows the folder
+ * holds output (`gitOutputFolder`).
  */
-const NOISE_PATHS: Array<{ regex: RegExp; folder: boolean; label: string }> = [
-  { regex: /(?:^|\/)(node_modules)\//i, folder: true, label: 'installed deps' },
-  { regex: /(?:^|\/)(dist)\//i, folder: true, label: 'build output' },
-  { regex: /(?:^|\/)(build)\//i, folder: true, label: 'build output' },
-  { regex: /(?:^|\/)(\.next)\//i, folder: true, label: 'Next.js cache' },
-  { regex: /(?:^|\/)(target)\//i, folder: true, label: 'Rust/JVM build' },
-  { regex: /(?:^|\/)(\.git)\//i, folder: true, label: 'version control internals' },
+const NOISE_PATHS: Array<{ regex: RegExp; folder: boolean; output: boolean; label: string }> = [
+  { regex: /(?:^|\/)(node_modules)\//i, folder: true, output: false, label: 'installed deps' },
+  { regex: /^((?:[^/]+\/)*?dist)\//, folder: true, output: true, label: 'build output' },
+  { regex: /^((?:[^/]+\/)*?build)\//, folder: true, output: true, label: 'build output' },
+  { regex: /^((?:[^/]+\/)*?\.next)\//, folder: true, output: true, label: 'Next.js cache' },
+  { regex: /^((?:[^/]+\/)*?target)\//, folder: true, output: true, label: 'Rust/JVM build' },
+  { regex: /(?:^|\/)(\.git)\//i, folder: true, output: false, label: 'version control internals' },
   {
     regex: /(?:^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|cargo\.lock|poetry\.lock|pipfile\.lock)$/i,
     folder: false,
+    output: false,
     label: 'lock file, auto-generated',
   },
 ];
@@ -126,6 +138,8 @@ export interface OptimizeReport {
 export interface OptimizeOptions {
   minSavings?: number;
   filter?: FixKind[];
+  /** Confirms that an output folder (dist, build, .next, target) holds no source; default `gitOutputFolder` */
+  isOutputFolder?: (projectPath: string, folder: string) => boolean;
 }
 
 /**
@@ -200,6 +214,8 @@ interface NoiseRead {
   label: string;
   /** Short name for the fix title, e.g. `node_modules/` or `bun.lock` */
   name: string;
+  /** For an output folder, its path from the project root, which git must confirm */
+  outputFolder?: string;
 }
 
 /**
@@ -209,8 +225,10 @@ interface NoiseRead {
  * Rules use Claude Code's permission path syntax, which is gitignore syntax:
  * a leading `/` anchors at the project (for `.claude/settings.local.json`,
  * the session's primary working directory) and `**` matches any depth, so
- * one rule covers nested copies such as `packages/web/node_modules/`. A
- * plain relative pattern (`./node_modules/**`) would resolve against Claude's
+ * one rule covers nested copies such as `packages/web/node_modules/`. An
+ * output folder's rule names the folder that was read
+ * (`Read(/packages/web/dist/**)`), never every folder of that name. A plain
+ * relative pattern (`./node_modules/**`) would resolve against Claude's
  * current directory, which follows a `cd` in the shell, and miss the
  * project's top-level folder after one. The name keeps the path's spelling,
  * since rules match case-sensitively outside Windows.
@@ -222,10 +240,14 @@ function matchNoisePath(relative: string): NoiseRead | null {
   for (const entry of NOISE_PATHS) {
     const covered = entry.regex.exec(relative)?.[1];
     if (!covered) continue;
+    const base = covered.split('/').pop()!;
+    if (entry.output) {
+      return { rule: `Read(/${covered}/**)`, label: `${covered} (${entry.label})`, name: `${covered}/`, outputFolder: covered };
+    }
     return {
-      rule: entry.folder ? `Read(/**/${covered}/**)` : `Read(/**/${covered})`,
-      label: `${covered} (${entry.label})`,
-      name: entry.folder ? `${covered}/` : covered,
+      rule: entry.folder ? `Read(/**/${base}/**)` : `Read(/**/${base})`,
+      label: `${base} (${entry.label})`,
+      name: entry.folder ? `${base}/` : base,
     };
   }
   return null;
@@ -240,6 +262,26 @@ interface NoiseReads extends NoiseRead {
 }
 
 /**
+ * Whether git shows that a project folder holds output: git ignores it, or
+ * tracks no file in it. Without git, or outside a repository, the answer is
+ * no, since a Read deny rule on a source folder would also block editing it.
+ *
+ * @param projectPath - Project root
+ * @param folder - Folder path relative to the project root, forward slashes
+ * @returns True when a deny rule on the folder cannot hide tracked files
+ */
+export function gitOutputFolder(projectPath: string, folder: string): boolean {
+  const git = (args: string[]) =>
+    spawnSync('git', ['-C', projectPath, ...args], { encoding: 'utf-8', timeout: 5_000, windowsHide: true });
+  const ignored = git(['check-ignore', '-q', '--', `${folder}/`]);
+  if (ignored.status === 0) return true;
+  // 1 = not ignored; anything else (128 outside a repository, or no git) = unknown
+  if (ignored.status !== 1) return false;
+  const tracked = git(['ls-files', '--', folder]);
+  return tracked.status === 0 && tracked.stdout.trim() === '';
+}
+
+/**
  * Walk session messages and total the reads of noise paths inside the
  * project, one entry per deny rule that covers them (see `matchNoisePath`),
  * in order of first read.
@@ -247,14 +289,35 @@ interface NoiseReads extends NoiseRead {
  * Reads outside `projectPath` are skipped: a rule in the project's settings
  * cannot block them. Paths are matched relative to the project root, so a
  * project that itself lives under a folder named `build` is not mistaken for
- * build output. A read that failed (`is_error`) put no file into context and
- * is not counted.
+ * build output. An output folder counts only when `isOutputFolder` confirms
+ * it (git, by default). A read that failed (`is_error`) put no file into
+ * context and is not counted.
  *
- * The token cost attributed to each path is the approximate size of the
- * corresponding tool_result body, a reasonable proxy since the file's
- * contents account for most of the tool_result's tokens.
+ * Each read costs what its own tool_result row holds in the classification
+ * (found by tool_use id, in the session model's tokens), the figure every
+ * other view of those reads uses.
+ *
+ * @param messages - Session messages
+ * @param classified - Their classification (`breakdown.messages`)
+ * @param projectPath - Project root
+ * @param isOutputFolder - Confirms an output folder (default `gitOutputFolder`)
+ * @returns One entry per deny rule
  */
-function detectNoiseReads(messages: SessionMessage[], projectPath: string): NoiseReads[] {
+function detectNoiseReads(
+  messages: SessionMessage[],
+  classified: ClassifiedMessage[],
+  projectPath: string,
+  isOutputFolder: (projectPath: string, folder: string) => boolean = gitOutputFolder,
+): NoiseReads[] {
+  const confirmed = new Map<string, boolean>();
+  const confirm = (folder: string): boolean => {
+    let ok = confirmed.get(folder);
+    if (ok === undefined) {
+      ok = isOutputFolder(projectPath, folder);
+      confirmed.set(folder, ok);
+    }
+    return ok;
+  };
   // Keyed by rule; case-folded on Windows, where Claude Code matches deny
   // rules case-insensitively, so `Node_modules` and `node_modules` share one.
   const hits = new Map<string, NoiseReads>();
@@ -262,7 +325,8 @@ function detectNoiseReads(messages: SessionMessage[], projectPath: string): Nois
   // Map tool_use_id → the read path and its rule
   const readById = new Map<string, NoiseRead & { path: string }>();
 
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
     const content = msg.message?.content;
     if (!Array.isArray(content)) continue;
 
@@ -276,19 +340,16 @@ function detectNoiseReads(messages: SessionMessage[], projectPath: string): Nois
         const relative = projectRelativePath(projectPath, path);
         if (relative === null) continue;
         const noise = matchNoisePath(relative);
-        if (noise && block.id) readById.set(block.id, { ...noise, path });
+        if (!noise || !block.id) continue;
+        if (noise.outputFolder !== undefined && !confirm(noise.outputFolder)) continue;
+        readById.set(block.id, { ...noise, path });
       }
     } else if (msg.type === 'user') {
       for (const block of content) {
         if (block.type !== 'tool_result' || block.is_error) continue;
         const meta = readById.get(block.tool_use_id ?? '');
         if (!meta) continue;
-        const textLen = typeof block.content === 'string'
-          ? block.content.length
-          : Array.isArray(block.content)
-            ? block.content.reduce((sum, b) => sum + (typeof b === 'object' && b && 'text' in b && typeof b.text === 'string' ? b.text.length : 0), 0)
-            : 0;
-        const tokens = Math.ceil(textLen / 3.3);
+        const tokens = resultTokens({ index: i, block, record: msg }, classified);
         const key = ruleKey(meta.rule);
         const bucket = hits.get(key)
           ?? { rule: meta.rule, label: meta.label, name: meta.name, paths: new Set<string>(), tokens: 0 };
@@ -455,6 +516,10 @@ function renderClaudemdRuleAppend(labels: string[]): string {
  * Fixes are sorted by `estimatedSavings` descending, filtered by `minSavings`
  * and `filter`, and given stable `id`s for user reference in `--filter` /
  * `--apply` flows.
+ *
+ * `projectPath` is the folder the file fixes write to: the session's own
+ * project (`AnalysisResult.projectPath`) unless the user names one. Without
+ * it the read-deny and CLAUDE.md-rule fixes are not offered.
  */
 export function buildOptimizeReport(
   sessionId: string,
@@ -462,7 +527,7 @@ export function buildOptimizeReport(
   waste: WasteItem[],
   configData: ConfigData,
   messages: SessionMessage[],
-  projectPath: string,
+  projectPath: string | undefined,
   options: OptimizeOptions = {},
 ): OptimizeReport {
   const minSavings = options.minSavings ?? DEFAULT_MIN_SAVINGS;
@@ -485,8 +550,8 @@ export function buildOptimizeReport(
 
   // 2. read-deny: noise paths read this session, blocked with Claude Code
   //    permission deny rules (Claude Code has no ignore file for Claude's reads)
-  const noiseHits = detectNoiseReads(messages, projectPath);
-  if (noiseHits.length > 0) {
+  const noiseHits = projectPath ? detectNoiseReads(messages, breakdown.messages, projectPath, options.isOutputFolder) : [];
+  if (projectPath && noiseHits.length > 0) {
     const settingsPath = join(projectPath, LOCAL_SETTINGS_PATH);
     const settingsFile = readDenySettings(settingsPath);
     const present = settingsFile.state === 'ok' ? settingsFile.deny : [];
@@ -527,9 +592,13 @@ export function buildOptimizeReport(
         denyRules: rules,
       });
 
-      // 3. claudemd-rule: also append a prose rule to CLAUDE.md to deter Read calls
+      // 3. claudemd-rule: a prose rule in CLAUDE.md, only where the deny rules
+      //    cannot apply (settings file not writable, or read-deny filtered
+      //    out). Next to them it saves nothing and costs tokens every request.
+      const denyUnavailable = settingsFile.state === 'invalid'
+        || (options.filter !== undefined && options.filter.length > 0 && !options.filter.includes('read-deny'));
       const claudeMdPath = join(projectPath, 'CLAUDE.md');
-      if (existsSync(claudeMdPath)) {
+      if (denyUnavailable && existsSync(claudeMdPath)) {
         const existingMd = readFileSync(claudeMdPath, 'utf-8');
         if (!existingMd.includes('Files to avoid reading')) {
           const ruleAppend = renderClaudemdRuleAppend(labels);
@@ -537,8 +606,8 @@ export function buildOptimizeReport(
             id: nextId++,
             kind: 'claudemd-rule',
             title: 'Add "Files to avoid reading" section to CLAUDE.md',
-            description: 'Asks Claude to avoid these paths in future sessions without blocking them.',
-            estimatedSavings: Math.round(totalTokens / 2), // secondary protection, don't double-count fully
+            description: 'Asks Claude to avoid these paths in future sessions without blocking them (offered because the deny rules cannot be applied here).',
+            estimatedSavings: Math.round(totalTokens / 2), // a request, not a block: count half
             action: ruleAppend.trim(),
             autoApplicable: true,
             applyTarget: claudeMdPath,
