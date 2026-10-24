@@ -19,9 +19,9 @@ import chalk from 'chalk';
 import { CRUSTS_DIR } from './calibrator.ts';
 import { discoverSessions, readLatestClaudeCodeVersion } from './scanner.ts';
 import { compareVersions } from './built-in-tools.ts';
-import { crustsSessionsDir } from './config.ts';
+import { crustsSessionsDir, stripBom } from './config.ts';
 import { loadSessionSummaries } from './session-summary.ts';
-import { detectStatusHooks } from './hooks.ts';
+import { detectStatusHooks, statusHookCommandProblem } from './hooks.ts';
 import { VERSION } from './version.ts';
 import type { SessionInfo } from './types.ts';
 
@@ -45,11 +45,11 @@ const BACKUPS_DIR = join(CRUSTS_DIR, 'backups');
 const HISTORY_PATH = join(CRUSTS_DIR, 'history.jsonl');
 const CALIBRATION_PATH = join(CRUSTS_DIR, 'calibration.json');
 
-/** Parse settings.json, tolerating missing file and corruption. */
+/** Parse settings.json, tolerating a missing file, a UTF-8 BOM and corruption. */
 function readSettings(): Record<string, unknown> | null {
   if (!existsSync(SETTINGS_PATH)) return null;
   try {
-    return JSON.parse(readFileSync(SETTINGS_PATH, 'utf-8')) as Record<string, unknown>;
+    return JSON.parse(stripBom(readFileSync(SETTINGS_PATH, 'utf-8'))) as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -103,6 +103,15 @@ export const RECOMMENDED_RETENTION_DAYS = 365;
  */
 export const LARGE_CLEANUP_PERIOD_FIXED_IN = '2.1.310';
 
+/**
+ * How large "very large" is: from about this many days the cleanup cutoff
+ * (now minus that many days) falls outside the range a JavaScript Date can
+ * hold (8.64e15 ms either side of 1970), which 2.1.310 guards against. Values
+ * such as 3650, which the settings reference suggests for long retention,
+ * were never affected.
+ */
+export const HUGE_CLEANUP_PERIOD_DAYS = 100_000_000;
+
 /** How many of the most recently modified transcripts are probed for the Claude Code version. */
 const VERSION_PROBE_SESSIONS = 5;
 
@@ -146,10 +155,7 @@ export function checkTranscriptRetention(
     : `No session summaries in ${context.summariesDir} yet; the auto-inject hook (claude-crusts hooks auto-inject enable) keeps one per session.`;
   const version = context.claudeCodeVersion;
   const olderClaudeCode = version !== undefined && compareVersions(version, LARGE_CLEANUP_PERIOD_FIXED_IN) < 0;
-  const advice = `Set "cleanupPeriodDays": ${RECOMMENDED_RETENTION_DAYS} in ~/.claude/settings.json to keep transcripts for a year.`
-    + (olderClaudeCode
-      ? ` Keep it moderate on Claude Code ${version}: before ${LARGE_CLEANUP_PERIOD_FIXED_IN}, a very large value made background cleanup delete some recent files, such as pasted images.`
-      : '');
+  const advice = `Set "cleanupPeriodDays": ${RECOMMENDED_RETENTION_DAYS} in ~/.claude/settings.json to keep transcripts for a year.`;
 
   if (settings === null) {
     return { name, status: 'warn', detail: `~/.claude/settings.json is not valid JSON, so the retention period cannot be read. ${summaries}` };
@@ -162,11 +168,13 @@ export function checkTranscriptRetention(
       detail: `cleanupPeriodDays is not set, so Claude Code deletes transcripts older than ${DEFAULT_CLEANUP_PERIOD_DAYS} days and crusts can no longer analyze those sessions. ${summaries} ${advice}`,
     };
   }
-  if (typeof days !== 'number' || !Number.isFinite(days) || days < 1) {
+  // Claude Code's schema takes a positive whole number and skips a settings
+  // file that holds anything else.
+  if (typeof days !== 'number' || !Number.isInteger(days) || days < 1) {
     return {
       name,
       status: 'warn',
-      detail: `cleanupPeriodDays is ${JSON.stringify(days)}, but Claude Code takes a number of days, 1 or more. ${summaries} ${advice}`,
+      detail: `cleanupPeriodDays is ${JSON.stringify(days)}, but Claude Code takes a whole number of days, 1 or more. ${summaries} ${advice}`,
     };
   }
   if (days < MIN_RETENTION_DAYS) {
@@ -176,11 +184,11 @@ export function checkTranscriptRetention(
       detail: `cleanupPeriodDays is ${days}, so Claude Code deletes transcripts older than ${days} days and crusts can no longer analyze those sessions. ${summaries} ${advice}`,
     };
   }
-  if (days > RECOMMENDED_RETENTION_DAYS && olderClaudeCode) {
+  if (days >= HUGE_CLEANUP_PERIOD_DAYS && olderClaudeCode) {
     return {
       name,
       status: 'warn',
-      detail: `cleanupPeriodDays is ${days}. Before Claude Code ${LARGE_CLEANUP_PERIOD_FIXED_IN}, a very large value made background cleanup delete some recent files, such as pasted images, and your newest transcripts are from ${version}. Update Claude Code, or use ${RECOMMENDED_RETENTION_DAYS}. ${summaries}`,
+      detail: `cleanupPeriodDays is ${days}. Before Claude Code ${LARGE_CLEANUP_PERIOD_FIXED_IN}, a value this large made background cleanup delete recent files, such as pasted images, and your newest transcripts are from ${version}. Update Claude Code, or use a smaller value such as 3650. ${summaries}`,
     };
   }
   return { name, status: 'pass', detail: `cleanupPeriodDays is ${days}: Claude Code keeps transcripts for ${days} days. ${summaries}` };
@@ -226,13 +234,19 @@ function checkHooks(): DoctorCheck {
  * The 'Hook integration' check for parsed settings.
  *
  * Passes with the Stop hook installed or with none (it is optional). Warns
- * when the 0.8.1-and-earlier entry on the Notification event is still there:
- * Claude Code discards that hook's output, so it shows nothing.
+ * when the 0.8.1-and-earlier entry on the Notification event is still there
+ * (Claude Code discards that hook's output, so it shows nothing), and when
+ * the installed Stop hook's command would fail here (missing from PATH, or
+ * too old for `status --hook`), which ends every response with an error.
  *
  * @param settings - Parsed settings.json, or null when missing or unreadable
+ * @param commandProblem - Checks the hook's command (default `statusHookCommandProblem`)
  * @returns The check result
  */
-export function checkHookIntegration(settings: Record<string, unknown> | null): DoctorCheck {
+export function checkHookIntegration(
+  settings: Record<string, unknown> | null,
+  commandProblem: () => string | null = statusHookCommandProblem,
+): DoctorCheck {
   const name = 'Hook integration';
   if (!settings) return { name, status: 'warn', detail: 'settings.json is missing or unreadable, so the hook state is unknown.' };
 
@@ -243,6 +257,10 @@ export function checkHookIntegration(settings: Record<string, unknown> | null): 
       status: 'warn',
       detail: 'Old CRUSTS hook on the Notification event shows nothing (Claude Code discards its output). Run `claude-crusts hooks enable` to move it to Stop.',
     };
+  }
+  if (installed) {
+    const problem = commandProblem();
+    if (problem) return { name, status: 'warn', detail: `The CRUSTS Stop hook cannot run, so each response ends with a hook error. ${problem}` };
   }
   return {
     name,

@@ -9,6 +9,7 @@ import {
   newestRecordedClaudeCodeVersion,
   MIN_RETENTION_DAYS,
   RECOMMENDED_RETENTION_DAYS,
+  HUGE_CLEANUP_PERIOD_DAYS,
 } from '../src/doctor.ts';
 import type { DoctorCheck, RetentionContext } from '../src/doctor.ts';
 import type { SessionInfo } from '../src/types.ts';
@@ -111,7 +112,9 @@ describe('0.8.2 transcript retention check', () => {
   test('warns on a value Claude Code rejects and on unreadable settings', () => {
     const zero = checkTranscriptRetention({ cleanupPeriodDays: 0 }, ctx(0));
     expect(zero.status).toBe('warn');
-    expect(zero.detail).toContain('cleanupPeriodDays is 0, but Claude Code takes a number of days, 1 or more.');
+    expect(zero.detail).toContain('cleanupPeriodDays is 0, but Claude Code takes a whole number of days, 1 or more.');
+    // Claude Code's schema rejects a fraction, so the value would not apply.
+    expect(checkTranscriptRetention({ cleanupPeriodDays: 120.5 }, ctx(0)).status).toBe('warn');
     expect(checkTranscriptRetention({ cleanupPeriodDays: '365' }, ctx(0)).detail).toContain('cleanupPeriodDays is "365"');
     const broken = checkTranscriptRetention(null, ctx(0));
     expect(broken.status).toBe('warn');
@@ -123,22 +126,22 @@ describe('0.8.2 transcript retention check', () => {
       .toContain(`No session summaries in ${dir} yet; the auto-inject hook (claude-crusts hooks auto-inject enable) keeps one per session.`);
   });
 
-  test('the large-value caveat appears only on Claude Code older than 2.1.310', () => {
-    const older = checkTranscriptRetention({}, ctx(0, '2.1.305'));
-    expect(older.detail).toContain('Keep it moderate on Claude Code 2.1.305: before 2.1.310, a very large value made background cleanup delete some recent files, such as pasted images.');
-    expect(checkTranscriptRetention({}, ctx(0, '2.1.310')).detail).not.toContain('moderate');
-    expect(checkTranscriptRetention({}, ctx(0, '2.1.311')).detail).not.toContain('moderate');
-    expect(checkTranscriptRetention({}, ctx(0)).detail).not.toContain('moderate');
+  test('long retention such as 3650 passes on any Claude Code', () => {
+    for (const version of ['2.1.300', '2.1.310', undefined]) {
+      expect(checkTranscriptRetention({ cleanupPeriodDays: 3650 }, ctx(2, version)).status).toBe('pass');
+      expect(checkTranscriptRetention({ cleanupPeriodDays: 100_000 }, ctx(2, version)).status).toBe('pass');
+    }
+    // The advice no longer carries a caveat about large values.
+    expect(checkTranscriptRetention({}, ctx(0, '2.1.305')).detail).not.toContain('pasted images');
   });
 
-  test('a value above the recommendation warns on older Claude Code only', () => {
-    const older = checkTranscriptRetention({ cleanupPeriodDays: 100_000 }, ctx(2, '2.1.300'));
+  test('a value large enough to break cleanup warns on Claude Code older than 2.1.310 only', () => {
+    const older = checkTranscriptRetention({ cleanupPeriodDays: HUGE_CLEANUP_PERIOD_DAYS }, ctx(2, '2.1.300'));
     expect(older.status).toBe('warn');
     expect(older.detail).toContain('pasted images');
     expect(older.detail).toContain('your newest transcripts are from 2.1.300');
-    expect(checkTranscriptRetention({ cleanupPeriodDays: 100_000 }, ctx(2, '2.1.310')).status).toBe('pass');
-    expect(checkTranscriptRetention({ cleanupPeriodDays: 100_000 }, ctx(2)).status).toBe('pass');
-    expect(checkTranscriptRetention({ cleanupPeriodDays: 365 }, ctx(2, '2.1.300')).status).toBe('pass');
+    expect(checkTranscriptRetention({ cleanupPeriodDays: HUGE_CLEANUP_PERIOD_DAYS }, ctx(2, '2.1.310')).status).toBe('pass');
+    expect(checkTranscriptRetention({ cleanupPeriodDays: HUGE_CLEANUP_PERIOD_DAYS }, ctx(2)).status).toBe('pass');
   });
 
   test('details carry no em dashes', () => {

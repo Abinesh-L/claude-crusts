@@ -38,6 +38,9 @@ function stripAnsi(s: string): string {
   return s.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
+/** A hook command check that finds nothing wrong (the real one runs claude-crusts --version). */
+const commandWorks = (): string | null => null;
+
 /**
  * Run a function and return what it printed with console.log, uncoloured.
  *
@@ -126,8 +129,18 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
     return existsSync(backupsDir) ? readdirSync(backupsDir).sort() : [];
   }
 
+  test('enable installs nothing when the hook command would fail here', () => {
+    writeSettingsFile({ model: 'opus' });
+    const problem = 'claude-crusts is not on your PATH.';
+    const out = captureLog(() => enableHooks(settingsPath, () => problem));
+    expect(out).toContain(`CRUSTS hooks not enabled. ${problem}`);
+    expect(readSettingsFile()).toEqual({ model: 'opus' });
+    expect(backups()).toEqual([]);
+    expect(readCrustsConfig().hooksEnabled).toBeUndefined();
+  });
+
   test('enable on a missing settings.json creates one Stop entry and no backup', () => {
-    const out = captureLog(() => enableHooks(settingsPath));
+    const out = captureLog(() => enableHooks(settingsPath, commandWorks));
     expect(out).toContain('CRUSTS hooks enabled.');
 
     const settings = readSettingsFile();
@@ -143,7 +156,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
     writeSettingsFile(legacySettings());
     const before = readFileSync(settingsPath, 'utf-8');
 
-    const out = captureLog(() => enableHooks(settingsPath));
+    const out = captureLog(() => enableHooks(settingsPath, commandWorks));
     expect(out).toContain('Moved the CRUSTS status hook from the Notification event');
     expect(out).toContain('CRUSTS hooks enabled.');
 
@@ -168,11 +181,11 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
 
   test('enable is idempotent: a second run changes nothing and writes no backup', () => {
     writeSettingsFile(legacySettings());
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     const once = readFileSync(settingsPath, 'utf-8');
     const backupsAfterFirst = backups();
 
-    const out = captureLog(() => enableHooks(settingsPath));
+    const out = captureLog(() => enableHooks(settingsPath, commandWorks));
     expect(out).toContain('already enabled');
     expect(readFileSync(settingsPath, 'utf-8')).toBe(once);
     expect(backups()).toEqual(backupsAfterFirst);
@@ -187,7 +200,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
         Stop: [{ hooks: [{ type: 'command', command: HOOK_COMMAND, timeout: 30 }] }],
       },
     });
-    const out = captureLog(() => enableHooks(settingsPath));
+    const out = captureLog(() => enableHooks(settingsPath, commandWorks));
     expect(out).toContain('Removed the old CRUSTS status hook from the Notification event');
     const after = readSettingsFile();
     expect(after).toEqual({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK_COMMAND, timeout: 30 }] }] } });
@@ -196,7 +209,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
 
   test('disable removes the Stop and legacy entries and nothing else', () => {
     writeSettingsFile(legacySettings());
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     // A legacy entry that reappeared (an old crusts run) goes too.
     const withLegacy = readSettingsFile();
     (withLegacy.hooks as Record<string, unknown[]>).Notification!.unshift(LEGACY_GROUP);
@@ -216,7 +229,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
     const original = { model: 'opus', permissions: { allow: ['Bash(git status)'] } };
     writeSettingsFile(original);
     const before = readFileSync(settingsPath, 'utf-8');
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     captureLog(() => disableHooks(settingsPath));
     expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
   });
@@ -241,7 +254,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
       },
     };
     writeSettingsFile(lookalikes);
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     captureLog(() => disableHooks(settingsPath));
 
     // Only the legacy command inside the mixed Notification group is gone;
@@ -263,7 +276,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
   test('a settings.json that does not parse is never rewritten', () => {
     const broken = '{\n  "model": "opus",\n  "hooks": {},\n}\n';
     writeFileSync(settingsPath, broken, 'utf-8');
-    const enableOut = captureLog(() => enableHooks(settingsPath));
+    const enableOut = captureLog(() => enableHooks(settingsPath, commandWorks));
     const disableOut = captureLog(() => disableHooks(settingsPath));
     const autoOut = captureLog(() => enableAutoInject(settingsPath));
     expect(enableOut).toContain('Cannot read');
@@ -279,14 +292,14 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
     const odd = { model: 'opus', hooks: { Stop: { command: 'say done' } } };
     writeSettingsFile(odd);
     const before = readFileSync(settingsPath, 'utf-8');
-    const out = captureLog(() => enableHooks(settingsPath));
+    const out = captureLog(() => enableHooks(settingsPath, commandWorks));
     expect(out).toContain('"hooks.Stop" is not a list');
     expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
   });
 
   test('a UTF-8 BOM in settings.json is tolerated', () => {
     writeFileSync(settingsPath, '﻿' + JSON.stringify({ model: 'opus' }, null, 2) + '\n', 'utf-8');
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     const after = readSettingsFile();
     expect(after.model).toBe('opus');
     expect(detectStatusHooks(after).installed).toBe(true);
@@ -299,7 +312,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
     }
     writeFileSync(join(backupsDir, 'CLAUDE.md.2020-01-01T00-00-00-000Z.bak'), 'x', 'utf-8');
     writeSettingsFile({ model: 'opus' });
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
 
     const kept = backups().filter((f) => f.startsWith('settings.json.'));
     expect(kept.length).toBe(10);
@@ -318,7 +331,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
     expect(out).toContain('old install on the Notification event, which shows nothing');
     expect(out).toContain('hooks enable');
 
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     out = captureLog(() => hooksStatus(settingsPath));
     expect(out).toContain('CRUSTS hooks: enabled (Stop hook');
     expect(out).not.toContain('Notification');
@@ -333,7 +346,7 @@ describe('hooks enable / disable / status on a temp settings.json', () => {
 
   test('auto-inject enable / disable and the status hook leave each other alone', () => {
     writeSettingsFile({ hooks: { Stop: [USER_STOP_GROUP] } });
-    captureLog(() => enableHooks(settingsPath));
+    captureLog(() => enableHooks(settingsPath, commandWorks));
     captureLog(() => enableAutoInject(settingsPath));
     let settings = readSettingsFile();
     expect(detectStatusHooks(settings).installed).toBe(true);
@@ -377,9 +390,17 @@ describe('doctor Hook integration check', () => {
   });
 
   test('passes with the Stop hook installed', () => {
-    const check = checkHookIntegration({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK_COMMAND }] }] } });
+    const check = checkHookIntegration({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK_COMMAND }] }] } }, commandWorks);
     expect(check.status).toBe('pass');
     expect(check.detail).toContain('Stop hook installed');
+  });
+
+  test('warns when the installed Stop hook\'s command would fail', () => {
+    const settings = { hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK_COMMAND }] }] } };
+    const check = checkHookIntegration(settings, () => 'The claude-crusts on your PATH is 0.8.1.');
+    expect(check.status).toBe('warn');
+    expect(check.detail).toContain('each response ends with a hook error');
+    expect(check.detail).toContain('0.8.1');
   });
 
   test('passes when not installed (the hook is optional)', () => {

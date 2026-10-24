@@ -22,6 +22,7 @@
 import { homedir } from 'os';
 import { basename, dirname, join } from 'path';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { loadConfig, saveConfig, stripBom, crustsSessionsDir } from './config.ts';
 import { loadSessionSummaries } from './session-summary.ts';
@@ -30,6 +31,7 @@ import { discoverSessions, parseSession, collectObservedMcpServers } from './sca
 import { gatherConfigData, sessionProjectPath } from './analyzer.ts';
 import { classifySession, countAnalyzedMessages } from './classifier.ts';
 import { getContextHealth } from './recommender.ts';
+import { compareVersions } from './built-in-tools.ts';
 import type { ContextHealth, CrustsBreakdown } from './types.ts';
 
 /** Path to Claude Code's global settings */
@@ -359,17 +361,52 @@ export function detectStatusHooks(settings: Record<string, unknown>): StatusHook
 // Public API
 // ---------------------------------------------------------------------------
 
+/** First claude-crusts version whose `status` command accepts `--hook` */
+export const STATUS_HOOK_SINCE = '0.8.2';
+
+/**
+ * Whether the command the Stop hook runs works on this machine. Claude Code
+ * runs the hook by name, so `claude-crusts` must be on PATH and new enough
+ * to accept `status --hook`; otherwise every response would end with a
+ * Stop hook error (a missing command exits 127, 0.8.1 rejects the flag).
+ * Run through the shell, as Claude Code does, so npm's command shims count.
+ *
+ * @returns null when it works, else what is wrong and how to fix it
+ */
+export function statusHookCommandProblem(): string | null {
+  const run = spawnSync('claude-crusts --version', { shell: true, encoding: 'utf-8', timeout: 15_000, windowsHide: true });
+  const version = /(\d+\.\d+\.\d+)/.exec(run.stdout ?? '')?.[1];
+  if (run.status !== 0 || !version) {
+    return 'claude-crusts is not on your PATH, and Claude Code runs the hook by that name. Install it with `npm install -g claude-crusts`, then run `claude-crusts hooks enable` again.';
+  }
+  if (compareVersions(version, STATUS_HOOK_SINCE) < 0) {
+    return `The claude-crusts on your PATH is ${version}, which does not accept \`status --hook\`. Update it with \`npm install -g claude-crusts@latest\`, then run \`claude-crusts hooks enable\` again.`;
+  }
+  return null;
+}
+
 /**
  * Install the CRUSTS status hook on Claude Code's Stop event.
  *
  * Idempotent: an existing Stop entry is kept and no second one is added.
  * The 0.8.1-and-earlier entry on Notification is removed in the same write.
  * settings.json is backed up first and left alone when it does not parse.
- * Claude Code's settings watcher picks up the change in running sessions.
+ * Nothing is installed when the hook's command would fail here (see
+ * `statusHookCommandProblem`). Claude Code's settings watcher picks up the
+ * change in running sessions.
  *
  * @param settingsPath - Settings file to edit (default `~/.claude/settings.json`)
+ * @param commandProblem - Checks the hook's command (default `statusHookCommandProblem`)
  */
-export function enableHooks(settingsPath: string = CLAUDE_SETTINGS_PATH): void {
+export function enableHooks(
+  settingsPath: string = CLAUDE_SETTINGS_PATH,
+  commandProblem: () => string | null = statusHookCommandProblem,
+): void {
+  const problem = commandProblem();
+  if (problem) {
+    console.log(chalk.red(`  CRUSTS hooks not enabled. ${problem}`));
+    return;
+  }
   const read = readSettingsForEdit(settingsPath);
   if (!read.ok) {
     reportUnreadable(settingsPath, read.reason);
