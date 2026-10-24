@@ -36,6 +36,9 @@ import {
   buildOptimizeReport,
   renderOptimizeReport,
   applyFix,
+  parseFixKinds,
+  FIX_KINDS,
+  RENAMED_FIX_KINDS,
 } from './optimizer.ts';
 import type { FixKind } from './optimizer.ts';
 import { runDoctor, renderDoctor } from './doctor.ts';
@@ -240,10 +243,25 @@ program
   .option('--apply', 'Apply auto-applicable fixes with per-fix confirmation')
   .option('--yes', 'Skip per-fix confirmations (requires --apply)')
   .option('--min-savings <n>', 'Skip fixes saving less than N tokens', '100')
-  .option('--filter <types>', 'Only show fixes of listed kinds (comma-separated)')
-  .option('--project-path <path>', 'Project root for .claudeignore / CLAUDE.md writes (default: cwd)')
+  .option('--filter <types>', `Only show fixes of these kinds, comma-separated: ${FIX_KINDS.join(', ')}`)
+  .option('--project-path <path>', 'Project folder for the .claude/settings.local.json and CLAUDE.md writes (default: cwd)')
   .action(async (sessionId: string | undefined, options: { apply?: boolean; yes?: boolean; minSavings?: string; filter?: string; projectPath?: string }, cmd: Command) => {
     const globals = cmd.optsWithGlobals();
+
+    let filter: FixKind[] | undefined;
+    if (options.filter) {
+      const parsed = parseFixKinds(options.filter);
+      if (parsed.unknown.length > 0) {
+        console.error(chalk.red(`Unknown fix kind: ${parsed.unknown.join(', ')}. Use one or more of: ${FIX_KINDS.join(', ')}.`));
+        process.exitCode = 1;
+        return;
+      }
+      for (const name of parsed.renamed) {
+        console.error(chalk.dim(`Fix kind "${name}" is now "${RENAMED_FIX_KINDS[name]}".`));
+      }
+      if (parsed.kinds.length > 0) filter = parsed.kinds;
+    }
+
     const session = resolveSession(sessionId, globals.path, globals.project);
     if (!session) return;
 
@@ -254,9 +272,6 @@ program
     }
 
     const minSavings = parseInt(options.minSavings ?? '100', 10);
-    const filter = options.filter
-      ? options.filter.split(',').map((s) => s.trim()).filter(Boolean) as FixKind[]
-      : undefined;
 
     const projectPath = options.projectPath
       ? resolve(options.projectPath)

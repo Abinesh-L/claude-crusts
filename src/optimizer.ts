@@ -10,7 +10,10 @@
  *
  * Fix categories (v1):
  *   - compact-focus      : `/compact focus "..."` tuned to this session's waste
- *   - claudeignore       : append noise patterns to project `.claudeignore`
+ *   - read-deny          : add `Read(...)` deny rules for the noise paths this
+ *                          session read to the project's
+ *                          `.claude/settings.local.json`, so Claude Code
+ *                          refuses to read them
  *   - claudemd-rule      : append a rule to project `CLAUDE.md` to prevent
  *                          the waste pattern in future sessions
  *   - mcp-disable        : copy disable command for MCP servers with zero
@@ -23,24 +26,42 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, unlinkSync, utimesSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, dirname, isAbsolute, resolve } from 'path';
 import { createInterface } from 'readline';
 import chalk from 'chalk';
 import { copyToClipboard } from './clipboard.ts';
 import { CRUSTS_DIR } from './calibrator.ts';
-import { loadWasteThresholds } from './config.ts';
+import { loadWasteThresholds, stripBom, writeFileAtomic } from './config.ts';
 import type { CrustsBreakdown, WasteItem, ConfigData, SessionMessage } from './types.ts';
 
-/** Noise path patterns that shouldn't be re-read into context repeatedly. */
-const CLAUDEIGNORE_PATTERNS: Array<{ regex: RegExp; rule: string; label: string }> = [
-  { regex: /(^|[\\/])node_modules[\\/]/i, rule: 'node_modules/', label: 'node_modules (installed deps)' },
-  { regex: /(^|[\\/])dist[\\/]/i, rule: 'dist/', label: 'dist (build output)' },
-  { regex: /(^|[\\/])build[\\/]/i, rule: 'build/', label: 'build (build output)' },
-  { regex: /(^|[\\/])\.next[\\/]/i, rule: '.next/', label: '.next (Next.js cache)' },
-  { regex: /(^|[\\/])target[\\/]/i, rule: 'target/', label: 'target (Rust/JVM build)' },
-  { regex: /(^|[\\/])\.git[\\/]/i, rule: '.git/', label: '.git (version control internals)' },
-  { regex: /(^|[\\/])(package-lock|bun|yarn|pnpm|cargo|poetry|pipfile)\.lock$/i, rule: '*.lock', label: 'lock files (auto-generated)' },
+/**
+ * Noise paths that shouldn't be re-read into context repeatedly.
+ *
+ * Each regex matches a path relative to the project root and captures the
+ * name the deny rule covers, as the path spells it: a folder (`folder: true`,
+ * everything under it is covered) or, for lock files, which mix `.lock`,
+ * `.json` and `.yaml` names, the file itself.
+ */
+const NOISE_PATHS: Array<{ regex: RegExp; folder: boolean; label: string }> = [
+  { regex: /(?:^|\/)(node_modules)\//i, folder: true, label: 'installed deps' },
+  { regex: /(?:^|\/)(dist)\//i, folder: true, label: 'build output' },
+  { regex: /(?:^|\/)(build)\//i, folder: true, label: 'build output' },
+  { regex: /(?:^|\/)(\.next)\//i, folder: true, label: 'Next.js cache' },
+  { regex: /(?:^|\/)(target)\//i, folder: true, label: 'Rust/JVM build' },
+  { regex: /(?:^|\/)(\.git)\//i, folder: true, label: 'version control internals' },
+  {
+    regex: /(?:^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|cargo\.lock|poetry\.lock|pipfile\.lock)$/i,
+    folder: false,
+    label: 'lock file, auto-generated',
+  },
 ];
+
+/**
+ * Where the read-deny fix writes, relative to the project root: Claude Code's
+ * personal per-project settings file, which it keeps out of git when it
+ * creates the file itself.
+ */
+const LOCAL_SETTINGS_PATH = '.claude/settings.local.json';
 
 /**
  * Default threshold above which a CLAUDE.md file is flagged as oversized.
@@ -53,12 +74,25 @@ const CLAUDE_MD_OVERSIZED_THRESHOLD_DEFAULT = 1_500;
 const DEFAULT_MIN_SAVINGS = 100;
 
 /** All fix kinds the optimizer emits. */
-export type FixKind =
-  | 'compact-focus'
-  | 'claudeignore'
-  | 'claudemd-rule'
-  | 'mcp-disable'
-  | 'claudemd-oversized';
+export const FIX_KINDS = [
+  'compact-focus',
+  'read-deny',
+  'claudemd-rule',
+  'mcp-disable',
+  'claudemd-oversized',
+] as const;
+
+/** One of the fix kinds in `FIX_KINDS`. */
+export type FixKind = typeof FIX_KINDS[number];
+
+/**
+ * Fix kinds renamed since an earlier release, mapped to the current name.
+ * `claudeignore` wrote a `.claudeignore` file, which Claude Code never reads;
+ * `read-deny` replaced it in 0.8.2.
+ */
+export const RENAMED_FIX_KINDS: Readonly<Record<string, FixKind>> = {
+  claudeignore: 'read-deny',
+};
 
 /** A single ranked, ROI-tagged fix ready for display or auto-apply. */
 export interface OptimizeFix {
@@ -75,6 +109,8 @@ export interface OptimizeFix {
   applyTarget?: string;
   /** Content to write (for file-appending fixes) */
   applyContent?: string;
+  /** Permission rules to add to `permissions.deny` in `applyTarget` (read-deny fixes) */
+  denyRules?: string[];
 }
 
 /** Full optimize report: ranked fixes with totals. */
@@ -88,6 +124,37 @@ export interface OptimizeReport {
 export interface OptimizeOptions {
   minSavings?: number;
   filter?: FixKind[];
+}
+
+/**
+ * Parse a comma-separated `--filter` value into fix kinds.
+ *
+ * Names are trimmed and matched case-insensitively. A renamed kind (see
+ * `RENAMED_FIX_KINDS`) still selects its replacement and is listed in
+ * `renamed`, so the CLI can say so; names that match no kind are returned in
+ * `unknown` instead of silently filtering every fix out.
+ *
+ * @param value - The raw `--filter` option value
+ * @returns The selected kinds (deduplicated), plus unknown and renamed names
+ */
+export function parseFixKinds(value: string): { kinds: FixKind[]; unknown: string[]; renamed: string[] } {
+  const kinds: FixKind[] = [];
+  const unknown: string[] = [];
+  const renamed: string[] = [];
+  for (const raw of value.split(',')) {
+    const name = raw.trim().toLowerCase();
+    if (name === '') continue;
+    const current = (FIX_KINDS as readonly string[]).includes(name)
+      ? name as FixKind
+      : RENAMED_FIX_KINDS[name];
+    if (current === undefined) {
+      unknown.push(raw.trim());
+      continue;
+    }
+    if (current !== name) renamed.push(name);
+    if (!kinds.includes(current)) kinds.push(current);
+  }
+  return { kinds, unknown, renamed };
 }
 
 // ---------------------------------------------------------------------------
@@ -108,17 +175,90 @@ function extractReadPath(input: unknown): string | undefined {
 }
 
 /**
- * Walk session messages and return read-path → token-cost aggregates,
- * grouped by matching CLAUDEIGNORE_PATTERNS.
+ * Path of `target` relative to the folder `root`, with forward slashes, or
+ * null when `target` is not inside `root`.
+ *
+ * Compares case-insensitively on Windows, as Claude Code matches deny rules
+ * there.
+ */
+function projectRelativePath(root: string, target: string): string | null {
+  const slashed = (p: string): string => resolve(p).replace(/\\/g, '/').replace(/\/+$/, '');
+  const fold = (p: string): string => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const base = slashed(root);
+  const full = slashed(target);
+  if (!fold(full).startsWith(`${fold(base)}/`)) return null;
+  return full.slice(base.length + 1);
+}
+
+/** A noise path one session read, with the deny rule that covers it. */
+interface NoiseRead {
+  /** Claude Code permission rule, e.g. `Read(/**\/node_modules/**)` */
+  rule: string;
+  /** Display name, e.g. `node_modules (installed deps)` */
+  label: string;
+  /** Short name for the fix title, e.g. `node_modules/` or `bun.lock` */
+  name: string;
+}
+
+/**
+ * Match a project-relative path against `NOISE_PATHS` and build the
+ * `Read(...)` deny rule that covers it.
+ *
+ * Rules use Claude Code's permission path syntax, which is gitignore syntax:
+ * a leading `/` anchors at the project (for `.claude/settings.local.json`,
+ * the session's primary working directory) and `**` matches any depth, so
+ * one rule covers nested copies such as `packages/web/node_modules/`. A
+ * plain relative pattern (`./node_modules/**`) would resolve against Claude's
+ * current directory, which follows a `cd` in the shell, and miss the
+ * project's top-level folder after one. The name keeps the path's spelling,
+ * since rules match case-sensitively outside Windows.
+ *
+ * @param relative - Path relative to the project root, forward slashes
+ * @returns The rule, or null when the path is not noise
+ */
+function matchNoisePath(relative: string): NoiseRead | null {
+  for (const entry of NOISE_PATHS) {
+    const covered = entry.regex.exec(relative)?.[1];
+    if (!covered) continue;
+    return {
+      rule: entry.folder ? `Read(/**/${covered}/**)` : `Read(/**/${covered})`,
+      label: `${covered} (${entry.label})`,
+      name: entry.folder ? `${covered}/` : covered,
+    };
+  }
+  return null;
+}
+
+/** Reads of the noise paths one deny rule covers, with their cost. */
+interface NoiseReads extends NoiseRead {
+  /** Distinct files read */
+  paths: Set<string>;
+  /** Approximate tokens their read results added to the window */
+  tokens: number;
+}
+
+/**
+ * Walk session messages and total the reads of noise paths inside the
+ * project, one entry per deny rule that covers them (see `matchNoisePath`),
+ * in order of first read.
+ *
+ * Reads outside `projectPath` are skipped: a rule in the project's settings
+ * cannot block them. Paths are matched relative to the project root, so a
+ * project that itself lives under a folder named `build` is not mistaken for
+ * build output. A read that failed (`is_error`) put no file into context and
+ * is not counted.
  *
  * The token cost attributed to each path is the approximate size of the
- * corresponding tool_result body — a reasonable proxy since the file's
+ * corresponding tool_result body, a reasonable proxy since the file's
  * contents account for most of the tool_result's tokens.
  */
-function detectClaudeignoreCandidates(messages: SessionMessage[]): Map<string, { paths: Set<string>; tokens: number; label: string }> {
-  const hits = new Map<string, { paths: Set<string>; tokens: number; label: string }>();
-  // Map tool_use_id → { path, pattern }
-  const readById = new Map<string, { path: string; rule: string; label: string }>();
+function detectNoiseReads(messages: SessionMessage[], projectPath: string): NoiseReads[] {
+  // Keyed by rule; case-folded on Windows, where Claude Code matches deny
+  // rules case-insensitively, so `Node_modules` and `node_modules` share one.
+  const hits = new Map<string, NoiseReads>();
+  const ruleKey = (rule: string): string => (process.platform === 'win32' ? rule.toLowerCase() : rule);
+  // Map tool_use_id → the read path and its rule
+  const readById = new Map<string, NoiseRead & { path: string }>();
 
   for (const msg of messages) {
     const content = msg.message?.content;
@@ -128,15 +268,17 @@ function detectClaudeignoreCandidates(messages: SessionMessage[]): Map<string, {
       for (const block of content) {
         if (block.type !== 'tool_use') continue;
         if (block.name !== 'Read' && block.name !== 'FileReadTool') continue;
-        const path = extractReadPath(block.input);
-        if (!path) continue;
-        const match = CLAUDEIGNORE_PATTERNS.find((p) => p.regex.test(path));
-        if (!match) continue;
-        if (block.id) readById.set(block.id, { path, rule: match.rule, label: match.label });
+        const raw = extractReadPath(block.input);
+        if (!raw) continue;
+        const path = isAbsolute(raw) ? raw : resolve(msg.cwd ?? projectPath, raw);
+        const relative = projectRelativePath(projectPath, path);
+        if (relative === null) continue;
+        const noise = matchNoisePath(relative);
+        if (noise && block.id) readById.set(block.id, { ...noise, path });
       }
     } else if (msg.type === 'user') {
       for (const block of content) {
-        if (block.type !== 'tool_result') continue;
+        if (block.type !== 'tool_result' || block.is_error) continue;
         const meta = readById.get(block.tool_use_id ?? '');
         if (!meta) continue;
         const textLen = typeof block.content === 'string'
@@ -145,14 +287,104 @@ function detectClaudeignoreCandidates(messages: SessionMessage[]): Map<string, {
             ? block.content.reduce((sum, b) => sum + (typeof b === 'object' && b && 'text' in b && typeof b.text === 'string' ? b.text.length : 0), 0)
             : 0;
         const tokens = Math.ceil(textLen / 3.3);
-        const bucket = hits.get(meta.rule) ?? { paths: new Set<string>(), tokens: 0, label: meta.label };
+        const key = ruleKey(meta.rule);
+        const bucket = hits.get(key)
+          ?? { rule: meta.rule, label: meta.label, name: meta.name, paths: new Set<string>(), tokens: 0 };
         bucket.paths.add(meta.path);
         bucket.tokens += tokens;
-        hits.set(meta.rule, bucket);
+        hits.set(key, bucket);
       }
     }
   }
-  return hits;
+  return [...hits.values()];
+}
+
+/** A Claude Code settings file read for a deny-rule merge. */
+export type DenySettingsFile =
+  | { state: 'missing' }
+  | { state: 'ok'; settings: Record<string, unknown>; deny: unknown[] }
+  | { state: 'invalid'; reason: string };
+
+/**
+ * Read a Claude Code settings file and check that deny rules can be merged
+ * into it without losing anything.
+ *
+ * A missing file, or one holding only whitespace, is fine: there is nothing
+ * to keep. Anything else must parse as a JSON object (a leading UTF-8 BOM is
+ * stripped first) whose `permissions`, when present, is an object and whose
+ * `permissions.deny`, when present, is a list; otherwise the file is reported
+ * as invalid so the apply step refuses to overwrite it.
+ *
+ * @param path - Absolute path of the settings file
+ */
+export function readDenySettings(path: string): DenySettingsFile {
+  if (!existsSync(path)) return { state: 'missing' };
+  let raw: string;
+  try {
+    raw = stripBom(readFileSync(path, 'utf-8'));
+  } catch (err) {
+    return { state: 'invalid', reason: `it could not be read (${err instanceof Error ? err.message : String(err)})` };
+  }
+  if (raw.trim() === '') return { state: 'ok', settings: {}, deny: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { state: 'invalid', reason: `it is not valid JSON (${err instanceof Error ? err.message : String(err)})` };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { state: 'invalid', reason: 'it does not hold a JSON object' };
+  }
+  const settings = parsed as Record<string, unknown>;
+  const permissions = settings.permissions;
+  if (permissions === undefined) return { state: 'ok', settings, deny: [] };
+  if (typeof permissions !== 'object' || permissions === null || Array.isArray(permissions)) {
+    return { state: 'invalid', reason: '"permissions" is not an object' };
+  }
+  const deny = (permissions as Record<string, unknown>).deny;
+  if (deny === undefined) return { state: 'ok', settings, deny: [] };
+  if (!Array.isArray(deny)) return { state: 'invalid', reason: '"permissions.deny" is not a list' };
+  return { state: 'ok', settings, deny };
+}
+
+/**
+ * Add deny rules to a parsed settings object without touching anything else.
+ *
+ * Every other key, every other `permissions` entry and the existing deny
+ * rules (in their order) are kept; only rules not already present are
+ * appended. The input object is not modified.
+ *
+ * @param settings - Parsed settings (as `readDenySettings` returned them)
+ * @param rules - Permission rules to add, such as `Read(/**\/dist/**)`
+ * @returns The merged settings and the rules that were actually added
+ */
+export function mergeDenyRules(
+  settings: Record<string, unknown>,
+  rules: string[],
+): { settings: Record<string, unknown>; added: string[] } {
+  const current = settings.permissions;
+  const permissions = typeof current === 'object' && current !== null && !Array.isArray(current)
+    ? current as Record<string, unknown>
+    : {};
+  const existing = Array.isArray(permissions.deny) ? permissions.deny as unknown[] : [];
+  const added: string[] = [];
+  for (const rule of rules) {
+    if (!existing.includes(rule) && !added.includes(rule)) added.push(rule);
+  }
+  return {
+    settings: { ...settings, permissions: { ...permissions, deny: [...existing, ...added] } },
+    added,
+  };
+}
+
+/**
+ * Join short names for a sentence: `a`, `a and b`, `a, b and c`.
+ *
+ * @param names - Names in display order
+ */
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
 /**
@@ -189,30 +421,24 @@ export function buildCompactFocus(waste: WasteItem[]): { text: string; savings: 
 }
 
 /**
- * Build an append-block of noise-pattern rules for project `.claudeignore`.
- */
-function renderClaudeignoreAppend(rules: string[]): string {
-  return `\n# Added by claude-crusts optimize (${new Date().toISOString().slice(0, 10)})\n${rules.join('\n')}\n`;
-}
-
-/**
  * Build a CLAUDE.md append block that tells Claude not to re-read the
  * detected noise patterns in future sessions.
  *
  * Includes an explicit "recovery" note: the rules are *preferences*, not
  * hard bans. If a file under these patterns genuinely becomes relevant
  * (debugging a build artefact, auditing a lock file), Claude is free to
- * re-read it on demand. The goal is to eliminate reflexive reads, not to
- * block needed ones.
+ * re-read it on demand, unless the read-deny fix's rules also block it
+ * (those Claude Code enforces). The goal is to eliminate reflexive reads,
+ * not to block needed ones.
  */
 function renderClaudemdRuleAppend(labels: string[]): string {
   const lines = labels.map((l) => `- ${l}`);
   const recovery = [
     '',
-    '**Recovery note:** these are preferences, not hard bans. If any of these files ',
-    'become relevant to a specific debugging or auditing task, re-read them on demand. ',
-    'Files remain on disk and can always be re-read — this rule only discourages ',
-    'reflexive reads that silently inflate context.',
+    '**Recovery note:** these are preferences, not hard bans. If one of these files ',
+    'becomes relevant to a specific debugging or auditing task, read it on demand, ',
+    'unless a Read deny rule in the Claude Code settings blocks it. This rule only ',
+    'discourages reflexive reads that silently inflate context.',
   ].join('');
   return `\n## Files to avoid reading\n\n${lines.join('\n')}\n${recovery}\n`;
 }
@@ -255,45 +481,61 @@ export function buildOptimizeReport(
     });
   }
 
-  // 2. claudeignore — noise paths being re-read
-  const ignoreHits = detectClaudeignoreCandidates(messages);
-  if (ignoreHits.size > 0) {
+  // 2. read-deny: noise paths read this session, blocked with Claude Code
+  //    permission deny rules (Claude Code has no ignore file for Claude's reads)
+  const noiseHits = detectNoiseReads(messages, projectPath);
+  if (noiseHits.length > 0) {
+    const settingsPath = join(projectPath, LOCAL_SETTINGS_PATH);
+    const settingsFile = readDenySettings(settingsPath);
+    const present = settingsFile.state === 'ok' ? settingsFile.deny : [];
     const rules: string[] = [];
+    const names: string[] = [];
     const labels: string[] = [];
+    const lines: string[] = [];
     let totalTokens = 0;
-    const claudeignorePath = join(projectPath, '.claudeignore');
-    const existing = existsSync(claudeignorePath) ? readFileSync(claudeignorePath, 'utf-8') : '';
-    for (const [rule, data] of ignoreHits) {
-      if (existing.includes(rule)) continue;
-      rules.push(rule);
-      labels.push(`${data.label} — ${data.paths.size} file(s), ~${data.tokens.toLocaleString()} tokens`);
+    for (const data of noiseHits) {
+      if (present.includes(data.rule)) continue;
+      rules.push(data.rule);
+      names.push(data.name);
+      labels.push(data.label);
+      lines.push(`${data.label}: ${data.paths.size} file(s) read, ~${data.tokens.toLocaleString()} tokens`);
       totalTokens += data.tokens;
     }
     if (rules.length > 0 && totalTokens >= minSavings) {
-      const appendContent = renderClaudeignoreAppend(rules);
+      lines.push(
+        `Adds Read deny rules to ${LOCAL_SETTINGS_PATH}, your personal settings for this project.`,
+        'Claude Code will refuse to read these paths (file reads, searches, @-mentions, and shell commands such as cat that name them) and to edit or write files there.',
+        'Remove the rules in /permissions or in that file to undo.',
+      );
+      if (existsSync(join(projectPath, '.claudeignore'))) {
+        lines.push('This project\'s .claudeignore has no effect: Claude Code does not read that file.');
+      }
+      if (settingsFile.state === 'invalid') {
+        lines.push(`${LOCAL_SETTINGS_PATH} cannot be updated yet: ${settingsFile.reason}. Fix the file first; --apply will not change it.`);
+      }
       fixes.push({
         id: nextId++,
-        kind: 'claudeignore',
-        title: `Add ${rules.length} noise pattern(s) to .claudeignore`,
-        description: labels.join('\n   '),
+        kind: 'read-deny',
+        title: `Make Claude Code refuse to read ${joinNames(names)}`,
+        description: lines.join('\n'),
         estimatedSavings: totalTokens,
-        action: appendContent.trim(),
+        action: rules.join('\n'),
         autoApplicable: true,
-        applyTarget: claudeignorePath,
-        applyContent: appendContent,
+        applyTarget: settingsPath,
+        denyRules: rules,
       });
 
-      // 3. claudemd-rule — also append a prose rule to CLAUDE.md to deter Read calls
+      // 3. claudemd-rule: also append a prose rule to CLAUDE.md to deter Read calls
       const claudeMdPath = join(projectPath, 'CLAUDE.md');
       if (existsSync(claudeMdPath)) {
         const existingMd = readFileSync(claudeMdPath, 'utf-8');
         if (!existingMd.includes('Files to avoid reading')) {
-          const ruleAppend = renderClaudemdRuleAppend(labels.map((l) => l.split(' — ')[0] ?? l));
+          const ruleAppend = renderClaudemdRuleAppend(labels);
           fixes.push({
             id: nextId++,
             kind: 'claudemd-rule',
             title: 'Add "Files to avoid reading" section to CLAUDE.md',
-            description: 'Prevents future sessions from re-reading the same noise.',
+            description: 'Asks Claude to avoid these paths in future sessions without blocking them.',
             estimatedSavings: Math.round(totalTokens / 2), // secondary protection, don't double-count fully
             action: ruleAppend.trim(),
             autoApplicable: true,
@@ -358,7 +600,7 @@ export function buildOptimizeReport(
 
 const KIND_ICON: Record<FixKind, string> = {
   'compact-focus': '\u25b6', // ▶
-  'claudeignore': '\u2699',  // ⚙
+  'read-deny': '\u2699',     // ⚙
   'claudemd-rule': '\u270e', // ✎
   'mcp-disable': '\u29bf',   // ⦿
   'claudemd-oversized': '\u26a0', // ⚠
@@ -491,9 +733,32 @@ function pruneBackups(originalName: string): void {
 }
 
 /**
+ * Copy a file about to be modified into the backup folder as
+ * `<name>.<timestamp>.bak`, then prune that name's older backups.
+ *
+ * @param target - Existing file about to be modified
+ * @returns Path of the backup written
+ */
+function backupFile(target: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const originalName = basename(target);
+  const backupPath = join(backupDir(), `${originalName}.${ts}.bak`);
+  copyFileSync(target, backupPath);
+  // On Windows, copyFileSync preserves the source file's mtime on the
+  // destination (via CopyFileW). Explicitly touch the backup to "now"
+  // so any mtime-based tooling (monitoring, prune fallbacks, test
+  // assertions) sees the backup's actual creation time rather than the
+  // target's age. Silent-fail: the primary pruning path keys off
+  // filenames, not mtime, so this is belt-and-suspenders.
+  try { const now = new Date(); utimesSync(backupPath, now, now); } catch { /* best-effort */ }
+  pruneBackups(originalName);
+  return backupPath;
+}
+
+/**
  * Apply a single fix, with optional user confirmation.
  *
- * File-modifying fixes (claudeignore, claudemd-rule) are backed up to
+ * File-modifying fixes (read-deny, claudemd-rule) are backed up to
  * `~/.claude-crusts/backups/` before writing. Clipboard-only fixes
  * (compact-focus, mcp-disable) copy the action text and report. Fixes
  * flagged `autoApplicable: false` fall through to clipboard copy of
@@ -513,6 +778,8 @@ export async function applyFix(
     };
   }
 
+  if (fix.kind === 'read-deny') return applyDenyRules(fix, options);
+
   if (!fix.applyTarget || fix.applyContent === undefined) {
     return { fixId: fix.id, status: 'failed', message: 'Fix marked auto-applicable but missing target or content.' };
   }
@@ -526,20 +793,9 @@ export async function applyFix(
   let backupPath: string | undefined;
   try {
     if (existsSync(fix.applyTarget)) {
-      const ts = new Date().toISOString().replace(/[:.]/g, '-');
-      const originalName = basename(fix.applyTarget);
-      backupPath = join(backupDir(), `${originalName}.${ts}.bak`);
-      copyFileSync(fix.applyTarget, backupPath);
-      // On Windows, copyFileSync preserves the source file's mtime on the
-      // destination (via CopyFileW). Explicitly touch the backup to "now"
-      // so any mtime-based tooling (monitoring, prune fallbacks, test
-      // assertions) sees the backup's actual creation time rather than the
-      // target's age. Silent-fail: the primary pruning path keys off
-      // filenames, not mtime, so this is belt-and-suspenders.
-      try { const now = new Date(); utimesSync(backupPath, now, now); } catch { /* best-effort */ }
+      backupPath = backupFile(fix.applyTarget);
       const prev = readFileSync(fix.applyTarget, 'utf-8');
       writeFileSync(fix.applyTarget, prev + fix.applyContent, 'utf-8');
-      pruneBackups(originalName);
     } else {
       writeFileSync(fix.applyTarget, fix.applyContent.trimStart(), 'utf-8');
     }
@@ -549,6 +805,76 @@ export async function applyFix(
       fixId: fix.id,
       status: 'failed',
       target: fix.applyTarget,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Apply a read-deny fix: merge its rules into `permissions.deny` in the
+ * project's `.claude/settings.local.json`.
+ *
+ * The file is parsed first and left untouched when it is not a usable
+ * settings object (see `readDenySettings`), so a hand-edited file with a
+ * typo is reported instead of overwritten. Every other key and the existing
+ * deny rules are kept, and rules already present are not added again, so a
+ * second apply changes nothing (and asks nothing). An existing file is backed
+ * up before the write; a missing `.claude` folder and file are created; the
+ * write is atomic. Claude Code watches its settings files, so running
+ * sessions pick the rules up without a restart.
+ */
+async function applyDenyRules(fix: OptimizeFix, options: { yes?: boolean }): Promise<ApplyResult> {
+  const target = fix.applyTarget;
+  const rules = fix.denyRules ?? [];
+  if (!target || rules.length === 0) {
+    return { fixId: fix.id, status: 'failed', message: 'Fix marked auto-applicable but missing target or rules.' };
+  }
+  const refuse = (reason: string): ApplyResult => ({
+    fixId: fix.id,
+    status: 'failed',
+    target,
+    message: `Did not change ${target}: ${reason}. Fix the file, then run optimize --apply again.`,
+  });
+  const nothingToAdd: ApplyResult = {
+    fixId: fix.id,
+    status: 'skipped',
+    target,
+    message: `The rules are already in ${target}; nothing to change.`,
+  };
+
+  const before = readDenySettings(target);
+  if (before.state === 'invalid') return refuse(before.reason);
+  if (mergeDenyRules(before.state === 'ok' ? before.settings : {}, rules).added.length === 0) return nothingToAdd;
+
+  if (!options.yes) {
+    const ok = await confirm(`  Apply fix #${fix.id} \u2192 ${LOCAL_SETTINGS_PATH}?`);
+    if (!ok) return { fixId: fix.id, status: 'skipped' };
+  }
+
+  try {
+    // Read again: the file may have changed while the prompt waited.
+    const current = readDenySettings(target);
+    if (current.state === 'invalid') return refuse(current.reason);
+    const { settings, added } = mergeDenyRules(current.state === 'ok' ? current.settings : {}, rules);
+    if (added.length === 0) return nothingToAdd;
+    const backupPath = current.state === 'missing' ? undefined : backupFile(target);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileAtomic(target, JSON.stringify(settings, null, 2) + '\n');
+    const gitNote = current.state === 'missing'
+      ? ` New file: if git lists it, add ${LOCAL_SETTINGS_PATH} to .gitignore so it stays personal.`
+      : '';
+    return {
+      fixId: fix.id,
+      status: 'applied',
+      target,
+      backup: backupPath,
+      message: `Added ${added.length} deny rule(s). Claude Code picks them up without a restart.${gitNote}`,
+    };
+  } catch (err) {
+    return {
+      fixId: fix.id,
+      status: 'failed',
+      target,
       message: err instanceof Error ? err.message : String(err),
     };
   }

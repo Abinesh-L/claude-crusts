@@ -181,9 +181,23 @@ export function saveConfig(updates: Record<string, unknown>): void {
   const merged = { ...current, ...updates };
   const dir = configDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const target = crustsConfigPath();
+  writeFileAtomic(crustsConfigPath(), JSON.stringify(merged, null, 2) + '\n');
+}
+
+/**
+ * Write a whole file atomically: the content goes to a temp file in the same
+ * folder, which is then renamed over the target, so a reader never sees a
+ * half-written file and a failed write leaves the old file intact.
+ *
+ * The target's folder must exist. Shared by `saveConfig` and the optimizer's
+ * settings writes.
+ *
+ * @param target - File to create or replace
+ * @param content - Full new content (UTF-8)
+ */
+export function writeFileAtomic(target: string, content: string): void {
   const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(temp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+  writeFileSync(temp, content, 'utf-8');
   // On Windows a rename over a file another process has open for reading
   // fails with EPERM or EBUSY for a moment (seen under concurrent hooks), so
   // it is retried briefly before giving up.
@@ -203,7 +217,7 @@ export function saveConfig(updates: Record<string, unknown>): void {
   }
 }
 
-/** Rename attempts after the first, for a busy config.json on Windows. */
+/** Rename attempts after the first, for a busy target file on Windows. */
 const RENAME_RETRIES = 8;
 
 /** Base delay between rename attempts (grows linearly). */

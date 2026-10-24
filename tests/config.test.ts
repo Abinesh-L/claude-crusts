@@ -12,6 +12,7 @@ import {
   crustsConfigPath,
   describeThresholdOverrides,
   stripBom,
+  writeFileAtomic,
 } from '../src/config.ts';
 import { AUTOCOMPACT_BUFFER_TOKENS } from '../src/model-context.ts';
 
@@ -211,5 +212,21 @@ describe('0.8.1 per-session injection record and atomic writes', () => {
     recordInjection('A');
     const leftovers = require('fs').readdirSync(sandbox).filter((f: string) => f.endsWith('.tmp'));
     expect(leftovers).toEqual([]);
+  });
+
+  test('writeFileAtomic creates and replaces a file, leaving no temp file', () => {
+    const target = join(sandbox, 'settings.local.json');
+    writeFileAtomic(target, '{"a":1}\n');
+    expect(readFileSync(target, 'utf-8')).toBe('{"a":1}\n');
+    writeFileAtomic(target, '{"a":2}\n');
+    expect(readFileSync(target, 'utf-8')).toBe('{"a":2}\n');
+    const leftovers = require('fs').readdirSync(sandbox).filter((f: string) => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+  });
+
+  test('writeFileAtomic into a missing folder throws and creates nothing', () => {
+    const target = join(sandbox, 'missing', 'file.json');
+    expect(() => writeFileAtomic(target, '{}')).toThrow();
+    expect(require('fs').existsSync(join(sandbox, 'missing'))).toBe(false);
   });
 });

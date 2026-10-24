@@ -1,28 +1,33 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
+import { join, resolve } from 'path';
 import { tmpdir } from 'os';
-import { applyFix } from '../src/optimizer.ts';
+import { applyFix, mergeDenyRules, readDenySettings } from '../src/optimizer.ts';
 import type { OptimizeFix } from '../src/optimizer.ts';
 
 let workdir: string;
 let sandboxBackupDir: string;
+let savedConfigDir: string | undefined;
 
 beforeEach(() => {
-  workdir = mkdtempSync(join(tmpdir(), 'crusts-apply-'));
+  workdir = resolve(mkdtempSync(join(tmpdir(), 'crusts-apply-')));
   // Sandbox the optimizer's backup directory to a temp location so tests
   // NEVER write to the developer's real `~/.claude-crusts/backups/`. Pre-fix,
   // the `backup pruning` test polluted it with ~10 leftover fixtures per run.
   sandboxBackupDir = join(workdir, 'sandboxed-backups');
   process.env.CRUSTS_BACKUP_DIR_OVERRIDE = sandboxBackupDir;
+  savedConfigDir = process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+  process.env.CRUSTS_CONFIG_DIR_OVERRIDE = join(workdir, 'sandboxed-config');
 });
 
 afterEach(() => {
   delete process.env.CRUSTS_BACKUP_DIR_OVERRIDE;
+  if (savedConfigDir === undefined) delete process.env.CRUSTS_CONFIG_DIR_OVERRIDE;
+  else process.env.CRUSTS_CONFIG_DIR_OVERRIDE = savedConfigDir;
   try { rmSync(workdir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-function fileFix(kind: 'claudeignore' | 'claudemd-rule', target: string, content: string): OptimizeFix {
+function fileFix(kind: 'claudemd-rule', target: string, content: string): OptimizeFix {
   return {
     id: 1,
     kind,
@@ -38,9 +43,9 @@ function fileFix(kind: 'claudeignore' | 'claudemd-rule', target: string, content
 
 describe('applyFix — file write path', () => {
   test('appends to an existing file and writes backup', async () => {
-    const target = join(workdir, '.claudeignore');
-    writeFileSync(target, 'node_modules/\n');
-    const fix = fileFix('claudeignore', target, '\ndist/\n');
+    const target = join(workdir, 'CLAUDE.md');
+    writeFileSync(target, '# Project\n');
+    const fix = fileFix('claudemd-rule', target, '\n## Files to avoid reading\n');
 
     const result = await applyFix(fix, { yes: true });
 
@@ -49,14 +54,14 @@ describe('applyFix — file write path', () => {
     expect(result.backup).toBeDefined();
     expect(existsSync(result.backup!)).toBe(true);
     // Backup preserves original content
-    expect(readFileSync(result.backup!, 'utf-8')).toBe('node_modules/\n');
+    expect(readFileSync(result.backup!, 'utf-8')).toBe('# Project\n');
     // Target has appended content (leading newline from applyContent preserved as a blank line)
-    expect(readFileSync(target, 'utf-8')).toBe('node_modules/\n\ndist/\n');
+    expect(readFileSync(target, 'utf-8')).toBe('# Project\n\n## Files to avoid reading\n');
   });
 
   test('creates target when it does not exist (no backup needed)', async () => {
-    const target = join(workdir, '.claudeignore');
-    const fix = fileFix('claudeignore', target, '\ndist/\n');
+    const target = join(workdir, 'CLAUDE.md');
+    const fix = fileFix('claudemd-rule', target, '\n## Files to avoid reading\n');
 
     const result = await applyFix(fix, { yes: true });
 
@@ -64,7 +69,7 @@ describe('applyFix — file write path', () => {
     expect(result.backup).toBeUndefined();
     expect(existsSync(target)).toBe(true);
     // Leading newline trimmed when creating fresh
-    expect(readFileSync(target, 'utf-8')).toBe('dist/\n');
+    expect(readFileSync(target, 'utf-8')).toBe('## Files to avoid reading\n');
   });
 
   test('skipped when confirmation declined (yes: false, no TTY)', async () => {
@@ -82,12 +87,184 @@ describe('applyFix — file write path', () => {
   });
 
   test('failed when target path is inside a nonexistent parent', async () => {
-    const target = join(workdir, 'does', 'not', 'exist', '.claudeignore');
-    const fix = fileFix('claudeignore', target, 'dist/\n');
+    const target = join(workdir, 'does', 'not', 'exist', 'CLAUDE.md');
+    const fix = fileFix('claudemd-rule', target, '## rule\n');
 
     const result = await applyFix(fix, { yes: true });
     expect(result.status).toBe('failed');
     expect(result.message).toBeDefined();
+  });
+});
+
+describe('applyFix: read-deny into .claude/settings.local.json', () => {
+  const RULES = ['Read(/**/node_modules/**)', 'Read(/**/dist/**)'];
+
+  /** A read-deny fix for the project folder `dir`, as buildOptimizeReport makes it. */
+  function denyFix(dir: string, rules: string[] = RULES): OptimizeFix {
+    return {
+      id: 2,
+      kind: 'read-deny',
+      title: 'Make Claude Code refuse to read node_modules/ and dist/',
+      description: '',
+      estimatedSavings: 3000,
+      action: rules.join('\n'),
+      autoApplicable: true,
+      applyTarget: join(dir, '.claude', 'settings.local.json'),
+      denyRules: rules,
+    };
+  }
+
+  /** Backups written for settings.local.json in the sandboxed backup folder. */
+  function settingsBackups(): string[] {
+    if (!existsSync(sandboxBackupDir)) return [];
+    return readdirSync(sandboxBackupDir).filter((f) => f.startsWith('settings.local.json.') && f.endsWith('.bak'));
+  }
+
+  test('creates the .claude folder and the file in a fresh project', async () => {
+    const project = join(workdir, 'fresh');
+    mkdirSync(project);
+    const fix = denyFix(project);
+
+    const result = await applyFix(fix, { yes: true });
+
+    expect(result.status).toBe('applied');
+    expect(result.backup).toBeUndefined();
+    expect(result.message).toContain('Added 2 deny rule(s)');
+    expect(result.message).toContain('.gitignore');
+    const written = readFileSync(fix.applyTarget!, 'utf-8');
+    expect(JSON.parse(written)).toEqual({ permissions: { deny: RULES } });
+    expect(written.endsWith('\n')).toBe(true);
+    expect(settingsBackups()).toEqual([]);
+    // No temp file left behind by the atomic write.
+    expect(readdirSync(join(project, '.claude'))).toEqual(['settings.local.json']);
+  });
+
+  test('keeps every other key and the existing deny rules, adds no duplicates, backs up first', async () => {
+    const project = join(workdir, 'existing');
+    mkdirSync(join(project, '.claude'), { recursive: true });
+    const original = {
+      model: 'claude-opus-5-5',
+      env: { FOO: '1' },
+      permissions: {
+        allow: ['Bash(npm run *)'],
+        deny: ['Read(./.env)', 'Read(/**/dist/**)'],
+        defaultMode: 'acceptEdits',
+      },
+      hooks: { Stop: [] },
+    };
+    const originalText = JSON.stringify(original, null, 4);
+    const target = join(project, '.claude', 'settings.local.json');
+    writeFileSync(target, originalText);
+
+    const result = await applyFix(denyFix(project), { yes: true });
+
+    expect(result.status).toBe('applied');
+    expect(result.message).toContain('Added 1 deny rule(s)');
+    expect(result.message).not.toContain('.gitignore');
+    expect(JSON.parse(readFileSync(target, 'utf-8'))).toEqual({
+      ...original,
+      permissions: {
+        ...original.permissions,
+        deny: ['Read(./.env)', 'Read(/**/dist/**)', 'Read(/**/node_modules/**)'],
+      },
+    });
+    // The backup holds the file exactly as it was.
+    expect(result.backup).toBeDefined();
+    expect(readFileSync(result.backup!, 'utf-8')).toBe(originalText);
+    expect(settingsBackups().length).toBe(1);
+  });
+
+  test('a second apply changes nothing and writes no second backup', async () => {
+    const project = join(workdir, 'twice');
+    mkdirSync(join(project, '.claude'), { recursive: true });
+    const target = join(project, '.claude', 'settings.local.json');
+    writeFileSync(target, JSON.stringify({ permissions: { allow: ['Bash(ls *)'] } }));
+
+    const first = await applyFix(denyFix(project), { yes: true });
+    expect(first.status).toBe('applied');
+    const afterFirst = readFileSync(target, 'utf-8');
+
+    const second = await applyFix(denyFix(project), { yes: true });
+    expect(second.status).toBe('skipped');
+    expect(second.message).toContain('already in');
+    expect(readFileSync(target, 'utf-8')).toBe(afterFirst);
+    expect(settingsBackups().length).toBe(1);
+    const deny = JSON.parse(afterFirst).permissions.deny as string[];
+    expect(deny).toEqual(RULES);
+  });
+
+  test('refuses to touch a file that is not valid JSON', async () => {
+    const project = join(workdir, 'broken');
+    mkdirSync(join(project, '.claude'), { recursive: true });
+    const target = join(project, '.claude', 'settings.local.json');
+    const broken = '{\n  // a comment\n  "permissions": { "deny": [] }\n}\n';
+    writeFileSync(target, broken);
+
+    const result = await applyFix(denyFix(project), { yes: true });
+
+    expect(result.status).toBe('failed');
+    expect(result.message).toContain('is not valid JSON');
+    expect(result.message).toContain('Did not change');
+    expect(result.backup).toBeUndefined();
+    expect(readFileSync(target, 'utf-8')).toBe(broken);
+    expect(settingsBackups()).toEqual([]);
+  });
+
+  test('refuses when permissions.deny is not a list', async () => {
+    const project = join(workdir, 'wrong-shape');
+    mkdirSync(join(project, '.claude'), { recursive: true });
+    const target = join(project, '.claude', 'settings.local.json');
+    const text = JSON.stringify({ permissions: { deny: 'Read(./.env)' } });
+    writeFileSync(target, text);
+
+    const result = await applyFix(denyFix(project), { yes: true });
+
+    expect(result.status).toBe('failed');
+    expect(result.message).toContain('"permissions.deny" is not a list');
+    expect(readFileSync(target, 'utf-8')).toBe(text);
+  });
+
+  test('reads a file saved with a UTF-8 BOM', async () => {
+    const project = join(workdir, 'bom');
+    mkdirSync(join(project, '.claude'), { recursive: true });
+    const target = join(project, '.claude', 'settings.local.json');
+    writeFileSync(target, '﻿' + JSON.stringify({ permissions: { deny: ['Read(./.env)'] } }));
+
+    const result = await applyFix(denyFix(project), { yes: true });
+
+    expect(result.status).toBe('applied');
+    expect(JSON.parse(readFileSync(target, 'utf-8')).permissions.deny).toEqual(['Read(./.env)', ...RULES]);
+  });
+});
+
+describe('readDenySettings / mergeDenyRules', () => {
+  test('readDenySettings reports missing, empty, valid and invalid files', () => {
+    const path = join(workdir, 'settings.local.json');
+    expect(readDenySettings(path)).toEqual({ state: 'missing' });
+
+    writeFileSync(path, '  \n');
+    expect(readDenySettings(path)).toEqual({ state: 'ok', settings: {}, deny: [] });
+
+    writeFileSync(path, JSON.stringify({ model: 'x' }));
+    expect(readDenySettings(path)).toEqual({ state: 'ok', settings: { model: 'x' }, deny: [] });
+
+    writeFileSync(path, '[]');
+    expect(readDenySettings(path).state).toBe('invalid');
+
+    writeFileSync(path, JSON.stringify({ permissions: [] }));
+    expect(readDenySettings(path)).toEqual({ state: 'invalid', reason: '"permissions" is not an object' });
+  });
+
+  test('mergeDenyRules appends only missing rules and leaves its input unchanged', () => {
+    const input = { permissions: { deny: ['Read(/**/dist/**)'], ask: ['Bash(git push *)'] }, model: 'x' };
+    const snapshot = JSON.parse(JSON.stringify(input));
+    const { settings, added } = mergeDenyRules(input, ['Read(/**/dist/**)', 'Read(/**/build/**)', 'Read(/**/build/**)']);
+    expect(added).toEqual(['Read(/**/build/**)']);
+    expect(settings).toEqual({
+      permissions: { deny: ['Read(/**/dist/**)', 'Read(/**/build/**)'], ask: ['Bash(git push *)'] },
+      model: 'x',
+    });
+    expect(input).toEqual(snapshot);
   });
 });
 
