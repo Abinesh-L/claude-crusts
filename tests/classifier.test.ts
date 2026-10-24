@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { classifySession, countAnalyzedMessages, detectCompactionEvents, estimateAttachmentTokens, isHumanUserText, IMAGE_BLOCK_TOKENS } from '../src/classifier.ts';
 import { detectWaste } from '../src/waste-detector.ts';
 import type { SessionMessage, ConfigData, TokenUsage, ContentBlock, CrustsCategory } from '../src/types.ts';
-import { NEWER_TOKENIZER_FACTOR } from '../src/model-context.ts';
+import { NEWER_TOKENIZER_FACTOR, tokenizerFactor } from '../src/model-context.ts';
 
 function assistant(inputTokens: number): SessionMessage {
   return {
@@ -2060,16 +2060,41 @@ describe('0.8.1: records carried over past a compaction boundary', () => {
     expect(b.total_tokens).toBe(67_160 + 200);
   });
 
-  test('before the first live turn the window is the recorded postTokens', () => {
+  test('before the first live turn the window is postTokens in the model\'s tokens, plus the files it re-attaches', () => {
     // The prompt that fires the hook right after a compaction sees this shape.
     const msgs = continued().slice(0, 5);
     const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
     expect(b.compactionEvents[0]!.firstLiveIndex).toBeUndefined();
-    expect(b.currentContext!.total_tokens).toBe(12_536);
-    expect(b.total_tokens).toBe(12_536);
-    expect(b.currentContext!.usage_percentage).toBeCloseTo((12_536 / b.context_limit) * 100, 6);
+    // postTokens is Claude Code's chars/4 count of the summary and the files it
+    // re-attaches; the files are not recorded yet, so their share is pending
+    // and counts as recorded re-attachments would (twice).
+    const post = Math.round(12_536 * tokenizerFactor(b.model));
+    const pending = post - b.messages[1]!.tokens;
+    expect(b.currentContext!.total_tokens).toBe(post + pending);
+    expect(b.total_tokens).toBe(post + pending);
+    expect(b.currentContext!.usage_percentage).toBeCloseTo(((post + pending) / b.context_limit) * 100, 6);
+    // The pending files are in the window, so Retrieved carries them.
+    expect(b.currentContext!.buckets.find((x) => x.category === 'retrieved')!.contentTokens).toBe(pending);
     // No live turn means no anchor yet, so nothing is derived.
     expect(b.derivedOverhead!.internalSystemPrompt).toBeNull();
+  });
+
+  test('re-attachments recorded before the prompt leave nothing pending', () => {
+    const msgs = continued().slice(0, 5);
+    // The re-attached file is recorded right after the summary, as some sessions do.
+    msgs.splice(2, 0, {
+      type: 'attachment',
+      timestamp: '2026-09-05T05:12:52.000Z',
+      attachment: { type: 'file', filename: 'C:/proj/app.ts', content: { type: 'text', file: { content: 'x'.repeat(60_000) } } },
+    } as unknown as SessionMessage);
+    const b = classifySession(msgs, EMPTY_CONFIG, msgs.length);
+    const post = Math.round(12_536 * tokenizerFactor(b.model));
+    const reattached = b.messages[2]!.tokens;
+    // The recorded file already covers postTokens' share beyond the summary.
+    expect(reattached).toBeGreaterThan(post - b.messages[1]!.tokens);
+    // Nothing is pending: postTokens + the recorded file counted again.
+    expect(b.currentContext!.total_tokens).toBe(post + reattached);
+    expect(b.currentContext!.buckets.find((x) => x.category === 'retrieved')!.contentTokens).toBe(reattached);
   });
 
   test('a fresh session subtracts every user-role record before the first turn', () => {
@@ -2359,7 +2384,7 @@ describe('0.8.2: the recorded system prompt sizes the System bucket', () => {
     expect(recorded.total_tokens).toBe(plain.total_tokens);
   });
 
-  test('the post-compaction view carries the recorded prompt, and the pre-live estimate is unchanged', () => {
+  test('the post-compaction view and the pre-live estimate carry the same recorded prompt', () => {
     const tail = [
       boundary(41_000, 9_000, '2026-10-20T11:00:00.000Z'),
       { type: 'user', timestamp: '2026-10-20T11:00:01.000Z', version: '2.1.300', isCompactSummary: true,
@@ -2371,9 +2396,14 @@ describe('0.8.2: the recorded system prompt sizes the System bucket', () => {
     const derived = plain.derivedOverhead!.internalSystemPrompt!.tokens;
     const promptTokens = recorded.derivedOverhead!.recordedSystemPrompt!.tokens;
     expect(systemContent(plain, true) - systemContent(recorded, true)).toBe(derived - promptTokens);
-    // Before the first live turn the window is postTokens + the derived fixed
-    // context + re-attached files, with or without a recorded prompt.
-    expect(recorded.currentContext!.total_tokens).toBe(plain.currentContext!.total_tokens);
+    // Before the first live turn the estimate uses the System bucket's figure,
+    // so it moves by exactly the difference between the two prompts...
+    expect(plain.currentContext!.total_tokens - recorded.currentContext!.total_tokens).toBe(derived - promptTokens);
+    // ...and the rows add up to it (they were left unreconciled when the
+    // estimate kept the derived prompt and the bucket the recorded one).
+    const cc = recorded.currentContext!;
+    expect(cc.reconciliation!.basis).toBe('api');
+    expect(cc.buckets.reduce((sum, x) => sum + x.tokens, 0)).toBe(cc.total_tokens);
   });
 
   test('the latest snapshot wins, and text blocks are read too', () => {

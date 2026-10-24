@@ -2098,19 +2098,22 @@ function computeEffectiveInputTokens(
  * (`CompactionEvent.firstLiveIndex`): records carried over past the boundary
  * still report the old window, and reading one right after a compaction put
  * a 13K window at 82%. Before the first live turn exists, the window is
- * estimated as Claude Code's `postTokens` plus the fixed context (derived
- * system prompt, CLAUDE.md, core tool and MCP schemas, memory) and the
- * attachments re-sent after the boundary. postTokens is Claude Code's
- * chars/4 count of the summary and those attachments, which runs well below
- * their real token count, so adding the attachments again lands closer: on real
- * boundaries the estimate came within about -17% to +19% of the next
- * request (about a third low at the first prompt of a continuation file,
- * where no fixed-context anchor exists yet).
+ * estimated as Claude Code's `postTokens` plus the fixed context (Claude
+ * Code's system prompt, CLAUDE.md, core tool and MCP schemas, memory) and
+ * the files re-attached after the boundary. postTokens is Claude Code's
+ * chars/4 count of the summary and those files, so it is scaled by the
+ * session model's tokenizer factor. The re-attached files are then counted
+ * again: that second count also stands in for fixed context crusts does not
+ * itemize after a compaction (without it the estimate ran about 27% low).
+ * Files Claude Code has re-attached but not yet recorded count as recorded
+ * ones would (`pendingReattachments`). On 50 real boundaries the estimate
+ * came within a median 6.3% of the next request (worst 28.5%).
  *
  * @param messages - Session messages (the classifier's `effectiveMessages`)
  * @param events - Compaction events detected on the same messages
  * @param classified - Per-record classification of `messages`
  * @param fixedContextTokens - The session's fixed-context estimate
+ * @param factor - Tokenizer factor of the session's model (see `tokenizerFactor`)
  * @returns Live window total in tokens, or null when no usable signal exists
  */
 function liveWindowTokens(
@@ -2118,6 +2121,7 @@ function liveWindowTokens(
   events: CompactionEvent[],
   classified: ClassifiedMessage[],
   fixedContextTokens: number,
+  factor = 1,
 ): number | null {
   const last = events[events.length - 1];
   if (!last) return computeEffectiveInputTokens(messages);
@@ -2129,7 +2133,42 @@ function liveWindowTokens(
   for (let i = last.beforeIndex + 1; i < classified.length; i++) {
     if (classified[i]!.isAttachment) reattached += classified[i]!.tokens;
   }
-  return last.postTokens + fixedContextTokens + reattached;
+  return Math.round(last.postTokens * factor) + fixedContextTokens + reattached
+    + pendingReattachments(messages, events, classified, factor);
+}
+
+/**
+ * Tokens of the files Claude Code re-attached after the last compaction
+ * that the transcript does not hold yet.
+ *
+ * Claude Code's `postTokens` counts the summary and the files it re-attaches
+ * (chars/4, so the tokenizer factor applies), but the transcript records
+ * those files only with the next request. Until then, postTokens x factor
+ * minus the summary and the attachments already recorded is their size: on
+ * 48 real compactions it matched the files recorded later at a median ratio
+ * of 0.98 (quartiles 0.93 and 1.02). They are in the window, so the
+ * pre-live total and the Retrieved bucket both carry them.
+ *
+ * @param messages - Session messages (the classifier's `effectiveMessages`)
+ * @param events - Compaction events detected on the same messages
+ * @param classified - Per-record classification of `messages`
+ * @param factor - Tokenizer factor of the session's model (see `tokenizerFactor`)
+ * @returns Estimated tokens not yet recorded; 0 once the first live turn
+ *   exists or when nothing is pending
+ */
+function pendingReattachments(
+  messages: SessionMessage[],
+  events: CompactionEvent[],
+  classified: ClassifiedMessage[],
+  factor = 1,
+): number {
+  const last = events[events.length - 1];
+  if (!last || last.firstLiveIndex !== undefined || last.postTokens === undefined) return 0;
+  let recorded = 0;
+  for (let i = last.beforeIndex + 1; i < classified.length; i++) {
+    if (classified[i]!.isAttachment || messages[i]?.isCompactSummary) recorded += classified[i]!.tokens;
+  }
+  return Math.max(0, Math.round(last.postTokens * factor) - recorded);
 }
 
 /**
@@ -2547,13 +2586,14 @@ export function classifySession(
   // usage (see `liveWindowTokens`). Falls back to the content sum when no
   // usable usage data exists (fresh sessions, synthetic-only sessions, or
   // fixtures without `usage` fields).
-  // The pre-live estimate keeps the derived figure even when the prompt was
-  // recorded: anchored on the exact first request, it also carries the
-  // estimates' shortfall, which offsets the chars/4 basis of `postTokens`.
-  const fixedContextTokens = (derivedSystemPrompt?.tokens ?? recordedPrompt?.tokens ?? 0) + configOverhead.systemTokens
+  // The pre-live estimate uses the System bucket's own system prompt figure,
+  // so the buckets reconcile to it. With the derived figure (which also holds
+  // the anchor's estimation shortfall) right after a compaction the rows
+  // summed to about two thirds of TOTAL and were left unreconciled.
+  const fixedContextTokens = systemPromptTokens + configOverhead.systemTokens
     + configOverhead.toolTokens + configOverhead.mcpTokens + configOverhead.memoryTokens;
   const effectiveInputTokens = liveWindowTokens(
-    effectiveMessages, compactionEvents, classifiedMessages, fixedContextTokens,
+    effectiveMessages, compactionEvents, classifiedMessages, fixedContextTokens, currentFactor,
   );
   const totalTokens = effectiveInputTokens ?? contentSumTokens;
   // Before the first live turn, the last event's post-compaction size is the
@@ -2804,6 +2844,13 @@ export function classifySession(
     if (systemPromptTokens > 0) {
       currentCategoryTokens.system += systemPromptTokens;
       currentCategoryAccuracy.system = 'estimated';
+    }
+    // Files Claude Code re-attached after the compaction but has not
+    // recorded yet are in the window, as in the pre-live total.
+    const pending = pendingReattachments(effectiveMessages, compactionEvents, classifiedMessages, currentFactor);
+    if (pending > 0) {
+      currentCategoryTokens.retrieved += pending;
+      currentCategoryAccuracy.retrieved = 'estimated';
     }
     if (derivedFraming && derivedFraming.tokensPerMessage > 0) {
       const currentMessages = currentIndices.map((i) => classifiedMessages[i]!);
